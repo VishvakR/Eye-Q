@@ -1,43 +1,55 @@
-"""Eye-Q — Main Orchestrator & CLI Entry Point.
+"""Eye-Q — CLI entry point.
 
-Wires all system components together and manages the full lifecycle:
-    1. Initialize database
-    2. Create shared-memory frame buffer
-    3. Start video capture thread(s)
-    4. Start YOLO watchdog (Stage 1)
-    5. Start VLM worker (Stage 2)
-    6. Start FastAPI server
-    7. Handle graceful shutdown on SIGINT/SIGTERM
+All runtime components (buffer, capture, Stage 1 watchdog, Stage 2 VLM
+worker, alert sink) are owned by the FastAPI lifespan in
+``app/api/server.py``. This module only translates CLI flags into ``EYEQ_*``
+environment overrides and hands control to uvicorn, which means there is
+exactly one place that starts and stops the pipeline.
 
 Usage:
-    # Start the full system
+    # Start the full system (webcam by default)
     uv run python main.py
 
-    # With custom settings
-    EYEQ_DEVICE=mps EYEQ_DEFAULT_SOURCE=0 uv run python main.py
+    # Point at a video file or RTSP stream
+    EYEQ_DEFAULT_SOURCE=demovideo.mp4 uv run python main.py
+    uv run python main.py --source rtsp://192.168.1.100:554/stream1
 
-    # Start just the API server (no video pipeline)
+    # Dashboard and API only, no video pipeline
     uv run python main.py --api-only
+
+    # Stage 1 only — runs YOLO without loading the VLM
+    uv run python main.py --no-vlm
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
-import signal
-import sys
-import threading
-import time
+import os
 
 import uvicorn
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("eyeq")
+
+
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    """Translate CLI flags into ``EYEQ_*`` environment variables.
+
+    This must run **before** the first ``get_settings()`` call — settings are
+    cached with ``lru_cache``, so a later write would be ignored.
+    """
+    if args.source is not None:
+        os.environ["EYEQ_DEFAULT_SOURCE"] = args.source
+    if args.host is not None:
+        os.environ["EYEQ_API_HOST"] = args.host
+    if args.port is not None:
+        os.environ["EYEQ_API_PORT"] = str(args.port)
+    if args.device is not None:
+        os.environ["EYEQ_DEVICE"] = args.device
+    if args.api_only:
+        os.environ["EYEQ_ENABLE_PIPELINE"] = "false"
+    if args.no_vlm:
+        os.environ["EYEQ_ENABLE_VLM"] = "false"
 
 
 def main() -> None:
@@ -46,200 +58,61 @@ def main() -> None:
         description="Eye-Q — Open-vocabulary VLM Retrofit Appliance",
     )
     parser.add_argument(
-        "--api-only",
-        action="store_true",
-        help="Start only the FastAPI server (no video pipeline)",
-    )
-    parser.add_argument(
-        "--host",
+        "--source",
         type=str,
         default=None,
-        help="API server bind address (default: from settings)",
+        help="Video source: RTSP URI, file path, or webcam index (default: from settings)",
     )
     parser.add_argument(
-        "--port",
-        type=int,
+        "--host", type=str, default=None, help="API server bind address"
+    )
+    parser.add_argument("--port", type=int, default=None, help="API server port")
+    parser.add_argument(
+        "--device",
+        type=str,
         default=None,
-        help="API server port (default: from settings)",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Inference device for Stage 1",
+    )
+    parser.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Start only the API and dashboard (no video pipeline)",
     )
     parser.add_argument(
         "--no-vlm",
         action="store_true",
-        help="Skip VLM worker startup (Stage 1 only mode)",
+        help="Skip the Stage 2 VLM worker (Stage 1 only mode)",
     )
 
     args = parser.parse_args()
+    _apply_cli_overrides(args)
 
-    if args.api_only:
-        _run_api_only(args)
-    else:
-        _run_full_system(args)
-
-
-def _run_api_only(args: argparse.Namespace) -> None:
-    """Start only the FastAPI server without the video pipeline."""
+    # Imported after the overrides land so the cached settings pick them up.
     from app.config.settings import get_settings
 
     settings = get_settings()
-    host = args.host or settings.api_host
-    port = args.port or settings.api_port
 
-    logger.info(f"Starting Eye-Q API server (api-only mode) on {host}:{port}")
-
-    uvicorn.run(
-        "app.api.server:app",
-        host=host,
-        port=port,
-        log_level="info",
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
     )
-
-
-def _run_full_system(args: argparse.Namespace) -> None:
-    """Start the full Eye-Q system with all components."""
-    from app.config.settings import get_settings
-    from app.core.buffer import RollingFrameBuffer
-    from app.core.capture import VideoCapture
-    from app.core.ipc import EventPublisher
-    from app.pipelines.detector import YOLOWatchdog
-
-    settings = get_settings()
-
-    logger.info("=" * 60)
-    logger.info("  Eye-Q — Open-Vocabulary VLM Retrofit Appliance")
-    logger.info("=" * 60)
-    logger.info(f"  Device:     {settings.inference_device}")
-    logger.info(f"  Source:     {settings.default_source}")
-    logger.info(f"  Resolution: {settings.frame_width}×{settings.frame_height}")
-    logger.info(f"  Buffer:     {settings.buffer_capacity} frames")
-    logger.info(f"  YOLO:       {settings.yolo_model}")
-    logger.info(f"  VLM:        {settings.vlm_model}")
-    logger.info(f"  API:        http://{settings.api_host}:{settings.api_port}")
-    logger.info("=" * 60)
-
-    # ── Initialize components ────────────────────────────────────
-
-    # 1. Frame buffer
-    buffer = RollingFrameBuffer(
-        capacity=settings.buffer_capacity,
-        frame_height=settings.frame_height,
-        frame_width=settings.frame_width,
-        buffer_id="main",
-    )
-
-    # 2. ZMQ publisher
-    publisher = EventPublisher(settings.zmq_endpoint)
-
-    # 3. Video capture
-    source: str | int = settings.default_source
-    try:
-        source = int(source)
-    except (ValueError, TypeError):
-        pass
-
-    capture = VideoCapture(
-        source=source,
-        buffer=buffer,
-        camera_id="default",
-        target_fps=settings.target_fps,
-    )
-    capture.start()
-
-    # 4. YOLO watchdog
-    watchdog = YOLOWatchdog(
-        buffer=buffer,
-        publisher=publisher,
-        device=settings.inference_device,
-        model_name=settings.yolo_model,
-        confidence_threshold=settings.yolo_confidence,
-        imgsz=settings.yolo_imgsz,
-        cooldown_seconds=settings.detection_cooldown_s,
-        camera_id="default",
-    )
-    watchdog.start()
-
-    # 5. VLM worker (optional)
-    vlm_worker = None
-    if not args.no_vlm:
-        from app.pipelines.vlm_worker import VLMWorker
-
-        vlm_worker = VLMWorker(
-            buffer=buffer,
-            zmq_endpoint=settings.zmq_endpoint,
-            publisher=publisher,
-            device=settings.inference_device,
-            model_id=settings.vlm_model,
-            model_revision=settings.vlm_revision,
-            staleness_threshold_s=settings.vlm_staleness_s,
-            crop_padding=settings.vlm_crop_padding,
-        )
-        vlm_worker.start()
-
-    # ── Attach components to FastAPI app state ───────────────────
-    from app.api.server import app
-
-    app.state.buffer = buffer
-    app.state.watchdog = watchdog
-    app.state.vlm_worker = vlm_worker
-    app.state.captures = [capture]
-
-    # ── Shutdown handler ─────────────────────────────────────────
-    shutdown_event = threading.Event()
-
-    def handle_shutdown(signum, frame):
-        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
-        shutdown_event.set()
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    # ── Start FastAPI server in a thread ─────────────────────────
-    host = args.host or settings.api_host
-    port = args.port or settings.api_port
-
-    server_config = uvicorn.Config(
-        "app.api.server:app",
-        host=host,
-        port=port,
-        log_level="info",
-    )
-    server = uvicorn.Server(server_config)
-
-    server_thread = threading.Thread(
-        target=server.run,
-        name="UvicornServer",
-        daemon=True,
-    )
-    server_thread.start()
 
     logger.info(
-        f"Eye-Q fully operational. Dashboard: http://{host}:{port}"
+        f"Starting Eye-Q on http://{settings.api_host}:{settings.api_port} "
+        f"(pipeline={'on' if settings.enable_pipeline else 'off'}, "
+        f"vlm={'on' if settings.enable_vlm else 'off'})"
     )
 
-    # ── Wait for shutdown signal ─────────────────────────────────
-    try:
-        while not shutdown_event.is_set():
-            shutdown_event.wait(timeout=1.0)
-    except KeyboardInterrupt:
-        pass
-
-    # ── Graceful shutdown ────────────────────────────────────────
-    logger.info("Shutting down Eye-Q...")
-
-    if vlm_worker is not None:
-        vlm_worker.stop()
-
-    watchdog.stop()
-    capture.stop()
-    publisher.close()
-
-    # Server shutdown
-    server.should_exit = True
-    server_thread.join(timeout=5.0)
-
-    buffer.close()
-    buffer.unlink()
-
-    logger.info("Eye-Q shut down cleanly.")
+    # uvicorn owns SIGINT/SIGTERM and drives the lifespan's shutdown path,
+    # so no separate signal handling is needed here.
+    uvicorn.run(
+        "app.api.server:app",
+        host=settings.api_host,
+        port=settings.api_port,
+        log_level=settings.log_level.lower(),
+    )
 
 
 if __name__ == "__main__":
