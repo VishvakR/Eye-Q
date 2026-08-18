@@ -21,11 +21,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+# Sentinel rule owning alerts whose rule was deleted, and the VLM worker's
+# no-matching-rule fallback. Disabled, so it never triggers anything itself.
+DEFAULT_RULE_ID = 0
+DEFAULT_RULE_NAME = "Default (unmatched)"
 
 
 SCHEMA_SQL = """
@@ -125,6 +130,60 @@ class Database:
         await self._db.close()
         logger.info("Database connection closed.")
 
+    async def ensure_default_rule(
+        self,
+        rule_id: int = DEFAULT_RULE_ID,
+        name: str = DEFAULT_RULE_NAME,
+    ) -> None:
+        """Guarantee the sentinel rule exists.
+
+        ``alerts.rule_id`` is a foreign key onto ``rules``, so verdicts whose
+        rule was deleted mid-flight — and the worker's ``rule_id=0`` fallback —
+        need a row to belong to. Seeded disabled so it never triggers the VLM
+        or inflates the active-rule count.
+        """
+        if await self.get_rule(rule_id) is not None:
+            return
+
+        await self._db.execute(
+            """INSERT OR IGNORE INTO rules (id, camera_id, name, prompt, enabled)
+               VALUES (?, ?, ?, ?, 0)""",
+            (
+                rule_id,
+                "default",
+                name,
+                "Fallback rule for detections with no user-defined rule.",
+            ),
+        )
+        await self._db.commit()
+        logger.info("Seeded sentinel rule for unmatched detections.")
+
+    async def delete_all_rules(self) -> int:
+        """Delete every user-defined rule in one shot.
+
+        Alert history is preserved: ``alerts.rule_id`` cascades on delete, so
+        the alerts are first reassigned to the sentinel rule. Clearing rules is
+        a configuration change, and silently destroying the evidence log with
+        it would be a nasty surprise.
+
+        Returns:
+            Number of rules deleted.
+        """
+        await self.ensure_default_rule()
+
+        await self._db.execute(
+            "UPDATE alerts SET rule_id = ? WHERE rule_id != ?",
+            (DEFAULT_RULE_ID, DEFAULT_RULE_ID),
+        )
+        cursor = await self._db.execute(
+            "DELETE FROM rules WHERE id != ?", (DEFAULT_RULE_ID,)
+        )
+        await self._db.commit()
+
+        deleted = cursor.rowcount
+        logger.info(f"Deleted {deleted} rule(s); alert history reassigned.")
+        return deleted
+
     # ── Rules CRUD ───────────────────────────────────────────────
 
     async def create_rule(
@@ -196,7 +255,7 @@ class Database:
         if "enabled" in fields and isinstance(fields["enabled"], bool):
             fields["enabled"] = 1 if fields["enabled"] else 0
 
-        fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+        fields["updated_at"] = datetime.now(UTC).isoformat()
 
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [rule_id]
@@ -337,10 +396,14 @@ class Database:
 
     async def get_stats(self) -> dict:
         """Get aggregate statistics for the dashboard."""
-        rules_count = (await (await self._db.execute("SELECT COUNT(*) FROM rules WHERE enabled = 1")).fetchone())[0]
-        alerts_count = (await (await self._db.execute("SELECT COUNT(*) FROM alerts")).fetchone())[0]
-        violations_count = (await (await self._db.execute("SELECT COUNT(*) FROM alerts WHERE verdict = 1")).fetchone())[0]
-        cameras_count = (await (await self._db.execute("SELECT COUNT(*) FROM cameras WHERE enabled = 1")).fetchone())[0]
+        async def _scalar(sql: str) -> int:
+            row = await (await self._db.execute(sql)).fetchone()
+            return row[0] if row else 0
+
+        rules_count = await _scalar("SELECT COUNT(*) FROM rules WHERE enabled = 1")
+        alerts_count = await _scalar("SELECT COUNT(*) FROM alerts")
+        violations_count = await _scalar("SELECT COUNT(*) FROM alerts WHERE verdict = 1")
+        cameras_count = await _scalar("SELECT COUNT(*) FROM cameras WHERE enabled = 1")
 
         return {
             "active_rules": rules_count,
