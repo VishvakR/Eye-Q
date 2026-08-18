@@ -39,7 +39,11 @@ EYEQ_DEFAULT_SOURCE="rtsp://192.168.1.100:554/stream1" uv run eyeq
 EYEQ_DEFAULT_SOURCE="/path/to/video.mp4" uv run eyeq
 ```
 
-The dashboard will be available at `http://localhost:8000`.
+The dashboard will be available at `http://localhost:8000`, with a live
+MJPEG preview, the rule editor, and the alert feed.
+
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the architecture, component
+reference, and how to swap the VLM model.
 
 ## Configuration
 
@@ -48,9 +52,11 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | Variable | Default | Description |
 |---|---|---|
 | `EYEQ_DEFAULT_SOURCE` | `0` | Camera source (RTSP URI, file path, or device index) |
-| `EYEQ_BUFFER_CAPACITY` | `300` | Frames in ring buffer (~10s at 30 FPS) |
+| `EYEQ_BUFFER_CAPACITY` | `150` | Frames in ring buffer (~5s at 30 FPS, ~405 MB at 720p) |
 | `EYEQ_YOLO_MODEL` | `yolov8n.pt` | YOLO model file |
-| `EYEQ_DEVICE` | `auto` | Inference device: `auto`, `mps`, `cuda`, `cpu` |
+| `EYEQ_DEVICE` | `auto` | Stage 1 device: `auto`, `mps`, `cuda`, `cpu` |
+| `EYEQ_VLM_BACKEND` | `moondream` | `moondream`, `transformers`, or `openai_compat` |
+| `EYEQ_VLM_MODEL` | `vikhyatk/moondream2` | Swap in Qwen2-VL-2B, SmolVLM, etc. |
 | `EYEQ_API_PORT` | `8000` | Dashboard & API port |
 | `EYEQ_WEBHOOK_URL` | `None` | Webhook endpoint for alerts |
 
@@ -58,7 +64,8 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 
 - **Runtime**: Python 3.13+ / `uv`
 - **Detection**: YOLOv8n (Ultralytics) on Apple MPS
-- **VLM**: Moondream2 (1.86B params) via Transformers
+- **VLM**: Moondream2 (1.86B) by default; swappable for Qwen2-VL-2B, SmolVLM,
+  or any model behind a local Ollama/llama.cpp server
 - **IPC**: ZeroMQ (PUB/SUB)
 - **Buffer**: POSIX Shared Memory (zero-copy)
 - **API**: FastAPI + SQLite (aiosqlite)
