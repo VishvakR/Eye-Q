@@ -118,6 +118,10 @@ class VLMResult(BaseModel):
     model_name: str = Field(
         default="moondream2", description="Name of the VLM model used."
     )
+    snapshot_path: str | None = Field(
+        default=None,
+        description="Path to the saved evidence JPEG for this verdict, if written.",
+    )
 
 
 class SystemStatus(BaseModel):
