@@ -10,7 +10,7 @@ Test groups:
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -18,7 +18,6 @@ import pytest
 from app.core.roi import RegionOfInterest
 from app.pipelines.detector import CooldownGate, YOLOWatchdog
 from app.schemas.events import BoundingBox
-
 
 # ═══════════════════════════════════════════════════════════════════
 # Region of Interest Tests
@@ -380,7 +379,7 @@ class TestYOLOWatchdogLive:
         endpoint = f"tcp://127.0.0.1:{np.random.randint(16000, 26000)}"
 
         with EventPublisher(endpoint) as pub:
-            with EventSubscriber(endpoint, topic="detection") as sub:
+            with EventSubscriber(endpoint, topic="detection"):
                 # Create a colorful image that YOLO might detect something in
                 # (random noise — YOLO likely won't detect anything, but the
                 #  pipeline should still process frames without errors)
@@ -402,3 +401,76 @@ class TestYOLOWatchdogLive:
                 # Whether or not YOLO detected anything on random noise,
                 # the watchdog should have processed frames without crashing
                 assert watchdog.stats.frames_processed > 0
+
+
+class TestDisplayVsTriggerScope:
+    """A narrow rule must scope alerts, not blind the live view.
+
+    `sync_rules()` narrows the watchdog's label whitelist to the labels your
+    rules care about. That must gate what wakes the VLM — not what the
+    dashboard draws, or adding a "person" rule would hide the forklift beside
+    them from the operator.
+    """
+
+    def _watchdog(self, **kwargs):
+        from app.pipelines.detector import YOLOWatchdog
+
+        return YOLOWatchdog(buffer=MagicMock(), publisher=MagicMock(), **kwargs)
+
+    def _fake_result(self, detections):
+        """Build a stub ultralytics result with the given (label, conf) pairs."""
+        names, boxes = {}, []
+        for i, (label, conf) in enumerate(detections):
+            names[i] = label
+            box = MagicMock()
+            box.cls = [MagicMock(item=lambda i=i: i)]
+            box.conf = [MagicMock(item=lambda c=conf: c)]
+            box.xyxy = [MagicMock(tolist=lambda: [10.0, 10.0, 50.0, 50.0])]
+            boxes.append(box)
+
+        result = MagicMock()
+        result.names = names
+        result.boxes = boxes
+        return result
+
+    def _run_frame(self, watchdog, detections):
+        watchdog._model = MagicMock()
+        watchdog._model.predict.return_value = [self._fake_result(detections)]
+        watchdog._process_frame(np.zeros((100, 100, 3), dtype=np.uint8), 1.0, 0)
+
+    def test_out_of_scope_labels_still_render(self):
+        """The whole scene stays visible even when one label is watched."""
+        watchdog = self._watchdog(target_labels={"person"})
+        self._run_frame(watchdog, [("person", 0.9), ("forklift", 0.8), ("car", 0.7)])
+
+        drawn = {e.label for e, _fired in watchdog.recent_detections(max_age_s=60)}
+        assert drawn == {"person", "forklift", "car"}
+
+    def test_only_in_scope_labels_trigger(self):
+        watchdog = self._watchdog(target_labels={"person"})
+        self._run_frame(watchdog, [("person", 0.9), ("forklift", 0.8)])
+
+        triggered = {
+            e.label for e, fired in watchdog.recent_detections(max_age_s=60) if fired
+        }
+        assert triggered == {"person"}
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_label == 1
+
+    def test_cooldown_holds_still_render(self):
+        """Boxes must persist between triggers, not blink once per cooldown."""
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, [("person", 0.9)])
+        self._run_frame(watchdog, [("person", 0.9)])
+
+        recent = watchdog.recent_detections(max_age_s=60)
+        assert len(recent) == 2
+        assert [fired for _e, fired in recent] == [True, False]
+        assert watchdog.stats.detections_published == 1
+
+    def test_low_confidence_is_not_rendered(self):
+        """Confidence is the one filter that also suppresses display."""
+        watchdog = self._watchdog(confidence_threshold=0.5)
+        self._run_frame(watchdog, [("person", 0.2)])
+
+        assert watchdog.recent_detections(max_age_s=60) == []
