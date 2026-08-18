@@ -4,22 +4,26 @@ This module runs in a dedicated daemon thread, listening for detection
 triggers from the Stage 1 YOLO Watchdog via ZMQ. When triggered, it:
     1. Fetches the high-resolution frame from the ring buffer by timestamp
     2. Crops the image to the detected bounding box (with padding)
-    3. Queries the VLM (Moondream2) with each matching rule's plain-English prompt
-    4. Parses the response into a binary Yes/No verdict
-    5. Publishes results and fires alerts for positive verdicts
+    3. Filters out rules whose ROI does not contain the detection
+    4. Queries the VLM with each matching rule's plain-English prompt
+    5. Parses the response into a binary Yes/No verdict
+    6. Saves an evidence JPEG and publishes the result for the control plane
 
 Key design constraints:
     - **Staleness protection**: Triggers older than N seconds are discarded
-    - **Memory cleanup**: ``torch.mps.empty_cache()`` after each inference
-    - **Timeout enforcement**: No single inference exceeds the configured timeout
+    - **Timeout enforcement**: No single inference exceeds ``inference_timeout_s``
+    - **Memory cleanup**: The backend's ``cleanup()`` runs after every trigger
     - **Non-blocking**: VLM latency (500ms–2s) never blocks the video pipeline
+    - **Socket ownership**: The result publisher is created *inside* the worker
+      thread, because ZMQ sockets are not safe to share across threads
+
+Results are published on their own endpoint (``:5558`` by default), separate
+from the detection endpoint (``:5557``), so Stage 1 and Stage 2 never share a
+socket. :class:`~app.services.alert_sink.AlertSink` consumes the result topic.
 
 Example:
-    >>> worker = VLMWorker(
-    ...     buffer=buffer,
-    ...     zmq_endpoint="tcp://127.0.0.1:5557",
-    ...     device="mps",
-    ... )
+    >>> worker = VLMWorker(buffer=buffer, device="cpu")
+    >>> worker.add_rule("person", "Is anyone missing a hard hat?", rule_id=1)
     >>> worker.start()
     >>> # ... runs in background, processes triggers from YOLO ...
     >>> worker.stop()
@@ -28,9 +32,13 @@ Example:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -38,10 +46,18 @@ from PIL import Image
 
 from app.core.buffer import RollingFrameBuffer
 from app.core.ipc import EventPublisher, EventSubscriber
+from app.core.roi import RegionOfInterest
+from app.pipelines.vlm_backends import MoondreamBackend, VLMBackend
 from app.pipelines.vlm_judge import BinaryVerdictParser
 from app.schemas.events import BoundingBox, DetectionEvent, VLMQuery, VLMResult
 
 logger = logging.getLogger(__name__)
+
+
+# Appended to every rule prompt. BinaryVerdictParser is most reliable on its
+# first-word strategy, so nudging the model toward a leading "Yes"/"No"
+# materially improves verdict accuracy over free-form prose.
+VERDICT_SUFFIX = " Answer with only Yes or No."
 
 
 # ── Frame Cropping ───────────────────────────────────────────────
@@ -98,167 +114,6 @@ def crop_detection(
     return frame[y1:y2, x1:x2].copy()
 
 
-# ── Moondream2 VLM Wrapper ───────────────────────────────────────
-
-
-class MoondreamVLM:
-    """Wrapper around vikhyatk/moondream2 for visual question answering.
-
-    Moondream2 is a tiny (1.86B params) vision-language model optimized
-    for edge deployment. It supports:
-        - Visual Question Answering (VQA) — used here
-        - Image Captioning
-        - Object Detection
-        - Visual Pointing
-
-    The model is loaded lazily on first use and can be explicitly
-    unloaded to free memory.
-
-    Args:
-        device: PyTorch device string (``"mps"``, ``"cuda"``, ``"cpu"``).
-        model_id: Hugging Face model identifier.
-        revision: Model revision for reproducibility.
-    """
-
-    def __init__(
-        self,
-        device: str = "mps",
-        model_id: str = "vikhyatk/moondream2",
-        revision: str = "2025-06-21",
-    ) -> None:
-        self._device = device
-        self._model_id = model_id
-        self._revision = revision
-        self._model = None
-        self._tokenizer = None
-        self._loaded = False
-
-    def load(self) -> None:
-        """Load the model and tokenizer into memory.
-
-        This can take 10–30 seconds on first run (downloads ~3.7GB).
-        Subsequent loads are fast if the model is cached locally.
-        """
-        if self._loaded:
-            return
-
-        logger.info(
-            f"Loading VLM model: {self._model_id} (revision={self._revision}) "
-            f"on device '{self._device}'..."
-        )
-
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self._model_id,
-                trust_remote_code=True,
-                revision=self._revision,
-                device_map={"": self._device},
-            )
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self._model_id,
-                revision=self._revision,
-            )
-            self._loaded = True
-
-            logger.info(
-                f"VLM model loaded successfully on '{self._device}'. "
-                f"Model ID: {self._model_id}"
-            )
-
-        except Exception as exc:
-            logger.error(f"Failed to load VLM model: {exc}")
-
-            # Try CPU fallback
-            if self._device != "cpu":
-                logger.warning("Retrying VLM load on CPU...")
-                self._device = "cpu"
-                try:
-                    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-                    self._model = AutoModelForCausalLM.from_pretrained(
-                        self._model_id,
-                        trust_remote_code=True,
-                        revision=self._revision,
-                        device_map={"": "cpu"},
-                    )
-                    self._tokenizer = AutoTokenizer.from_pretrained(
-                        self._model_id,
-                        revision=self._revision,
-                    )
-                    self._loaded = True
-                    logger.info("VLM model loaded on CPU (fallback).")
-                except Exception as cpu_exc:
-                    logger.error(f"VLM CPU fallback also failed: {cpu_exc}")
-                    raise
-
-    def query(self, image: Image.Image, question: str) -> str:
-        """Ask a yes/no question about an image.
-
-        Args:
-            image: PIL Image to analyze.
-            question: Plain-English question (e.g., "Is a pallet blocking
-                      the fire exit?").
-
-        Returns:
-            Raw text response from the VLM.
-
-        Raises:
-            RuntimeError: If the model is not loaded.
-        """
-        if not self._loaded or self._model is None:
-            raise RuntimeError("VLM model is not loaded. Call load() first.")
-
-        result = self._model.query(image, question)
-        return result["answer"]
-
-    def cleanup(self) -> None:
-        """Release GPU memory after inference.
-
-        On Apple MPS, this calls ``torch.mps.empty_cache()`` to free
-        the Metal command buffer pool. On CUDA, it calls the equivalent.
-        """
-        try:
-            import torch
-
-            if self._device == "mps" and hasattr(torch.mps, "empty_cache"):
-                torch.mps.empty_cache()
-            elif self._device == "cuda":
-                torch.cuda.empty_cache()
-        except Exception:
-            pass  # Cleanup is best-effort
-
-    def unload(self) -> None:
-        """Unload the model from memory entirely."""
-        self._model = None
-        self._tokenizer = None
-        self._loaded = False
-        self.cleanup()
-
-        import gc
-        gc.collect()
-
-        logger.info("VLM model unloaded.")
-
-    @property
-    def is_loaded(self) -> bool:
-        """Whether the model is currently loaded in memory."""
-        return self._loaded
-
-    @property
-    def device(self) -> str:
-        """Current inference device."""
-        return self._device
-
-    def __repr__(self) -> str:
-        status = "loaded" if self._loaded else "unloaded"
-        return (
-            f"MoondreamVLM(model='{self._model_id}', "
-            f"device='{self._device}', {status})"
-        )
-
-
 # ── Worker Statistics ────────────────────────────────────────────
 
 
@@ -272,7 +127,9 @@ class VLMWorkerStats:
     triggers_received: int
     triggers_processed: int
     triggers_stale: int
+    triggers_coalesced: int
     triggers_failed: int
+    triggers_timed_out: int
     verdicts_positive: int
     verdicts_negative: int
     avg_inference_ms: float
@@ -291,44 +148,55 @@ class VLMWorker:
         1. Check staleness — discard if too old
         2. Fetch the frame from the ring buffer by timestamp
         3. Crop to the bounding box with padding
-        4. Query the VLM with the configured prompt(s)
-        5. Parse the response into a binary verdict
-        6. Publish the result
+        4. Select rules matching the label whose ROI contains the detection
+        5. Query the VLM for each rule, under a hard timeout
+        6. Parse the verdict, save evidence, publish the result
 
     Args:
         buffer: Shared-memory ring buffer to read frames from.
         zmq_endpoint: ZMQ endpoint to subscribe to detection events.
-        publisher: Optional ZMQ publisher for VLM results. If None,
-                   results are only logged.
-        device: Inference device (``"mps"``, ``"cuda"``, ``"cpu"``).
-        model_id: Hugging Face model ID for the VLM.
-        model_revision: Model revision for reproducibility.
+        result_endpoint: ZMQ endpoint to publish ``vlm_result`` events on.
+                         Must differ from ``zmq_endpoint``.
+        backend: VLM backend to use. Defaults to in-process Moondream2.
+        device: Inference device for the default backend.
+        model_id: Hugging Face model ID for the default backend.
+        model_revision: Model revision for the default backend.
         staleness_threshold_s: Discard triggers older than this (seconds).
         crop_padding: Extra padding around bbox as fraction of bbox size.
-        default_prompt: Default prompt used when no rules are configured.
+        inference_timeout_s: Hard cap on a single VLM query.
+        snapshot_dir: Directory for evidence JPEGs. None disables snapshots.
+        default_prompt: Optional fallback question for detections no rule
+            matches. ``None`` (the default) means an unmatched detection is
+            simply ignored — the appliance should never spend an inference on
+            a question the operator did not ask.
     """
 
     def __init__(
         self,
         buffer: RollingFrameBuffer,
         zmq_endpoint: str = "tcp://127.0.0.1:5557",
-        publisher: EventPublisher | None = None,
+        result_endpoint: str = "tcp://127.0.0.1:5558",
+        backend: VLMBackend | None = None,
         device: str = "cpu",
         model_id: str = "vikhyatk/moondream2",
-        model_revision: str = "2025-06-21",
+        model_revision: str = "2024-08-26",
         staleness_threshold_s: float = 5.0,
         crop_padding: float = 0.15,
-        default_prompt: str = "Is there anything unusual or potentially dangerous in this image? Answer with Yes or No and explain briefly.",
+        inference_timeout_s: float = 30.0,
+        snapshot_dir: str | None = "data/snapshots",
+        default_prompt: str | None = None,
     ) -> None:
         self._buffer = buffer
         self._zmq_endpoint = zmq_endpoint
-        self._publisher = publisher
+        self._result_endpoint = result_endpoint
         self._staleness_threshold = staleness_threshold_s
         self._crop_padding = crop_padding
+        self._inference_timeout_s = inference_timeout_s
+        self._snapshot_dir = snapshot_dir
         self._default_prompt = default_prompt
 
-        # VLM model (loaded lazily in worker thread)
-        self._vlm = MoondreamVLM(
+        # VLM backend (loaded lazily inside the worker thread)
+        self._vlm: VLMBackend = backend or MoondreamBackend(
             device=device,
             model_id=model_id,
             revision=model_revision,
@@ -337,9 +205,17 @@ class VLMWorker:
         # Verdict parser
         self._verdict_parser = BinaryVerdictParser()
 
-        # Prompt rules: mapping of label -> list of prompts
-        # In Phase 4, this will be loaded from SQLite
+        # Prompt rules: label -> list of rule dicts. Synced from SQLite by the
+        # control plane whenever a rule is created, updated, or deleted.
+        # Guarded by a lock because the API event loop writes while the worker
+        # thread reads.
         self._rules: dict[str, list[dict]] = {}
+        self._rules_lock = threading.Lock()
+
+        # Single-worker executor used purely to bound inference time. One
+        # worker is deliberate: if an inference hangs, the next submit blocks
+        # and times out fast rather than fanning out runaway threads.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="VLMInfer")
 
         # Thread coordination
         self._shutdown_event = threading.Event()
@@ -349,7 +225,9 @@ class VLMWorker:
         self._triggers_received = 0
         self._triggers_processed = 0
         self._triggers_stale = 0
+        self._triggers_coalesced = 0
         self._triggers_failed = 0
+        self._triggers_timed_out = 0
         self._verdicts_positive = 0
         self._verdicts_negative = 0
         self._inference_times: list[float] = []
@@ -361,41 +239,94 @@ class VLMWorker:
         """Whether the worker thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
+    # ── Rule Management ──────────────────────────────────────────
+
     def add_rule(
         self,
         label: str,
         prompt: str,
         rule_id: int = 0,
         rule_name: str = "",
+        roi: RegionOfInterest | None = None,
     ) -> None:
         """Register a prompt rule for a specific detection label.
 
-        When a detection with ``label`` is received, the VLM will be
-        queried with ``prompt``.
+        When a detection with ``label`` arrives, the VLM is queried with
+        ``prompt`` — but only if ``roi`` (when given) contains the detection.
+
+        Per-rule ROI is enforced here rather than in the watchdog because a
+        single watchdog cannot hold N distinct polygons; the point-in-polygon
+        test is pure geometry and costs nothing at trigger rates.
 
         Args:
-            label: COCO class label to match (e.g., ``"person"``).
+            label: COCO class label to match, or ``"*"`` for any label.
             prompt: Plain-English question for the VLM.
-            rule_id: Optional database ID for the rule.
-            rule_name: Optional human-readable name.
+            rule_id: Database ID for the rule.
+            rule_name: Human-readable name.
+            roi: Optional region of interest for this rule.
         """
-        if label not in self._rules:
-            self._rules[label] = []
+        with self._rules_lock:
+            self._rules.setdefault(label, []).append(
+                {
+                    "rule_id": rule_id,
+                    "rule_name": rule_name,
+                    "prompt": prompt,
+                    "roi": roi,
+                }
+            )
 
-        self._rules[label].append({
-            "rule_id": rule_id,
-            "rule_name": rule_name,
-            "prompt": prompt,
-        })
-
-        logger.info(
-            f"VLM rule added: label='{label}', prompt='{prompt[:60]}...'"
-        )
+        logger.info(f"VLM rule added: label='{label}', prompt='{prompt[:60]}'")
 
     def clear_rules(self) -> None:
         """Remove all registered prompt rules."""
-        self._rules.clear()
+        with self._rules_lock:
+            self._rules.clear()
         logger.info("All VLM rules cleared.")
+
+    def _match_rules(self, event: DetectionEvent) -> list[dict]:
+        """Select the rules that should run for a detection.
+
+        Label-specific rules take precedence; wildcard (``"*"``) rules apply
+        when no label-specific rule exists. Rules whose ROI excludes the
+        detection are dropped.
+
+        Returns an empty list when nothing matches, so no VLM call is made.
+        A fallback prompt runs only if one was explicitly configured via
+        ``default_prompt`` — otherwise a detection nobody wrote a rule for
+        costs nothing and produces no alert.
+        """
+        with self._rules_lock:
+            candidates = list(self._rules.get(event.label, []))
+            if not candidates:
+                candidates = list(self._rules.get("*", []))
+
+        matched = [
+            rule
+            for rule in candidates
+            if rule.get("roi") is None or rule["roi"].contains_bbox_center(event.bbox)
+        ]
+
+        if candidates and not matched:
+            logger.debug(
+                f"All {len(candidates)} rule(s) for '{event.label}' excluded by ROI."
+            )
+            return []
+
+        if not matched:
+            if not self._default_prompt:
+                return []
+            return [
+                {
+                    "rule_id": 0,
+                    "rule_name": "default",
+                    "prompt": self._default_prompt,
+                    "roi": None,
+                }
+            ]
+
+        return matched
+
+    # ── Lifecycle ────────────────────────────────────────────────
 
     def start(self) -> None:
         """Start the VLM worker in a dedicated daemon thread.
@@ -425,6 +356,7 @@ class VLMWorker:
             timeout: Maximum seconds to wait (VLM inference can be slow).
         """
         if not self.is_running:
+            self._executor.shutdown(wait=False)
             return
 
         logger.info("Stopping VLMWorker...")
@@ -434,28 +366,27 @@ class VLMWorker:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 logger.warning(
-                    f"VLMWorker did not stop within {timeout}s "
-                    f"(may be mid-inference)."
+                    f"VLMWorker did not stop within {timeout}s (may be mid-inference)."
                 )
 
         self._thread = None
+        self._executor.shutdown(wait=False)
+
         logger.info(
             f"VLMWorker stopped. "
             f"Processed {self._triggers_processed} triggers, "
             f"positive={self._verdicts_positive}, "
             f"negative={self._verdicts_negative}, "
-            f"stale={self._triggers_stale}."
+            f"stale={self._triggers_stale}, "
+            f"coalesced={self._triggers_coalesced}."
         )
 
     @property
     def stats(self) -> VLMWorkerStats:
         """Current worker statistics snapshot."""
         uptime = time.monotonic() - self._start_time if self._start_time else 0.0
-        avg_ms = (
-            sum(self._inference_times[-50:]) / len(self._inference_times[-50:])
-            if self._inference_times
-            else 0.0
-        )
+        recent = self._inference_times[-50:]
+        avg_ms = sum(recent) / len(recent) if recent else 0.0
 
         return VLMWorkerStats(
             is_running=self.is_running,
@@ -464,7 +395,9 @@ class VLMWorker:
             triggers_received=self._triggers_received,
             triggers_processed=self._triggers_processed,
             triggers_stale=self._triggers_stale,
+            triggers_coalesced=self._triggers_coalesced,
             triggers_failed=self._triggers_failed,
+            triggers_timed_out=self._triggers_timed_out,
             verdicts_positive=self._verdicts_positive,
             verdicts_negative=self._verdicts_negative,
             avg_inference_ms=avg_ms,
@@ -475,59 +408,129 @@ class VLMWorker:
     # ── Internal Worker Loop ─────────────────────────────────────
 
     def _worker_loop(self) -> None:
-        """Main worker loop running in a dedicated thread."""
-        # Load the VLM model (this takes 10-30s on first run)
+        """Main worker loop running in a dedicated thread.
+
+        Both ZMQ sockets are created here, in the thread that uses them —
+        ZMQ sockets must not be shared across threads.
+        """
         try:
             self._vlm.load()
         except Exception as exc:
             logger.error(f"VLMWorker: failed to load model: {exc}")
             return
 
-        # Create ZMQ subscriber (in the worker thread for thread safety)
-        subscriber = EventSubscriber(
-            self._zmq_endpoint,
-            topic="detection",
-        )
+        subscriber = EventSubscriber(self._zmq_endpoint, topic="detection")
+        publisher = EventPublisher(self._result_endpoint)
 
         try:
             while not self._shutdown_event.is_set():
-                # Wait for a detection trigger (1s timeout for shutdown checks)
-                msg = subscriber.receive(timeout_ms=1000)
-                if msg is None:
-                    continue
-
-                topic, payload = msg
-                self._triggers_received += 1
-
-                try:
-                    self._process_trigger(payload)
-                except Exception as exc:
-                    self._triggers_failed += 1
-                    logger.error(
-                        f"VLMWorker: trigger processing failed: {exc}",
-                        exc_info=True,
-                    )
-                finally:
-                    # Always clean up GPU memory
-                    self._vlm.cleanup()
+                for payload in self._collect_batch(subscriber):
+                    if self._shutdown_event.is_set():
+                        break
+                    try:
+                        self._process_trigger(payload, publisher)
+                    except Exception as exc:
+                        self._triggers_failed += 1
+                        logger.error(
+                            f"VLMWorker: trigger processing failed: {exc}",
+                            exc_info=True,
+                        )
+                    finally:
+                        # Always release accelerator memory back to YOLO
+                        self._vlm.cleanup()
 
         finally:
+            publisher.close()
             subscriber.close()
             self._vlm.unload()
 
-    def _process_trigger(self, payload: dict) -> None:
-        """Process a single detection trigger.
+    def _collect_batch(self, subscriber: EventSubscriber) -> list[dict]:
+        """Take one trigger, then coalesce the whole backlog behind it.
 
-        Steps:
-            1. Parse the detection event
-            2. Check staleness
-            3. Fetch frame from buffer
-            4. Crop to bounding box
-            5. Get matching rules (or use default prompt)
-            6. Query VLM for each prompt
-            7. Parse verdict and publish results
+        VLM inference (~1–8s) is far slower than Stage 1 produces triggers, so
+        a queue builds up. Processing it in arrival order means always working
+        on the *oldest* frame, which is exactly the one most likely to have
+        aged past ``staleness_threshold`` by the time it is dequeued — the
+        pipeline spends its budget on work it then throws away.
+
+        Instead, drain everything pending and keep only the newest trigger per
+        label, newest first. Older duplicates of the same label describe a
+        scene that a fresher frame already supersedes.
+
+        Returns:
+            Triggers to process, newest first. Empty if nothing arrived.
         """
-        # Parse event
+        # 1s timeout so shutdown stays responsive when the scene is quiet.
+        first = subscriber.receive(timeout_ms=1000)
+        if first is None:
+            return []
+
+        pending = [first[1]]
+        pending.extend(payload for _topic, payload in subscriber.drain(max_messages=512))
+        self._triggers_received += len(pending)
+
+        newest: dict[str, dict] = {}
+        for payload in pending:
+            label = payload.get("label", "")
+            current = newest.get(label)
+            if current is None or payload.get("timestamp", 0.0) > current.get(
+                "timestamp", 0.0
+            ):
+                newest[label] = payload
+
+        coalesced = len(pending) - len(newest)
+        if coalesced:
+            self._triggers_coalesced += coalesced
+            logger.debug(
+                f"Coalesced {coalesced} superseded trigger(s); "
+                f"processing {len(newest)} label(s)."
+            )
+
+        return sorted(
+            newest.values(), key=lambda p: p.get("timestamp", 0.0), reverse=True
+        )
+
+    def _infer(self, image: Image.Image, prompt: str) -> str:
+        """Run a single VLM query under a hard timeout.
+
+        Args:
+            image: Cropped detection image.
+            prompt: Question to ask.
+
+        Returns:
+            Raw VLM text response.
+
+        Raises:
+            concurrent.futures.TimeoutError: If inference exceeds the timeout.
+        """
+        future = self._executor.submit(self._vlm.query, image, prompt)
+        return future.result(timeout=self._inference_timeout_s)
+
+    def _save_snapshot(self, image_bgr: np.ndarray) -> str | None:
+        """Write an evidence JPEG for an alert.
+
+        Args:
+            image_bgr: The cropped region the VLM was shown, in BGR order.
+
+        Returns:
+            Path to the written file, or None if snapshots are disabled or
+            the write failed (evidence is best-effort — never fail a verdict
+            because the disk is full).
+        """
+        if not self._snapshot_dir:
+            return None
+
+        try:
+            os.makedirs(self._snapshot_dir, exist_ok=True)
+            path = os.path.join(self._snapshot_dir, f"{uuid.uuid4().hex}.jpg")
+            cv2.imwrite(path, image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            return path
+        except Exception as exc:
+            logger.warning(f"Failed to write alert snapshot: {exc}")
+            return None
+
+    def _process_trigger(self, payload: dict, publisher: EventPublisher) -> None:
+        """Process a single detection trigger end to end."""
         event = DetectionEvent(**payload)
 
         # ── Staleness check ──────────────────────────────────────
@@ -540,10 +543,13 @@ class VLMWorker:
             )
             return
 
+        # ── Select rules before doing any expensive work ─────────
+        rules = self._match_rules(event)
+        if not rules:
+            return
+
         # ── Fetch frame from buffer ──────────────────────────────
-        frame_result = self._buffer.read_by_timestamp(
-            event.timestamp, tolerance_ms=500.0
-        )
+        frame_result = self._buffer.read_by_timestamp(event.timestamp, tolerance_ms=500.0)
 
         if frame_result is None:
             # Try direct index access as fallback
@@ -558,41 +564,38 @@ class VLMWorker:
                 )
                 return
 
-        frame, actual_ts, slot_idx = frame_result
+        frame, _actual_ts, _slot_idx = frame_result
 
         # ── Crop to bounding box ─────────────────────────────────
         cropped = crop_detection(frame, event.bbox, self._crop_padding)
+        pil_image = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
 
-        # Convert BGR (OpenCV) to RGB (PIL)
-        cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(cropped_rgb)
+        # One evidence JPEG per trigger, shared by every rule it fires.
+        snapshot_path: str | None = None
+        snapshot_written = False
 
-        # ── Get matching rules ───────────────────────────────────
-        rules = self._rules.get(event.label, [])
-
-        if not rules:
-            # Use default prompt if no specific rules are configured
-            rules = [{
-                "rule_id": 0,
-                "rule_name": "default",
-                "prompt": self._default_prompt,
-            }]
-
-        # ── Query VLM for each rule ──────────────────────────────
+        # ── Query VLM for each matching rule ─────────────────────
         for rule in rules:
             prompt = rule["prompt"]
             rule_id = rule["rule_id"]
             rule_name = rule.get("rule_name", "")
 
-            logger.info(
-                f"VLM query: [{event.label}] '{prompt[:80]}...' "
-                f"(rule_id={rule_id})"
-            )
+            logger.info(f"VLM query: [{event.label}] '{prompt[:80]}' (rule_id={rule_id})")
 
-            # Run inference with timing
             start_time = time.monotonic()
             try:
-                raw_response = self._vlm.query(pil_image, prompt)
+                raw_response = self._infer(pil_image, prompt + VERDICT_SUFFIX)
+            except FutureTimeoutError:
+                self._triggers_timed_out += 1
+                # Ask the backend to abandon generation. Without this the
+                # executor's single worker stays pinned on the dead inference
+                # and the *next* trigger waits behind it too.
+                self._vlm.request_stop()
+                logger.error(
+                    f"VLM inference exceeded {self._inference_timeout_s}s "
+                    f"for rule_id={rule_id}. Aborting and skipping trigger."
+                )
+                continue
             except Exception as exc:
                 self._triggers_failed += 1
                 logger.error(f"VLM inference failed: {exc}")
@@ -601,7 +604,6 @@ class VLMWorker:
 
             self._last_inference_ms = inference_ms
             self._inference_times.append(inference_ms)
-            # Keep only last 100 timings
             if len(self._inference_times) > 100:
                 self._inference_times = self._inference_times[-100:]
 
@@ -614,36 +616,33 @@ class VLMWorker:
             else:
                 self._verdicts_negative += 1
 
-            # Create result
-            query = VLMQuery(
-                detection=event,
-                rule_id=rule_id,
-                rule_name=rule_name,
-                prompt=prompt,
-            )
+            if not snapshot_written:
+                snapshot_path = self._save_snapshot(cropped)
+                snapshot_written = True
 
             result = VLMResult(
-                query=query,
+                query=VLMQuery(
+                    detection=event,
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    prompt=prompt,
+                ),
                 verdict=verdict,
                 raw_response=raw_response,
                 inference_time_ms=inference_ms,
-                model_name=self._vlm._model_id,
+                model_name=self._vlm.model_name,
+                snapshot_path=snapshot_path,
             )
 
-            # Log result
             verdict_str = "🔴 YES (VIOLATION)" if verdict else "🟢 NO (clear)"
             logger.info(
                 f"VLM result: {verdict_str} | "
                 f"inference={inference_ms:.0f}ms | "
-                f"response='{raw_response[:100]}...'"
+                f"response='{raw_response[:100]}'"
             )
 
-            # Publish result via ZMQ
-            if self._publisher is not None:
-                self._publisher.publish(
-                    "vlm_result",
-                    result.model_dump(),
-                )
+            # Hand off to the control plane (persist + broadcast + webhook)
+            publisher.publish("vlm_result", result.model_dump())
 
     def __repr__(self) -> str:
         status = "running" if self.is_running else "stopped"
