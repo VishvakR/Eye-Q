@@ -7,8 +7,9 @@ consumers (YOLO watchdog, VLM worker) read them without blocking
 the producer.
 
 Architecture:
-    - Two shared memory segments: pixel data (uint8) and timestamps (float64).
-    - Circular write via an atomic shared integer (write head).
+    - Three shared memory segments: pixel data (uint8), timestamps (float64),
+      and a two-slot int64 meta block holding the write head and frame count.
+    - Circular write via the shared write head.
     - Writer-side locking only; readers are lock-free (stale-OK semantics).
 
 A torn read (reading a frame while it's being overwritten) is harmless:
@@ -26,9 +27,9 @@ Example:
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from dataclasses import dataclass, field
-from multiprocessing import Lock, Value
+from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from typing import TYPE_CHECKING
 
@@ -62,8 +63,15 @@ class RollingFrameBuffer:
         SHM Block 2 ("eyeq_ts_{id}"):
             np.ndarray of shape (capacity,), dtype=float64
 
-        Shared Value: write_head (int32) — current write position
-        Shared Value: frame_count (int64) — total frames written (monotonic)
+        SHM Block 3 ("eyeq_meta_{id}"):
+            np.ndarray of shape (2,), dtype=int64 — [write_head, frame_count]
+
+    The counters live in shared memory rather than ``multiprocessing.Value``
+    so that readers in other processes still see them, while the buffer owns
+    every resource it allocates. ``multiprocessing`` primitives each carry a
+    POSIX semaphore that ``unlink()`` cannot release, which leaked on every
+    shutdown. Writers are threads in one process, so a ``threading.Lock``
+    is the right level of exclusion here.
 
     Args:
         capacity: Number of frames the ring buffer holds.
@@ -89,6 +97,7 @@ class RollingFrameBuffer:
         frame_bytes = int(np.prod(self._frame_shape)) * np.dtype(np.uint8).itemsize
         total_frame_bytes = capacity * frame_bytes
         total_ts_bytes = capacity * np.dtype(np.float64).itemsize
+        total_meta_bytes = 2 * np.dtype(np.int64).itemsize
 
         logger.info(
             f"Allocating frame buffer '{buffer_id}': "
@@ -96,19 +105,26 @@ class RollingFrameBuffer:
             f"{total_frame_bytes / (1024**2):.1f} MB"
         )
 
+        # Helper to safely create shared memory, cleaning up existing orphaned ones
+        def _safe_create_shm(name: str, size: int) -> SharedMemory:
+            try:
+                return SharedMemory(name=name, create=True, size=size)
+            except FileExistsError:
+                logger.warning(
+                    f"Shared memory '{name}' already exists. Unlinking and recreating..."
+                )
+                existing = SharedMemory(name=name)
+                existing.unlink()
+                return SharedMemory(name=name, create=True, size=size)
+
         # Allocate shared memory — frame pixel data
-        self._shm_frames = SharedMemory(
-            name=f"eyeq_frames_{buffer_id}",
-            create=True,
-            size=total_frame_bytes,
-        )
+        self._shm_frames = _safe_create_shm(f"eyeq_frames_{buffer_id}", total_frame_bytes)
 
         # Allocate shared memory — timestamps
-        self._shm_timestamps = SharedMemory(
-            name=f"eyeq_ts_{buffer_id}",
-            create=True,
-            size=total_ts_bytes,
-        )
+        self._shm_timestamps = _safe_create_shm(f"eyeq_ts_{buffer_id}", total_ts_bytes)
+
+        # Allocate shared memory — [write_head, frame_count]
+        self._shm_meta = _safe_create_shm(f"eyeq_meta_{buffer_id}", total_meta_bytes)
 
         # Create numpy views over shared memory (zero-copy)
         self._frames: NDArray[np.uint8] = np.ndarray(
@@ -122,22 +138,26 @@ class RollingFrameBuffer:
             buffer=self._shm_timestamps.buf,
         )
 
+        self._meta: NDArray[np.int64] = np.ndarray(
+            (2,),
+            dtype=np.int64,
+            buffer=self._shm_meta.buf,
+        )
+
         # Initialize timestamps to zero (marks slots as unwritten)
         self._timestamps[:] = 0.0
-
-        # Shared atomic counters
-        self._write_head: Value = Value("i", 0)  # int32
-        self._frame_count: Value = Value("l", 0)  # int64
+        self._meta[:] = 0
 
         # Writer-side lock (readers are lock-free)
-        self._write_lock = Lock()
+        self._write_lock = threading.Lock()
 
         self._closed = False
 
         logger.info(
             f"Frame buffer '{buffer_id}' allocated: "
             f"{total_frame_bytes / (1024**2):.1f} MB frames + "
-            f"{total_ts_bytes / 1024:.1f} KB timestamps"
+            f"{total_ts_bytes / 1024:.1f} KB timestamps + "
+            f"{total_meta_bytes} B meta"
         )
 
     @property
@@ -154,6 +174,16 @@ class RollingFrameBuffer:
     def buffer_id(self) -> str:
         """Unique identifier for this buffer instance."""
         return self._buffer_id
+
+    @property
+    def _write_head(self) -> int:
+        """Slot index the next frame will be written to."""
+        return int(self._meta[0])
+
+    @property
+    def _frame_count(self) -> int:
+        """Total frames written since allocation (monotonic, never wraps)."""
+        return int(self._meta[1])
 
     def write(self, frame: NDArray[np.uint8], timestamp: float | None = None) -> int:
         """Write a frame into the next slot in the ring buffer.
@@ -193,15 +223,15 @@ class RollingFrameBuffer:
             frame = cv2.resize(frame, (expected_w, expected_h))
 
         with self._write_lock:
-            idx = self._write_head.value
+            idx = int(self._meta[0])
 
             # Copy frame data into shared memory
             np.copyto(self._frames[idx], frame)
             self._timestamps[idx] = timestamp
 
             # Advance the write head (circular)
-            self._write_head.value = (idx + 1) % self._capacity
-            self._frame_count.value += 1
+            self._meta[0] = (idx + 1) % self._capacity
+            self._meta[1] += 1
 
         return idx
 
@@ -220,11 +250,11 @@ class RollingFrameBuffer:
         if self._closed:
             raise RuntimeError("Cannot read from a closed buffer.")
 
-        if self._frame_count.value == 0:
+        if self._frame_count == 0:
             raise RuntimeError("Buffer is empty — no frames have been written yet.")
 
         # The latest frame is at (write_head - 1) mod capacity
-        idx = (self._write_head.value - 1) % self._capacity
+        idx = (self._write_head - 1) % self._capacity
         frame_copy = self._frames[idx].copy()
         ts = float(self._timestamps[idx])
 
@@ -253,7 +283,7 @@ class RollingFrameBuffer:
         if self._closed:
             raise RuntimeError("Cannot read from a closed buffer.")
 
-        if self._frame_count.value == 0:
+        if self._frame_count == 0:
             return None
 
         tolerance_s = tolerance_ms / 1000.0
@@ -312,7 +342,7 @@ class RollingFrameBuffer:
     @property
     def stats(self) -> BufferStats:
         """Current buffer statistics for monitoring dashboards."""
-        total_written = self._frame_count.value
+        total_written = self._frame_count
         occupancy = min(1.0, total_written / self._capacity) if self._capacity > 0 else 0.0
         frame_bytes = int(np.prod(self._frame_shape)) * np.dtype(np.uint8).itemsize
         total_bytes = self._capacity * frame_bytes
@@ -337,6 +367,13 @@ class RollingFrameBuffer:
             return
 
         self._closed = True
+
+        # Drop the numpy views first — SharedMemory.close() fails while an
+        # exported buffer still references the mapping.
+        self._frames = None
+        self._timestamps = None
+        self._meta = None
+
         try:
             self._shm_frames.close()
         except Exception as exc:
@@ -345,6 +382,10 @@ class RollingFrameBuffer:
             self._shm_timestamps.close()
         except Exception as exc:
             logger.warning(f"Error closing timestamp SHM: {exc}")
+        try:
+            self._shm_meta.close()
+        except Exception as exc:
+            logger.warning(f"Error closing meta SHM: {exc}")
 
         logger.info(f"Frame buffer '{self._buffer_id}' closed.")
 
@@ -363,6 +404,10 @@ class RollingFrameBuffer:
             self._shm_timestamps.unlink()
         except Exception as exc:
             logger.warning(f"Error unlinking timestamp SHM: {exc}")
+        try:
+            self._shm_meta.unlink()
+        except Exception as exc:
+            logger.warning(f"Error unlinking meta SHM: {exc}")
 
         logger.info(f"Frame buffer '{self._buffer_id}' unlinked (memory released).")
 
@@ -372,5 +417,5 @@ class RollingFrameBuffer:
             f"capacity={self._capacity}, "
             f"frame_shape={self._frame_shape}, "
             f"id='{self._buffer_id}', "
-            f"written={self._frame_count.value})"
+            f"written={self._frame_count})"
         )
