@@ -112,7 +112,8 @@ class BinaryVerdictParser:
         # Check for negation of affirmative keywords
         negated_affirmatives = 0
         for i, w in enumerate(words):
-            if w in cls.AFFIRMATIVE and i > 0 and words[i - 1] in ("not", "no", "isn't", "aren't", "doesn't", "don't", "wasn't"):
+            negators = ("not", "no", "isn't", "aren't", "doesn't", "don't", "wasn't")
+            if w in cls.AFFIRMATIVE and i > 0 and words[i - 1] in negators:
                 negated_affirmatives += 1
 
         affirm_count = len(word_set & cls.AFFIRMATIVE) - negated_affirmatives
