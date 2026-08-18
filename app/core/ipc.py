@@ -285,3 +285,128 @@ class EventSubscriber:
             f"topic='{self._topic}', status={status}, "
             f"received={self._messages_received})"
         )
+
+
+class AsyncEventSubscriber:
+    """Asyncio-native SUB socket for consumers running on the event loop.
+
+    Mirrors :class:`EventSubscriber` but is built on ``zmq.asyncio`` so that
+    awaiting a message yields to the event loop instead of blocking it. This
+    is what the control plane uses to consume ``vlm_result`` events, since the
+    downstream work (SQLite writes, WebSocket broadcast, webhook POST) is all
+    async already.
+
+    Args:
+        endpoint: ZMQ connect address (e.g., ``"tcp://127.0.0.1:5558"``).
+        topic: Topic filter string. Empty string subscribes to all topics.
+        high_water_mark: Maximum queued inbound messages before dropping.
+
+    Example:
+        >>> sub = AsyncEventSubscriber("tcp://127.0.0.1:5558", topic="vlm_result")
+        >>> event = await sub.receive(timeout_ms=1000)
+        >>> if event:
+        ...     topic, payload = event
+        >>> sub.close()
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "tcp://127.0.0.1:5558",
+        topic: str = "",
+        high_water_mark: int = 1000,
+    ) -> None:
+        import zmq.asyncio
+
+        self._endpoint = endpoint
+        self._topic = topic
+        self._context = zmq.asyncio.Context.instance()
+        self._socket = self._context.socket(zmq.SUB)
+
+        self._socket.setsockopt(zmq.RCVHWM, high_water_mark)
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, topic)
+        self._socket.setsockopt(zmq.LINGER, 0)
+
+        self._socket.connect(endpoint)
+
+        self._poller = zmq.asyncio.Poller()
+        self._poller.register(self._socket, zmq.POLLIN)
+
+        self._closed = False
+        self._messages_received = 0
+
+        logger.info(
+            f"Async ZMQ Subscriber connected to {endpoint}, "
+            f"topic filter: '{topic or '(all)'}'"
+        )
+
+    async def receive(self, timeout_ms: int = 1000) -> tuple[str, dict] | None:
+        """Await a single message, yielding to the event loop while waiting.
+
+        Args:
+            timeout_ms: Maximum wait time in milliseconds.
+
+        Returns:
+            Tuple of ``(topic, payload_dict)``, or ``None`` on timeout.
+        """
+        if self._closed:
+            return None
+
+        try:
+            events = dict(await self._poller.poll(timeout_ms))
+
+            if self._socket in events:
+                parts = await self._socket.recv_multipart()
+
+                if len(parts) != 2:
+                    logger.warning(
+                        f"Received malformed multipart message with {len(parts)} parts, "
+                        f"expected 2. Discarding."
+                    )
+                    return None
+
+                topic_str = parts[0].decode("utf-8")
+                payload = json.loads(parts[1].decode("utf-8"))
+
+                self._messages_received += 1
+                return topic_str, payload
+
+        except json.JSONDecodeError as exc:
+            logger.warning(f"Received non-JSON payload: {exc}")
+        except zmq.ZMQError as exc:
+            if not self._closed:
+                logger.error(f"Async ZMQ receive error: {exc}")
+
+        return None
+
+    @property
+    def messages_received(self) -> int:
+        """Total number of messages successfully received since creation."""
+        return self._messages_received
+
+    def close(self) -> None:
+        """Close the SUB socket and release resources."""
+        if self._closed:
+            return
+
+        self._closed = True
+        try:
+            self._poller.unregister(self._socket)
+        except (zmq.ZMQError, KeyError):
+            pass
+        try:
+            self._socket.close()
+        except zmq.ZMQError as exc:
+            logger.warning(f"Error closing async ZMQ SUB socket: {exc}")
+
+        logger.info(
+            f"Async ZMQ Subscriber closed ({self._endpoint}). "
+            f"Total messages received: {self._messages_received}"
+        )
+
+    def __repr__(self) -> str:
+        status = "closed" if self._closed else "active"
+        return (
+            f"AsyncEventSubscriber(endpoint='{self._endpoint}', "
+            f"topic='{self._topic}', status={status}, "
+            f"received={self._messages_received})"
+        )
