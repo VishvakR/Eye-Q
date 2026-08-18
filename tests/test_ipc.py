@@ -15,10 +15,7 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from app.core.ipc import EventPublisher, EventSubscriber
-
 
 # ── Helpers ──────────────────────────────────────────────────────
 
