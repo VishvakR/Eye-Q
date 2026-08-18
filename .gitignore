@@ -13,15 +13,32 @@ wheels/
 .env
 .env.*
 
-# Runtime data
-data/*.db
-data/*.db-journal
-data/*.db-wal
+# Test & tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
 
-# Model weights (auto-downloaded)
-models/*.pt
-models/*.onnx
-models/*.bin
+# Runtime data — SQLite database and alert evidence JPEGs.
+# Leading slash so this only matches the project-root directory.
+/data/
+
+# Model weights. Auto-downloaded on first run: yolov8n.pt (~6 MB) and the
+# VLM cache (~3.5 GB for Moondream2). Never commit these — a fresh clone
+# re-fetches them, and git handles multi-GB binaries badly.
+/models/
+*.pt
+*.onnx
+*.safetensors
+*.gguf
+
+# Media. Sample/demo footage is large and reproducible from the source
+# camera; keep it out of history.
+*.mp4
+*.avi
+*.mov
+*.mkv
 
 # OS artifacts
 .DS_Store
@@ -33,5 +50,5 @@ Thumbs.db
 *.swp
 *.swo
 
-# Lock file (reproducible via uv sync)
-# uv.lock is committed for reproducibility
+# Note: uv.lock IS committed — it pins the exact dependency graph so
+# `uv sync` reproduces this environment.
