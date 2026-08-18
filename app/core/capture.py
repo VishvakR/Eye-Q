@@ -29,7 +29,6 @@ import time
 from dataclasses import dataclass
 
 import cv2
-import numpy as np
 
 from app.core.buffer import RollingFrameBuffer
 
@@ -70,6 +69,10 @@ class VideoCapture:
                               Doubles with each attempt (exponential backoff).
     """
 
+    # Minimum wall-clock duration a connection must last before a drop is
+    # treated as a genuine mid-stream failure rather than an immediate EOF.
+    _MIN_SESSION_S = 0.5
+
     def __init__(
         self,
         source: str | int,
@@ -99,6 +102,7 @@ class VideoCapture:
         self._reconnect_attempts = 0
         self._is_connected = False
         self._start_time: float = 0.0
+        self._last_write_time: float = 0.0
         self._fps_counter = _FPSCounter(window_size=30)
 
         # OpenCV capture handle (created in capture thread)
@@ -199,12 +203,31 @@ class VideoCapture:
                 )
                 break
 
+            session_start = time.monotonic()
+
             # Continuous frame capture
             self._run_capture()
 
             # If we exit _run_capture and haven't been told to shut down,
             # we lost the connection — loop back to reconnect
-            if not self._shutdown_event.is_set():
+            if self._shutdown_event.is_set():
+                break
+
+            session_duration = time.monotonic() - session_start
+
+            if session_duration < self._MIN_SESSION_S:
+                # A session this short means the source ended almost
+                # immediately — a finished video file being replayed, or a
+                # stream that accepts the connection then drops it. Without a
+                # pause here the loop reopens the source hundreds of times a
+                # second and pins a CPU core.
+                logger.info(
+                    f"VideoCapture '{self._camera_id}': source ended after "
+                    f"{session_duration:.2f}s, restarting in "
+                    f"{self._MIN_SESSION_S:.1f}s..."
+                )
+                self._shutdown_event.wait(timeout=self._MIN_SESSION_S)
+            else:
                 logger.warning(
                     f"VideoCapture '{self._camera_id}': "
                     f"connection lost, attempting reconnect..."
@@ -280,8 +303,6 @@ class VideoCapture:
         if self._cap is None:
             return
 
-        last_write_time = 0.0
-
         while not self._shutdown_event.is_set():
             try:
                 # Always grab the latest frame (keeps RTSP stream current)
@@ -292,7 +313,7 @@ class VideoCapture:
                     return
 
                 now = time.monotonic()
-                elapsed = now - last_write_time
+                elapsed = now - self._last_write_time
 
                 # Frame-rate control: skip decode if too fast
                 if elapsed < self._frame_interval:
@@ -316,7 +337,7 @@ class VideoCapture:
 
                 self._frames_captured += 1
                 self._fps_counter.tick()
-                last_write_time = now
+                self._last_write_time = now
 
             except Exception as exc:
                 logger.error(
