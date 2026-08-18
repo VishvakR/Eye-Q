@@ -20,7 +20,6 @@ import pytest
 
 from app.core.buffer import RollingFrameBuffer
 
-
 # ── Fixtures ─────────────────────────────────────────────────────
 
 @pytest.fixture
