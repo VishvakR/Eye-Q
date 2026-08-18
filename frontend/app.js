@@ -29,9 +29,60 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAlerts();
     connectWebSocket();
     startStatusPolling();
+    startCameraStream();
 
     document.getElementById('rule-form').addEventListener('submit', handleRuleSubmit);
 });
+
+// ── Live Camera Feed ────────────────────────────────────────────
+
+const CAMERA_ID = 'default';
+let streamFallbackTimer = null;
+
+/**
+ * Ensure the live feed is loading, degrading to still-frame polling if needed.
+ *
+ * The <img> carries its own `src` and inline `onerror` so the feed works even
+ * if this file is cached or fails to load. This only re-arms the handler and
+ * covers the case where the element somehow has no source.
+ *
+ * `multipart/x-mixed-replace` in an <img> is not supported uniformly across
+ * browsers (Safari in particular fails to render it), and an <img> that errors
+ * never retries on its own — so a single transient failure at page load would
+ * otherwise leave a permanently broken panel.
+ */
+function startCameraStream() {
+    const img = document.getElementById('camera-stream');
+    if (!img) return;
+
+    img.onerror = () => {
+        console.warn('MJPEG stream failed; falling back to still-frame polling.');
+        useSnapshotFallback();
+    };
+
+    if (!img.getAttribute('src')) {
+        img.src = `/api/stream/${CAMERA_ID}.mjpg`;
+    }
+}
+
+// Exposed on window so the inline onerror in index.html can reach it.
+function useSnapshotFallback() {
+    const img = document.getElementById('camera-stream');
+    if (!img || streamFallbackTimer) return;
+
+    // Drop the error handler so a momentarily unavailable frame does not
+    // re-enter this path and stack up timers.
+    img.onerror = null;
+
+    const refresh = () => {
+        // Cache-bust: without it the browser serves the first frame forever.
+        img.src = `/api/stream/${CAMERA_ID}/frame.jpg?t=${Date.now()}`;
+    };
+
+    refresh();
+    streamFallbackTimer = setInterval(refresh, 200);  // ~5 FPS
+}
+window.useSnapshotFallback = useSnapshotFallback;
 
 // ── REST API Helpers ────────────────────────────────────────────
 
@@ -67,10 +118,19 @@ async function loadRules() {
     }
 }
 
+// The sentinel rule owns alerts whose rule was deleted. It is an internal
+// bookkeeping row, not something the user created, so keep it out of the list.
+const SENTINEL_RULE_ID = 0;
+
 function renderRules(rules) {
     const container = document.getElementById('rules-list');
+    const clearBtn = document.getElementById('clear-rules-btn');
 
-    if (!rules || rules.length === 0) {
+    rules = (rules || []).filter(r => r.id !== SENTINEL_RULE_ID);
+
+    if (clearBtn) clearBtn.classList.toggle('hidden', rules.length === 0);
+
+    if (rules.length === 0) {
         container.innerHTML = '<div class="empty-state">No rules configured. Create one to get started.</div>';
         return;
     }
@@ -110,6 +170,9 @@ function openRuleModal(editData = null) {
     const modal = document.getElementById('rule-modal');
     const title = document.getElementById('modal-title');
     const form = document.getElementById('rule-form');
+    const errorDiv = document.getElementById('rule-error');
+    errorDiv.classList.add('hidden');
+    errorDiv.textContent = '';
 
     if (editData) {
         title.textContent = 'Edit Rule';
@@ -169,7 +232,9 @@ async function handleRuleSubmit(e) {
         closeRuleModal();
         await loadRules();
     } catch (err) {
-        alert(`Failed to save rule: ${err.message}`);
+        const errorDiv = document.getElementById('rule-error');
+        errorDiv.textContent = `Failed to save rule: ${err.message}`;
+        errorDiv.classList.remove('hidden');
     }
 }
 
@@ -201,6 +266,26 @@ async function deleteRule(ruleId) {
         await loadRules();
     } catch (err) {
         alert(`Failed to delete rule: ${err.message}`);
+    }
+}
+
+async function clearAllRules() {
+    const count = document.querySelectorAll('#rules-list .rule-card').length;
+    const subject = count === 1 ? '1 rule' : `all ${count} rules`;
+
+    if (!confirm(`Delete ${subject}?\n\nAlert history is kept — past alerts stay in the feed under "Default (unmatched)".`)) {
+        return;
+    }
+
+    try {
+        const result = await apiFetch('/api/rules', { method: 'DELETE' });
+        await loadRules();
+        // Rule deletion reassigns alerts, so the feed's labels are now stale.
+        alertOffset = 0;
+        await loadAlerts();
+        console.log(`Cleared ${result.deleted} rule(s).`);
+    } catch (err) {
+        alert(`Failed to clear rules: ${err.message}`);
     }
 }
 
@@ -272,6 +357,17 @@ function renderAlerts(alertList) {
         const timeStr = createdAt ? new Date(createdAt + 'Z').toLocaleTimeString() : '--';
         const dateStr = createdAt ? new Date(createdAt + 'Z').toLocaleDateString() : '';
 
+        // frame_snapshot is a server-side path (data/snapshots/<uuid>.jpg);
+        // the snapshots directory is mounted at /snapshots.
+        const snapshot = alert.frame_snapshot
+            ? `<img src="/snapshots/${escapeHtml(alert.frame_snapshot.split('/').pop())}"
+                    alt="Alert evidence" class="alert-snapshot" loading="lazy">`
+            : '';
+
+        const ruleLabel = alert.rule_name
+            ? escapeHtml(alert.rule_name)
+            : `Rule #${alert.rule_id}`;
+
         return `
             <div class="alert-card ${cardClass}">
                 <div class="alert-header">
@@ -280,9 +376,12 @@ function renderAlerts(alertList) {
                     </span>
                     <span class="alert-time">${timeStr} · ${dateStr}</span>
                 </div>
-                <div class="alert-response">${escapeHtml(alert.raw_response || '').substring(0, 200)}</div>
+                <div class="alert-body">
+                    ${snapshot}
+                    <div class="alert-response">${escapeHtml(alert.raw_response || '').substring(0, 200)}</div>
+                </div>
                 <div class="alert-meta">
-                    <span>Rule #${alert.rule_id}</span>
+                    <span>${ruleLabel}</span>
                     <span>Camera: ${escapeHtml(alert.camera_id)}</span>
                     <span>VLM: ${(alert.inference_ms || 0).toFixed(0)}ms</span>
                 </div>
@@ -340,6 +439,26 @@ function updateStats(status) {
     // Uptime
     const uptime = status.uptime_seconds || 0;
     document.getElementById('uptime-badge').textContent = `Uptime: ${formatUptime(uptime)}`;
+
+    updateCameraStatus(status);
+}
+
+function updateCameraStatus(status) {
+    const label = document.getElementById('camera-status');
+    const errorOverlay = document.getElementById('stream-error');
+    if (!label || !errorOverlay) return;
+
+    if (status.pipeline_enabled === false) {
+        label.textContent = 'pipeline disabled';
+        errorOverlay.classList.remove('hidden');
+        return;
+    }
+
+    const cam = (status.cameras || [])[0];
+    if (cam) {
+        label.textContent = `${cam.camera_id} · ${cam.connected ? 'online' : 'offline'} · ${(cam.fps || 0).toFixed(1)} FPS`;
+        errorOverlay.classList.toggle('hidden', cam.connected);
+    }
 }
 
 // ── WebSocket ───────────────────────────────────────────────────

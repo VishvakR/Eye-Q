@@ -107,6 +107,28 @@
             </div>
         </div>
 
+        <!-- Live Camera Preview -->
+        <section class="space-y-3">
+            <div class="section-header">
+                <h2 class="text-sm font-semibold uppercase tracking-wider text-text-secondary">Live Feed</h2>
+                <div id="camera-status" class="text-xs text-text-muted font-mono">default</div>
+            </div>
+            <div class="relative rounded-card overflow-hidden border border-border-subtle bg-black">
+                <!-- src lives here, not in JS: the feed must still appear if
+                     app.js is cached, blocked, or fails to parse. The inline
+                     onerror is bound before the request starts, so the
+                     still-frame fallback engages even on the first load. -->
+                <img id="camera-stream"
+                     src="/api/stream/default.mjpg"
+                     onerror="if (window.useSnapshotFallback) useSnapshotFallback();"
+                     alt="Live camera feed with detection overlay"
+                     class="w-full max-h-[520px] object-contain bg-black">
+                <div id="stream-error" class="hidden absolute inset-0 flex items-center justify-center text-sm text-text-muted bg-surface-secondary">
+                    Video pipeline is not running.
+                </div>
+            </div>
+        </section>
+
         <!-- Two-Column Layout -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
@@ -114,7 +136,10 @@
             <div class="lg:col-span-1 space-y-4">
                 <div class="section-header">
                     <h2 class="text-sm font-semibold uppercase tracking-wider text-text-secondary">Alert Rules</h2>
-                    <button onclick="openRuleModal()" class="btn-primary text-xs">+ New Rule</button>
+                    <div class="flex items-center gap-2">
+                        <button onclick="clearAllRules()" id="clear-rules-btn" class="btn-danger text-xs hidden">Clear All</button>
+                        <button onclick="openRuleModal()" class="btn-primary text-xs">+ New Rule</button>
+                    </div>
                 </div>
 
                 <div id="rules-list" class="space-y-3">
@@ -147,7 +172,7 @@
     </main>
 
     <!-- Rule Modal -->
-    <div id="rule-modal" class="modal-overlay hidden">
+    <div id="rule-modal" class="modal-overlay hidden" onclick="if(event.target === this) closeRuleModal()">
         <div class="modal-content">
             <div class="flex items-center justify-between mb-6">
                 <h3 class="text-lg font-semibold" id="modal-title">New Alert Rule</h3>
@@ -171,6 +196,7 @@
                     <textarea id="rule-prompt" class="form-input h-20 resize-none" placeholder="e.g., Is a pallet blocking the fire exit?" required></textarea>
                 </div>
 
+                <div id="rule-error" class="hidden text-xs text-accent-red bg-accent-red/10 border border-accent-red/20 rounded p-2 mb-4"></div>
                 <div class="grid grid-cols-2 gap-4">
                     <div>
                         <label class="form-label">Camera ID</label>
