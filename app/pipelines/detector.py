@@ -14,6 +14,9 @@ Key design principles:
       with redundant detections of the same object.
     - **ROI filtering**: Only detections whose center falls within the
       configured polygon are forwarded.
+    - **Display vs. trigger scope**: label/ROI/cooldown gate what wakes the
+      VLM, not what the dashboard draws. Every confident detection is recorded
+      for the live overlay so a narrow rule never blinds the operator.
 
 Example:
     >>> watchdog = YOLOWatchdog(
@@ -31,7 +34,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
 
 from app.core.buffer import RollingFrameBuffer
 from app.core.ipc import EventPublisher
@@ -192,10 +198,39 @@ class YOLOWatchdog:
         self._start_time: float = 0.0
         self._fps_counter = _WatchdogFPSCounter(window_size=30)
 
+        # Recently seen detections, for the dashboard's live overlay. Holds
+        # every detection above the confidence threshold — including labels no
+        # rule watches, and detections suppressed by ROI or cooldown — so the
+        # live feed shows the whole scene rather than only what triggers.
+        self._recent: deque[tuple[DetectionEvent, float, bool]] = deque(maxlen=64)
+        self._recent_lock = threading.Lock()
+
     @property
     def is_running(self) -> bool:
         """Whether the watchdog thread is alive."""
         return self._thread is not None and self._thread.is_alive()
+
+    def recent_detections(
+        self, max_age_s: float = 1.0
+    ) -> list[tuple[DetectionEvent, bool]]:
+        """Detections seen within the last ``max_age_s`` seconds.
+
+        Args:
+            max_age_s: Maximum age of returned detections.
+
+        Returns:
+            List of ``(event, triggered)`` pairs, where ``triggered`` marks
+            detections that actually woke the VLM. Untriggered entries include
+            out-of-scope labels, out-of-ROI positions, and cooldown holds.
+        """
+        cutoff = time.monotonic() - max_age_s
+        with self._recent_lock:
+            return [(evt, fired) for evt, ts, fired in self._recent if ts >= cutoff]
+
+    @property
+    def roi(self) -> RegionOfInterest:
+        """Current region of interest, for overlay rendering."""
+        return self._roi
 
     def start(self) -> None:
         """Start the YOLO watchdog in a dedicated daemon thread.
@@ -289,6 +324,15 @@ class YOLOWatchdog:
         self._cooldown.cooldown_seconds = seconds
         logger.info(f"YOLOWatchdog cooldown updated to: {seconds}s")
 
+    def update_confidence(self, threshold: float) -> None:
+        """Update the minimum detection confidence at runtime.
+
+        Args:
+            threshold: New confidence threshold, clamped to [0, 1].
+        """
+        self._confidence_threshold = max(0.0, min(1.0, threshold))
+        logger.info(f"YOLOWatchdog confidence updated to: {self._confidence_threshold}")
+
     # ── Internal Watchdog Loop ───────────────────────────────────
 
     def _watchdog_loop(self) -> None:
@@ -349,8 +393,6 @@ class YOLOWatchdog:
             self._model = YOLO(self._model_name)
 
             # Warm up the model with a dummy inference to initialize device
-            import numpy as np
-
             dummy = np.zeros((self._imgsz, self._imgsz, 3), dtype=np.uint8)
             try:
                 self._model.predict(
@@ -390,7 +432,7 @@ class YOLOWatchdog:
 
     def _process_frame(
         self,
-        frame: "np.ndarray",
+        frame: np.ndarray,
         timestamp: float,
         frame_index: int,
     ) -> None:
@@ -432,12 +474,7 @@ class YOLOWatchdog:
                 confidence = float(box.conf[0].item())
                 label = result.names.get(cls_id, f"class_{cls_id}")
 
-                # ── Filter 1: Label whitelist ────────────────────
-                if self._target_labels is not None and label not in self._target_labels:
-                    self._detections_filtered_label += 1
-                    continue
-
-                # ── Filter 2: Confidence threshold ───────────────
+                # ── Confidence threshold ─────────────────────────
                 # (Already filtered by YOLO `conf` param, but double-check
                 #  for safety since threshold may be updated at runtime)
                 if confidence < self._confidence_threshold:
@@ -453,17 +490,6 @@ class YOLOWatchdog:
                     y2=max(0.0, min(1.0, xyxy[3] / frame_h)),
                 )
 
-                # ── Filter 3: ROI containment ────────────────────
-                if not self._roi.contains_bbox_center(bbox):
-                    self._detections_filtered_roi += 1
-                    continue
-
-                # ── Filter 4: Per-label cooldown ─────────────────
-                if not self._cooldown.should_trigger(label):
-                    self._detections_filtered_cooldown += 1
-                    continue
-
-                # ── Publish detection event ──────────────────────
                 event = DetectionEvent(
                     timestamp=timestamp,
                     camera_id=self._camera_id,
@@ -473,6 +499,31 @@ class YOLOWatchdog:
                     frame_index=frame_index,
                 )
 
+                # ── Trigger gating ───────────────────────────────
+                # Scope (label whitelist), ROI, and cooldown decide whether to
+                # WAKE THE VLM. They deliberately do not decide what the live
+                # feed shows: a rule watching "person" must not blind the
+                # operator to the forklift beside them. YOLO scores every class
+                # regardless, so displaying them all is free.
+                fired = False
+                if self._target_labels is not None and label not in self._target_labels:
+                    self._detections_filtered_label += 1
+                elif not self._roi.contains_bbox_center(bbox):
+                    self._detections_filtered_roi += 1
+                elif not self._cooldown.should_trigger(label):
+                    self._detections_filtered_cooldown += 1
+                else:
+                    fired = True
+
+                # Record every confident detection for the live overlay —
+                # in-scope or not, triggering or not.
+                with self._recent_lock:
+                    self._recent.append((event, time.monotonic(), fired))
+
+                if not fired:
+                    continue
+
+                # ── Publish detection event ──────────────────────
                 success = self._publisher.publish(
                     "detection",
                     event.model_dump(),
