@@ -38,11 +38,16 @@ import sys
 import time
 
 import cv2
-import numpy as np
 
 from app.core.buffer import RollingFrameBuffer
 from app.core.capture import VideoCapture
 from app.core.ipc import EventPublisher, EventSubscriber
+from app.core.overlay import (
+    draw_detection,
+    draw_roi,
+    draw_stats_bar,
+    draw_title_bar,
+)
 from app.core.roi import RegionOfInterest
 from app.pipelines.detector import YOLOWatchdog
 from app.schemas.events import BoundingBox
@@ -53,221 +58,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("demo")
-
-
-# ── Colors (BGR for OpenCV) ──────────────────────────────────────
-
-COLOR_DETECTION = (0, 255, 0)      # Green — active detection
-COLOR_TRIGGERED = (0, 100, 255)    # Orange — detection that triggered VLM
-COLOR_ROI = (255, 200, 0)          # Cyan — ROI boundary
-COLOR_TEXT_BG = (0, 0, 0)          # Black — text background
-COLOR_TEXT = (255, 255, 255)       # White — text
-COLOR_STATS_BG = (30, 30, 30)     # Dark gray — stats bar
-COLOR_FPS = (0, 255, 200)         # Mint — FPS text
-
-
-def draw_detection(
-    frame: np.ndarray,
-    bbox: BoundingBox,
-    label: str,
-    confidence: float,
-    triggered: bool = False,
-) -> None:
-    """Draw a bounding box with label on the frame.
-
-    Args:
-        frame: BGR frame to draw on (modified in-place).
-        bbox: Normalized bounding box coordinates.
-        label: Detection class label.
-        confidence: Detection confidence [0, 1].
-        triggered: If True, use the triggered color (orange).
-    """
-    h, w = frame.shape[:2]
-    x1 = int(bbox.x1 * w)
-    y1 = int(bbox.y1 * h)
-    x2 = int(bbox.x2 * w)
-    y2 = int(bbox.y2 * h)
-
-    color = COLOR_TRIGGERED if triggered else COLOR_DETECTION
-    thickness = 3 if triggered else 2
-
-    # Draw bounding box
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-
-    # Draw corner accents (modern style)
-    corner_len = min(20, (x2 - x1) // 4, (y2 - y1) // 4)
-    corner_thick = thickness + 1
-    # Top-left
-    cv2.line(frame, (x1, y1), (x1 + corner_len, y1), color, corner_thick)
-    cv2.line(frame, (x1, y1), (x1, y1 + corner_len), color, corner_thick)
-    # Top-right
-    cv2.line(frame, (x2, y1), (x2 - corner_len, y1), color, corner_thick)
-    cv2.line(frame, (x2, y1), (x2, y1 + corner_len), color, corner_thick)
-    # Bottom-left
-    cv2.line(frame, (x1, y2), (x1 + corner_len, y2), color, corner_thick)
-    cv2.line(frame, (x1, y2), (x1, y2 - corner_len), color, corner_thick)
-    # Bottom-right
-    cv2.line(frame, (x2, y2), (x2 - corner_len, y2), color, corner_thick)
-    cv2.line(frame, (x2, y2), (x2, y2 - corner_len), color, corner_thick)
-
-    # Label text
-    text = f"{label} {confidence:.0%}"
-    if triggered:
-        text = f"[TRIGGER] {text}"
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
-    font_thickness = 2
-    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, font_thickness)
-
-    # Text background
-    label_y = max(y1 - 8, th + 8)
-    cv2.rectangle(
-        frame,
-        (x1, label_y - th - 6),
-        (x1 + tw + 8, label_y + 4),
-        color,
-        -1,
-    )
-    cv2.putText(
-        frame, text, (x1 + 4, label_y - 2),
-        font, font_scale, COLOR_TEXT_BG, font_thickness + 1, cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame, text, (x1 + 4, label_y - 2),
-        font, font_scale, COLOR_TEXT, font_thickness, cv2.LINE_AA,
-    )
-
-
-def draw_roi(frame: np.ndarray, roi: RegionOfInterest) -> None:
-    """Draw the ROI polygon overlay on the frame.
-
-    Args:
-        frame: BGR frame to draw on (modified in-place).
-        roi: Region of interest to visualize.
-    """
-    h, w = frame.shape[:2]
-    pts = np.array(
-        [(int(x * w), int(y * h)) for x, y in roi.vertices],
-        dtype=np.int32,
-    )
-
-    # Semi-transparent fill
-    overlay = frame.copy()
-    cv2.fillPoly(overlay, [pts], (255, 200, 0, 40))
-    cv2.addWeighted(overlay, 0.1, frame, 0.9, 0, frame)
-
-    # Border
-    cv2.polylines(frame, [pts], isClosed=True, color=COLOR_ROI, thickness=2)
-
-    # Label
-    centroid_x = int(sum(x for x, _ in roi.vertices) / len(roi.vertices) * w)
-    centroid_y = int(sum(y for _, y in roi.vertices) / len(roi.vertices) * h)
-    cv2.putText(
-        frame,
-        f"ROI: {roi.name}",
-        (centroid_x - 30, centroid_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        COLOR_ROI,
-        1,
-        cv2.LINE_AA,
-    )
-
-
-def draw_stats_bar(
-    frame: np.ndarray,
-    fps: float,
-    frames_processed: int,
-    detections: int,
-    triggers: int,
-    device: str,
-    paused: bool = False,
-) -> None:
-    """Draw a stats overlay bar at the bottom of the frame.
-
-    Args:
-        frame: BGR frame to draw on (modified in-place).
-        fps: Current YOLO FPS.
-        frames_processed: Total frames processed by YOLO.
-        detections: Total raw detections.
-        triggers: Total published triggers.
-        device: Inference device name.
-        paused: Whether the display is paused.
-    """
-    h, w = frame.shape[:2]
-    bar_h = 36
-
-    # Background bar
-    cv2.rectangle(frame, (0, h - bar_h), (w, h), COLOR_STATS_BG, -1)
-
-    # Stats text
-    parts = [
-        f"YOLO: {fps:.1f} FPS",
-        f"Frames: {frames_processed}",
-        f"Detections: {detections}",
-        f"Triggers: {triggers}",
-        f"Device: {device.upper()}",
-    ]
-    if paused:
-        parts.insert(0, "|| PAUSED")
-
-    text = "  |  ".join(parts)
-
-    cv2.putText(
-        frame,
-        text,
-        (10, h - 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        COLOR_FPS,
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Eye-Q branding
-    cv2.putText(
-        frame,
-        "Eye-Q",
-        (w - 70, h - 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (100, 100, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-
-def draw_title_bar(frame: np.ndarray, source: str) -> None:
-    """Draw a title bar at the top of the frame."""
-    h, w = frame.shape[:2]
-    bar_h = 32
-
-    cv2.rectangle(frame, (0, 0), (w, bar_h), COLOR_STATS_BG, -1)
-
-    src_display = source if len(source) < 60 else f"...{source[-57:]}"
-    cv2.putText(
-        frame,
-        f"Eye-Q Stage 1 | Source: {src_display}",
-        (10, 22),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        COLOR_TEXT,
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Controls hint
-    cv2.putText(
-        frame,
-        "Q:quit  R:reset  SPACE:pause",
-        (w - 280, 22),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (150, 150, 150),
-        1,
-        cv2.LINE_AA,
-    )
 
 
 def run_demo(args: argparse.Namespace) -> None:
@@ -281,7 +71,7 @@ def run_demo(args: argparse.Namespace) -> None:
     # Parse target labels
     target_labels: set[str] | None = None
     if args.labels:
-        target_labels = {l.strip() for l in args.labels.split(",")}
+        target_labels = {lbl.strip() for lbl in args.labels.split(",")}
         logger.info(f"Target labels: {target_labels}")
 
     # Set up ROI
@@ -456,7 +246,7 @@ def run_demo(args: argparse.Namespace) -> None:
             )
 
             # Draw title bar
-            draw_title_bar(display, source_str)
+            draw_title_bar(display, source_str, hint="Q:quit  R:reset  SPACE:pause")
 
             # Show frame
             cv2.imshow(window_name, display)
