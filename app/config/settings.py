@@ -82,26 +82,40 @@ class Settings(BaseSettings):
         default="0",
         description="Default camera source: RTSP URI, file path, or device index (as string).",
     )
-    frame_width: int = Field(default=1920, ge=160, le=7680, description="Capture frame width.")
-    frame_height: int = Field(default=1080, ge=120, le=4320, description="Capture frame height.")
+    frame_width: int = Field(default=1280, ge=160, le=7680, description="Capture frame width.")
+    frame_height: int = Field(default=720, ge=120, le=4320, description="Capture frame height.")
     target_fps: int = Field(default=30, ge=1, le=120, description="Target capture frame rate.")
 
     # ── Buffer ───────────────────────────────────────────────────
     buffer_capacity: int = Field(
-        default=300,
+        default=150,
         ge=10,
         le=3000,
-        description="Number of frames in the shared-memory ring buffer.",
+        description=(
+            "Number of frames in the shared-memory ring buffer. "
+            "At the 1280×720 default this is ~405 MB (5s of history at 30 FPS) — "
+            "sized for edge devices. 1080p×300 would need 1.77 GB."
+        ),
     )
 
     # ── ZMQ ──────────────────────────────────────────────────────
     zmq_endpoint: str = Field(
         default="tcp://127.0.0.1:5557",
-        description="ZeroMQ PUB/SUB endpoint for inter-component IPC.",
+        description="ZeroMQ endpoint for Stage 1 → Stage 2 'detection' events.",
+    )
+    zmq_result_endpoint: str = Field(
+        default="tcp://127.0.0.1:5558",
+        description=(
+            "ZeroMQ endpoint for Stage 2 → control-plane 'vlm_result' events. "
+            "Kept separate from zmq_endpoint so each publisher owns its socket "
+            "in its own thread (ZMQ sockets are not thread-safe)."
+        ),
     )
 
     # ── YOLO (Stage 1) ───────────────────────────────────────────
-    yolo_model: str = Field(default="yolov8n.pt", description="YOLO model filename.")
+    yolo_model: str = Field(
+        default="models/yolov8n.pt", description="Path or name of the YOLOv8 model."
+    )
     yolo_confidence: float = Field(
         default=0.25, ge=0.0, le=1.0, description="Minimum detection confidence."
     )
@@ -113,19 +127,72 @@ class Settings(BaseSettings):
     )
 
     # ── VLM (Stage 2) ───────────────────────────────────────────
+    vlm_backend: Literal["moondream", "transformers", "openai_compat"] = Field(
+        default="moondream",
+        description=(
+            "Which VLM backend to use. All three run locally — no cloud. "
+            "'moondream' loads Moondream2 in-process via its bespoke API. "
+            "'transformers' loads any chat-templated vision-to-text model "
+            "in-process (Qwen2-VL-2B, SmolVLM, MiniCPM-V) — set vlm_model to "
+            "the HF id. 'openai_compat' calls a local OpenAI-compatible server "
+            "(Ollama, llama.cpp, vLLM), usually the fastest option on edge CPUs "
+            "and it keeps model weights out of this process."
+        ),
+    )
     vlm_model: str = Field(
         default="vikhyatk/moondream2", description="Hugging Face model ID for the VLM."
     )
+    vlm_api_base: str = Field(
+        default="http://127.0.0.1:11434/v1",
+        description="Base URL of the local OpenAI-compatible VLM server (openai_compat backend).",
+    )
+    vlm_api_model: str = Field(
+        default="moondream",
+        description="Model name to request from the OpenAI-compatible server.",
+    )
+    vlm_api_key: str = Field(
+        default="EMPTY", description="API key for the local VLM server (usually unused)."
+    )
+    vlm_max_tokens: int = Field(
+        default=24,
+        ge=1,
+        description=(
+            "Maximum tokens the VLM may generate per query. Verdicts are "
+            "binary and BinaryVerdictParser only reads the leading word, so "
+            "this is a worst-case guard against a model that ignores the "
+            "'answer Yes or No' instruction and rambles — each extra token is "
+            "another sequential forward pass. It does not speed up a model "
+            "that already stops at EOS. Ignored by the moondream backend, "
+            "whose wrapper sets its own limit."
+        ),
+    )
     vlm_revision: str = Field(
-        default="2025-06-21", description="Model revision/commit for reproducibility."
+        default="2024-08-26", description="Model revision/commit for reproducibility."
     )
     vlm_timeout_s: float = Field(
-        default=10.0, ge=1.0, description="Maximum seconds for a single VLM inference."
+        default=60.0,
+        ge=1.0,
+        description=(
+            "Hard cap on a single VLM inference. Measured ~8s for Moondream2 "
+            "on Apple Silicon CPU, and edge CPUs are slower still, so this is "
+            "a runaway guard rather than a latency target. Lower it well below "
+            "60s only when running the openai_compat backend on a GPU."
+        ),
     )
     vlm_staleness_s: float = Field(
         default=5.0,
         ge=0.5,
         description="Discard detection triggers older than this many seconds.",
+    )
+    vlm_default_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Optional fallback question asked when a detection matches no "
+            "rule. Unset by default: an appliance should not spend inferences "
+            "on questions the operator never asked, and the resulting alerts "
+            "are unattributable. Set it only to demo the cascade with no "
+            "rules configured."
+        ),
     )
     vlm_crop_padding: float = Field(
         default=0.15,
@@ -137,16 +204,54 @@ class Settings(BaseSettings):
     # ── Inference Device ─────────────────────────────────────────
     device: Literal["auto", "mps", "cuda", "cpu"] = Field(
         default="auto",
-        description="Inference device. 'auto' detects MPS → CUDA → CPU.",
+        description="Inference device for YOLO. 'auto' detects MPS → CUDA → CPU.",
+    )
+    vlm_device: Literal["auto", "mps", "cuda", "cpu"] = Field(
+        default="cpu",
+        description=(
+            "Inference device for the VLM. Defaults to 'cpu': Moondream2 does "
+            "run on MPS, but measured no faster there (6.1s vs 5.6s per query) "
+            "and took ~10s longer to load, so MPS only costs unified memory "
+            "that Stage 1 wants. Other backends may benefit — try 'mps' when "
+            "running vlm_backend='transformers'."
+        ),
     )
 
     # ── API Server ───────────────────────────────────────────────
     api_host: str = Field(default="0.0.0.0", description="FastAPI bind host.")
     api_port: int = Field(default=8000, ge=1, le=65535, description="FastAPI bind port.")
 
-    # ── Database ─────────────────────────────────────────────────
+    # ── Pipeline Toggles ─────────────────────────────────────────
+    # These are set by main.py's CLI flags via environment variables before
+    # get_settings() is first called, so the lifespan can honour them.
+    enable_pipeline: bool = Field(
+        default=True,
+        description="Start capture + Stage 1 + Stage 2. False = API/dashboard only.",
+    )
+    enable_vlm: bool = Field(
+        default=True,
+        description="Start the Stage 2 VLM worker. False = Stage 1 only (no model load).",
+    )
+
+    # ── Database & Media ─────────────────────────────────────────
     database_path: str = Field(
         default="data/eyeq.db", description="SQLite database file path."
+    )
+    snapshot_dir: str = Field(
+        default="data/snapshots",
+        description="Directory where alert evidence JPEGs are written.",
+    )
+    stream_fps: float = Field(
+        default=12.0,
+        gt=0.0,
+        le=30.0,
+        description="Frame rate of the MJPEG dashboard preview stream.",
+    )
+    stream_width: int = Field(
+        default=1280, ge=160, description="Max width of MJPEG preview frames (downscaled)."
+    )
+    stream_quality: int = Field(
+        default=70, ge=10, le=100, description="JPEG quality for the MJPEG preview stream."
     )
 
     # ── Webhooks ─────────────────────────────────────────────────
@@ -168,6 +273,13 @@ class Settings(BaseSettings):
         if self.device == "auto":
             return detect_inference_device()
         return self.device
+
+    @property
+    def vlm_inference_device(self) -> str:
+        """Resolve the VLM device. Defaults to CPU to avoid MPS crashes."""
+        if self.vlm_device == "auto":
+            return detect_inference_device()
+        return self.vlm_device
 
     @property
     def video_source(self) -> str | int:
