@@ -11,20 +11,17 @@ Test groups:
 
 from __future__ import annotations
 
+import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from app.pipelines.vlm_backends import MoondreamBackend
 from app.pipelines.vlm_judge import BinaryVerdictParser
-from app.pipelines.vlm_worker import (
-    MoondreamVLM,
-    VLMWorker,
-    crop_detection,
-)
-from app.schemas.events import BoundingBox
-
+from app.pipelines.vlm_worker import VLMWorker, crop_detection
+from app.schemas.events import BoundingBox, DetectionEvent
 
 # ═══════════════════════════════════════════════════════════════════
 # Binary Verdict Parser Tests
@@ -228,22 +225,22 @@ class TestCropDetection:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MoondreamVLM Tests (without loading the model)
+# MoondreamBackend Tests (without loading the model)
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestMoondreamVLM:
+class TestMoondreamBackend:
     """Test VLM wrapper initialization and state management."""
 
     def test_initialization(self):
         """VLM should initialize without loading the model."""
-        vlm = MoondreamVLM(device="cpu")
+        vlm = MoondreamBackend(device="cpu")
         assert not vlm.is_loaded
         assert vlm.device == "cpu"
 
     def test_query_before_load_raises(self):
         """Querying before loading should raise RuntimeError."""
-        vlm = MoondreamVLM(device="cpu")
+        vlm = MoondreamBackend(device="cpu")
         from PIL import Image
         dummy_image = Image.new("RGB", (64, 64))
 
@@ -252,9 +249,9 @@ class TestMoondreamVLM:
 
     def test_repr(self):
         """__repr__ should be informative."""
-        vlm = MoondreamVLM(device="mps", model_id="vikhyatk/moondream2")
+        vlm = MoondreamBackend(device="mps", model_id="vikhyatk/moondream2")
         r = repr(vlm)
-        assert "MoondreamVLM" in r
+        assert "MoondreamBackend" in r
         assert "moondream2" in r
         assert "unloaded" in r
 
@@ -351,7 +348,7 @@ class TestVLMWorkerUnit:
             "frame_index": 0,
         }
 
-        worker._process_trigger(stale_payload)
+        worker._process_trigger(stale_payload, MagicMock())
 
         assert worker._triggers_stale == 1
         assert worker._triggers_processed == 0
@@ -393,7 +390,7 @@ class TestVLMWorkerLive:
         """VLM should load and answer a basic question."""
         from PIL import Image
 
-        vlm = MoondreamVLM(device="cpu")
+        vlm = MoondreamBackend(device="cpu")
         vlm.load()
         assert vlm.is_loaded
 
@@ -406,3 +403,265 @@ class TestVLMWorkerLive:
 
         vlm.unload()
         assert not vlm.is_loaded
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Backend Selection Tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBackendFactory:
+    """EYEQ_VLM_BACKEND must select the right implementation.
+
+    All three run locally; the choice is about speed and model availability
+    on the target edge device, not about where inference happens.
+    """
+
+    def test_moondream_is_the_default(self):
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import MoondreamBackend, build_backend
+
+        backend = build_backend(Settings())
+        assert isinstance(backend, MoondreamBackend)
+        assert not backend.is_loaded
+
+    def test_transformers_backend_carries_the_model_id(self):
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import TransformersVLMBackend, build_backend
+
+        backend = build_backend(
+            Settings(vlm_backend="transformers", vlm_model="Qwen/Qwen2-VL-2B-Instruct")
+        )
+        assert isinstance(backend, TransformersVLMBackend)
+        assert backend.model_name == "Qwen/Qwen2-VL-2B-Instruct"
+
+    def test_openai_compat_backend_targets_the_local_server(self):
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import OpenAICompatBackend, build_backend
+
+        backend = build_backend(
+            Settings(
+                vlm_backend="openai_compat",
+                vlm_api_base="http://127.0.0.1:8080/v1",
+                vlm_api_model="qwen2-vl",
+            )
+        )
+        assert isinstance(backend, OpenAICompatBackend)
+        assert backend.model_name == "qwen2-vl"
+        assert "127.0.0.1:8080" in backend.device
+
+    def test_all_backends_satisfy_the_protocol(self):
+        """The worker depends only on VLMBackend, so each must conform."""
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import VLMBackend, build_backend
+
+        for name in ("moondream", "transformers", "openai_compat"):
+            backend = build_backend(Settings(vlm_backend=name))
+            assert isinstance(backend, VLMBackend), f"{name} does not conform"
+
+    def test_query_before_load_raises(self):
+        """Every in-process backend must fail loudly, not silently return junk."""
+        from PIL import Image
+
+        from app.pipelines.vlm_backends import TransformersVLMBackend
+
+        backend = TransformersVLMBackend(device="cpu")
+        with pytest.raises(RuntimeError, match="not loaded"):
+            backend.query(Image.new("RGB", (64, 64)), "Is there a person?")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Backlog Coalescing Tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestTriggerCoalescing:
+    """VLM inference is far slower than Stage 1 triggers, so a backlog forms.
+
+    Processing it in arrival order means always working on the oldest frame —
+    precisely the one most likely to be discarded as stale on arrival. The
+    worker must instead keep the newest trigger per label.
+    """
+
+    def _worker(self):
+        buffer = MagicMock()
+        return VLMWorker(buffer=buffer, device="cpu")
+
+    def _sub(self, first, backlog):
+        """Fake subscriber: one receive() then a drained backlog."""
+        sub = MagicMock()
+        sub.receive.return_value = ("detection", first) if first else None
+        sub.drain.return_value = [("detection", p) for p in backlog]
+        return sub
+
+    def _payload(self, label, ts):
+        return {
+            "timestamp": ts,
+            "camera_id": "test",
+            "label": label,
+            "confidence": 0.9,
+            "bbox": {"x1": 0.1, "y1": 0.1, "x2": 0.2, "y2": 0.2},
+            "frame_index": 0,
+        }
+
+    def test_empty_when_nothing_arrives(self):
+        worker = self._worker()
+        assert worker._collect_batch(self._sub(None, [])) == []
+
+    def test_single_trigger_passes_through(self):
+        worker = self._worker()
+        batch = worker._collect_batch(self._sub(self._payload("person", 10.0), []))
+        assert len(batch) == 1
+        assert batch[0]["label"] == "person"
+
+    def test_keeps_only_the_newest_per_label(self):
+        worker = self._worker()
+        batch = worker._collect_batch(
+            self._sub(
+                self._payload("person", 10.0),
+                [self._payload("person", 11.0), self._payload("person", 12.0)],
+            )
+        )
+        assert len(batch) == 1
+        assert batch[0]["timestamp"] == 12.0, "Superseded frame processed instead"
+        assert worker._triggers_coalesced == 2
+
+    def test_distinct_labels_all_survive(self):
+        """Different labels may match different rules — none may be dropped."""
+        worker = self._worker()
+        batch = worker._collect_batch(
+            self._sub(
+                self._payload("person", 10.0),
+                [self._payload("car", 11.0), self._payload("dog", 9.0)],
+            )
+        )
+        assert {p["label"] for p in batch} == {"person", "car", "dog"}
+        assert worker._triggers_coalesced == 0
+
+    def test_batch_is_ordered_newest_first(self):
+        """The freshest evidence should be judged before the budget runs out."""
+        worker = self._worker()
+        batch = worker._collect_batch(
+            self._sub(
+                self._payload("person", 5.0),
+                [self._payload("car", 20.0), self._payload("dog", 12.0)],
+            )
+        )
+        assert [p["timestamp"] for p in batch] == [20.0, 12.0, 5.0]
+
+    def test_every_trigger_is_counted_as_received(self):
+        """Coalescing must not hide throughput from the stats endpoint."""
+        worker = self._worker()
+        worker._collect_batch(
+            self._sub(
+                self._payload("person", 10.0),
+                [self._payload("person", 11.0), self._payload("car", 12.0)],
+            )
+        )
+        assert worker._triggers_received == 3
+        assert worker._triggers_coalesced == 1
+
+    def test_out_of_order_arrival_still_keeps_newest(self):
+        worker = self._worker()
+        batch = worker._collect_batch(
+            self._sub(
+                self._payload("person", 99.0),
+                [self._payload("person", 1.0), self._payload("person", 50.0)],
+            )
+        )
+        assert batch[0]["timestamp"] == 99.0
+
+
+class TestInferenceAbort:
+    """A timed-out inference must release the executor, not merely be ignored."""
+
+    def test_timeout_signals_the_backend_to_stop(self):
+        import concurrent.futures
+
+        buffer = MagicMock()
+        backend = MagicMock()
+        backend.query.side_effect = lambda *a, **k: time.sleep(5)
+        worker = VLMWorker(buffer=buffer, backend=backend, inference_timeout_s=0.2)
+
+        with pytest.raises(concurrent.futures.TimeoutError):
+            worker._infer(MagicMock(), "Is there a person?")
+
+        # The worker calls request_stop() on the timeout path in _process_trigger;
+        # verify the backend exposes and records it.
+        worker._vlm.request_stop()
+        backend.request_stop.assert_called()
+
+    def test_stop_event_halts_generation(self):
+        """The criteria must integrate with the real transformers plumbing.
+
+        ``StoppingCriteriaList`` ORs each criterion into a per-sequence
+        BoolTensor, so it is exercised here with the tensors ``generate()``
+        actually passes rather than with placeholders.
+        """
+        import torch
+
+        from app.pipelines.vlm_backends import _stop_on_event_criteria
+
+        event = threading.Event()
+        criteria = _stop_on_event_criteria(event)
+
+        input_ids = torch.zeros((1, 4), dtype=torch.long)
+        scores = torch.zeros((1, 32))
+
+        assert not bool(criteria(input_ids, scores).all())
+        event.set()
+        assert bool(criteria(input_ids, scores).all())
+
+    def test_transformers_backend_stop_is_idempotent(self):
+        """request_stop() before/without a query must never raise."""
+        from app.pipelines.vlm_backends import TransformersVLMBackend
+
+        backend = TransformersVLMBackend(device="cpu")
+        backend.request_stop()
+        backend.request_stop()
+        assert backend._stop_event.is_set()
+
+
+class TestUnmatchedDetections:
+    """A detection no rule asked about must not cost an inference."""
+
+    def _worker(self, **kwargs):
+        return VLMWorker(buffer=MagicMock(), device="cpu", **kwargs)
+
+    def _event(self, label="person"):
+        return DetectionEvent(
+            timestamp=time.monotonic(),
+            camera_id="test",
+            label=label,
+            confidence=0.9,
+            bbox=BoundingBox(x1=0.1, y1=0.1, x2=0.3, y2=0.3),
+            frame_index=0,
+        )
+
+    def test_no_rules_means_no_query(self):
+        """With no rules there is no question to ask."""
+        worker = self._worker()
+        assert worker._match_rules(self._event()) == []
+
+    def test_non_matching_label_is_ignored(self):
+        """A 'dog' rule must not cause the VLM to be asked about a person."""
+        worker = self._worker()
+        worker.add_rule("dog", "Is a dog present?", rule_id=1)
+
+        assert worker._match_rules(self._event("person")) == []
+        assert len(worker._match_rules(self._event("dog"))) == 1
+
+    def test_fallback_runs_only_when_configured(self):
+        """The default prompt is opt-in, not a hidden default."""
+        worker = self._worker(default_prompt="Anything dangerous here?")
+        matched = worker._match_rules(self._event())
+
+        assert len(matched) == 1
+        assert matched[0]["rule_id"] == 0
+        assert matched[0]["prompt"] == "Anything dangerous here?"
+
+    def test_wildcard_rule_matches_any_label(self):
+        worker = self._worker()
+        worker.add_rule("*", "Is anything wrong?", rule_id=7)
+
+        assert len(worker._match_rules(self._event("forklift"))) == 1
