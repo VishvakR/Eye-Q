@@ -59,8 +59,70 @@ logger = logging.getLogger(__name__)
 # materially improves verdict accuracy over free-form prose.
 VERDICT_SUFFIX = " Answer with only Yes or No."
 
+# Above this many memo entries, expired ones are swept. Keys are per subject
+# and track ids never repeat, so the memo grows with footfall rather than with
+# the number of rules.
+_MEMO_PRUNE_AT = 1024
+
+# Ceiling on how many triggers one drain may carry forward. Not the load
+# control — that is max_instances_per_batch, applied after the memo has had its
+# say — purely a guard against an unbounded backlog materialising as crops.
+_BATCH_HARD_CAP = 64
+
 
 # ── Frame Cropping ───────────────────────────────────────────────
+
+
+def crop_bounds(
+    frame_shape: tuple[int, ...],
+    bbox: BoundingBox,
+    padding_ratio: float = 0.15,
+) -> tuple[int, int, int, int]:
+    """Pixel bounds of the padded crop for a detection, as ``(x1, y1, x2, y2)``.
+
+    Split out from :func:`crop_detection` so the focused variant can reuse the
+    exact same geometry — the two must never disagree about where the crop
+    starts, or the subject would be dimmed instead of highlighted.
+
+    Both degenerate cases fall back to the whole frame: a bbox covering most of
+    the frame has no meaningful context left to add, and a crop under 32x32 is
+    too small for the VLM to read.
+
+    Args:
+        frame_shape: ``frame.shape`` of the source frame.
+        bbox: Normalized bounding box coordinates.
+        padding_ratio: Extra padding as a fraction of bbox dimensions.
+
+    Returns:
+        Pixel bounds, clamped to the frame.
+    """
+    h, w = frame_shape[:2]
+
+    # If bbox covers >80% of the frame, use the full frame
+    if bbox.area > 0.8:
+        return 0, 0, w, h
+
+    # Denormalize to pixel coordinates
+    x1 = int(bbox.x1 * w)
+    y1 = int(bbox.y1 * h)
+    x2 = int(bbox.x2 * w)
+    y2 = int(bbox.y2 * h)
+
+    # Add padding
+    pad_w = int((x2 - x1) * padding_ratio)
+    pad_h = int((y2 - y1) * padding_ratio)
+
+    # Clamp to frame bounds
+    x1 = max(0, x1 - pad_w)
+    y1 = max(0, y1 - pad_h)
+    x2 = min(w, x2 + pad_w)
+    y2 = min(h, y2 + pad_h)
+
+    # Ensure minimum crop size (at least 32×32)
+    if (x2 - x1) < 32 or (y2 - y1) < 32:
+        return 0, 0, w, h
+
+    return x1, y1, x2, y2
 
 
 def crop_detection(
@@ -85,33 +147,60 @@ def crop_detection(
         Cropped region as a new numpy array. Returns the full frame
         if the bbox covers most of the frame already.
     """
-    h, w = frame.shape[:2]
-
-    # If bbox covers >80% of the frame, return full frame
-    if bbox.area > 0.8:
-        return frame.copy()
-
-    # Denormalize to pixel coordinates
-    x1 = int(bbox.x1 * w)
-    y1 = int(bbox.y1 * h)
-    x2 = int(bbox.x2 * w)
-    y2 = int(bbox.y2 * h)
-
-    # Add padding
-    pad_w = int((x2 - x1) * padding_ratio)
-    pad_h = int((y2 - y1) * padding_ratio)
-
-    # Clamp to frame bounds
-    x1 = max(0, x1 - pad_w)
-    y1 = max(0, y1 - pad_h)
-    x2 = min(w, x2 + pad_w)
-    y2 = min(h, y2 + pad_h)
-
-    # Ensure minimum crop size (at least 32×32)
-    if (x2 - x1) < 32 or (y2 - y1) < 32:
-        return frame.copy()
-
+    x1, y1, x2, y2 = crop_bounds(frame.shape, bbox, padding_ratio)
     return frame[y1:y2, x1:x2].copy()
+
+
+def crop_detection_focused(
+    frame: np.ndarray,
+    bbox: BoundingBox,
+    padding_ratio: float = 0.15,
+    dim: float = 0.4,
+) -> np.ndarray:
+    """Crop to the detection, dimming everything outside the subject's own box.
+
+    Padding is what lets the VLM answer questions about relationships — is this
+    person bending over, is that pallet blocking the exit — so it cannot simply
+    be removed. But in a crowded frame the padding drags in the people standing
+    nearby, and "is this person missing a hard hat?" asked over a crop
+    containing two people has no single correct answer. The model will pick
+    one, and which one is not something the operator controls.
+
+    Dimming keeps the context legible while making the subject unambiguous.
+
+    Args:
+        frame: Full-resolution frame (H, W, C), BGR.
+        bbox: Normalized box of the subject to highlight.
+        padding_ratio: Extra context around the box, as a fraction of its size.
+        dim: Brightness multiplier for the context. 1.0 returns a plain crop.
+
+    Returns:
+        A new array — the crop, with the subject at full brightness.
+    """
+    x1, y1, x2, y2 = crop_bounds(frame.shape, bbox, padding_ratio)
+    crop = frame[y1:y2, x1:x2]
+
+    if dim >= 1.0:
+        return crop.copy()
+
+    h, w = frame.shape[:2]
+    crop_h, crop_w = crop.shape[:2]
+
+    # The subject's box in coordinates local to the crop. Clamped because
+    # crop_bounds falls back to the whole frame for very large or very small
+    # boxes, in which case the subject may sit anywhere inside it.
+    bx1 = max(0, min(crop_w, int(bbox.x1 * w) - x1))
+    by1 = max(0, min(crop_h, int(bbox.y1 * h) - y1))
+    bx2 = max(0, min(crop_w, int(bbox.x2 * w) - x1))
+    by2 = max(0, min(crop_h, int(bbox.y2 * h) - y1))
+
+    # One SIMD pass over a sub-megapixel crop — well under a millisecond, and
+    # convertScaleAbs already returns a fresh array.
+    out = cv2.convertScaleAbs(crop, alpha=dim)
+    if bx2 > bx1 and by2 > by1:
+        out[by1:by2, bx1:bx2] = crop[by1:by2, bx1:bx2]
+
+    return out
 
 
 # ── Worker Statistics ────────────────────────────────────────────

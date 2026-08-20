@@ -20,7 +20,11 @@ import pytest
 
 from app.pipelines.vlm_backends import MoondreamBackend
 from app.pipelines.vlm_judge import BinaryVerdictParser
-from app.pipelines.vlm_worker import VLMWorker, crop_detection
+from app.pipelines.vlm_worker import (
+    VLMWorker,
+    crop_detection,
+    crop_detection_focused,
+)
 from app.schemas.events import BoundingBox, DetectionEvent
 
 # ═══════════════════════════════════════════════════════════════════
@@ -665,3 +669,51 @@ class TestUnmatchedDetections:
         worker.add_rule("*", "Is anything wrong?", rule_id=7)
 
         assert len(worker._match_rules(self._event("forklift"))) == 1
+
+
+class TestFocusedCrop:
+    """The subject must be unambiguous when neighbours share the crop."""
+
+    def test_the_subject_keeps_its_pixels(self):
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        bbox = BoundingBox(x1=0.4, y1=0.4, x2=0.6, y2=0.6)
+
+        out = crop_detection_focused(frame, bbox, padding_ratio=0.5, dim=0.3)
+
+        assert out[out.shape[0] // 2, out.shape[1] // 2, 0] == 200
+
+    def test_the_surroundings_are_dimmed(self):
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        bbox = BoundingBox(x1=0.4, y1=0.4, x2=0.6, y2=0.6)
+
+        out = crop_detection_focused(frame, bbox, padding_ratio=0.5, dim=0.3)
+
+        assert out[0, 0, 0] < 100, "Context was not dimmed"
+
+    def test_dim_of_one_matches_a_plain_crop(self):
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        bbox = BoundingBox(x1=0.3, y1=0.3, x2=0.5, y2=0.5)
+
+        focused = crop_detection_focused(frame, bbox, padding_ratio=0.15, dim=1.0)
+        plain = crop_detection(frame, bbox, padding_ratio=0.15)
+
+        assert np.array_equal(focused, plain)
+
+    def test_the_full_frame_fallback_still_focuses(self):
+        """A near-full-frame box falls back to the whole frame; focus applies."""
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        bbox = BoundingBox(x1=0.02, y1=0.02, x2=0.96, y2=0.96)
+
+        out = crop_detection_focused(frame, bbox, padding_ratio=0.15, dim=0.3)
+
+        assert out.shape == frame.shape
+        assert out[0, 0, 0] < 100
+        assert out[240, 320, 0] == 200
+
+    def test_the_source_frame_is_never_modified(self):
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        bbox = BoundingBox(x1=0.3, y1=0.3, x2=0.5, y2=0.5)
+
+        crop_detection_focused(frame, bbox, dim=0.1)
+
+        assert frame[0, 0, 0] == 200
