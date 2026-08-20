@@ -221,6 +221,9 @@ class VLMWorkerStats:
     triggers_timed_out: int
     verdicts_positive: int
     verdicts_negative: int
+    instances_judged: int
+    instances_memoised: int
+    instances_shed: int
     avg_inference_ms: float
     last_inference_ms: float
     uptime_seconds: float
@@ -258,6 +261,12 @@ class VLMWorker:
             matches. ``None`` (the default) means an unmatched detection is
             simply ignored — the appliance should never spend an inference on
             a question the operator did not ask.
+        focus_dim: Brightness applied outside the subject's box in its crop.
+        verdict_ttl_s: Seconds a per-instance verdict is reused before that
+            subject is judged again. The load control; see the memo below.
+        rejudge_iou: Re-judge early below this IoU against the judged box.
+        min_rejudge_s: Floor between re-judgements of one subject.
+        max_instances_per_batch: Cap on subjects inferred per drained batch.
     """
 
     def __init__(
@@ -274,6 +283,11 @@ class VLMWorker:
         inference_timeout_s: float = 30.0,
         snapshot_dir: str | None = "data/snapshots",
         default_prompt: str | None = None,
+        focus_dim: float = 0.4,
+        verdict_ttl_s: float = 300.0,
+        rejudge_iou: float = 0.5,
+        min_rejudge_s: float = 20.0,
+        max_instances_per_batch: int = 8,
     ) -> None:
         self._buffer = buffer
         self._zmq_endpoint = zmq_endpoint
@@ -283,6 +297,22 @@ class VLMWorker:
         self._inference_timeout_s = inference_timeout_s
         self._snapshot_dir = snapshot_dir
         self._default_prompt = default_prompt
+        self._focus_dim = focus_dim
+        self._verdict_ttl_s = verdict_ttl_s
+        self._rejudge_iou = rejudge_iou
+        self._min_rejudge_s = min_rejudge_s
+        self._max_instances_per_batch = max_instances_per_batch
+
+        # Verdict memo: (track_id, rule_id) -> (verdict, judged_at, judged_bbox).
+        # This is the appliance's load control. Judging every tracked subject on
+        # every cooldown would multiply inference demand by the size of the
+        # crowd; reusing a verdict until the subject moves or the TTL expires
+        # spends the same budget covering everyone instead of re-asking about
+        # one person. Guarded by a lock because the batch loop reads and writes
+        # it while rules are synced from the API thread.
+        self._memo: dict[tuple[int, int], tuple[bool, float, BoundingBox]] = {}
+        self._judged_tracks: set[int] = set()
+        self._memo_lock = threading.Lock()
 
         # VLM backend (loaded lazily inside the worker thread)
         self._vlm: VLMBackend = backend or MoondreamBackend(
@@ -319,6 +349,9 @@ class VLMWorker:
         self._triggers_timed_out = 0
         self._verdicts_positive = 0
         self._verdicts_negative = 0
+        self._instances_judged = 0
+        self._instances_memoised = 0
+        self._instances_shed = 0
         self._inference_times: list[float] = []
         self._last_inference_ms: float = 0.0
         self._start_time: float = 0.0
@@ -415,6 +448,100 @@ class VLMWorker:
 
         return matched
 
+    def _rules_to_judge(self, event: DetectionEvent) -> list[dict]:
+        """Rules for this detection that are not already answered.
+
+        Wraps :meth:`_match_rules` rather than replacing it, so rule matching
+        stays a pure function of the rule table while the memo — which is
+        stateful and time-dependent — is layered on top and testable alone.
+
+        A rule is skipped when this exact subject was judged for it recently
+        enough that the answer is still expected to hold. "Recently enough"
+        means all of:
+
+            - the subject has a stable id (an untracked detection is nobody in
+              particular, and treating it as somebody would blind the appliance
+              to everyone after the first person it ever saw);
+            - the verdict is younger than the TTL; and
+            - the subject has not moved far from where it was judged — unless
+              it moved within the re-judge floor, which stops a walking subject
+              from demanding a fresh inference every stride.
+        """
+        matched = self._match_rules(event)
+        if not matched or event.track_id < 0 or self._verdict_ttl_s <= 0:
+            return matched
+
+        now = time.monotonic()
+        unjudged = []
+
+        with self._memo_lock:
+            for rule in matched:
+                entry = self._memo.get((event.track_id, rule["rule_id"]))
+                if entry is None:
+                    unjudged.append(rule)
+                    continue
+
+                _verdict, judged_at, judged_bbox = entry
+                age = now - judged_at
+
+                if age >= self._verdict_ttl_s:
+                    unjudged.append(rule)
+                    continue
+
+                moved = event.bbox.iou(judged_bbox) < self._rejudge_iou
+                if moved and age >= self._min_rejudge_s:
+                    unjudged.append(rule)
+                    continue
+
+                self._instances_memoised += 1
+
+        return unjudged
+
+    def _remember_verdict(
+        self, event: DetectionEvent, rule_id: int, verdict: bool
+    ) -> None:
+        """Record a verdict so this subject is not re-asked immediately."""
+        if event.track_id < 0 or self._verdict_ttl_s <= 0:
+            return
+
+        with self._memo_lock:
+            self._memo[(event.track_id, rule_id)] = (
+                verdict,
+                time.monotonic(),
+                event.bbox,
+            )
+            self._judged_tracks.add(event.track_id)
+
+            if len(self._memo) > _MEMO_PRUNE_AT:
+                self._prune_memo()
+
+    def _prune_memo(self) -> None:
+        """Drop expired memo entries. Caller holds the lock.
+
+        Entries past the TTL would be re-judged anyway, so dropping them is
+        exact. Track ids never repeat, so without this the memo would grow for
+        the life of the process.
+        """
+        now = time.monotonic()
+        self._memo = {
+            key: entry
+            for key, entry in self._memo.items()
+            if now - entry[1] < self._verdict_ttl_s
+        }
+        self._judged_tracks = {track_id for track_id, _rule_id in self._memo}
+
+    def _is_new_subject(self, track_id: int) -> bool:
+        """Whether this subject has never been judged.
+
+        Drives batch priority: a person nobody has looked at yet outranks a
+        re-check of someone already cleared, so a crowd delays re-checks rather
+        than first looks.
+        """
+        if track_id < 0:
+            return True
+        with self._memo_lock:
+            return track_id not in self._judged_tracks
+
     # ── Lifecycle ────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -489,6 +616,9 @@ class VLMWorker:
             triggers_timed_out=self._triggers_timed_out,
             verdicts_positive=self._verdicts_positive,
             verdicts_negative=self._verdicts_negative,
+            instances_judged=self._instances_judged,
+            instances_memoised=self._instances_memoised,
+            instances_shed=self._instances_shed,
             avg_inference_ms=avg_ms,
             last_inference_ms=self._last_inference_ms,
             uptime_seconds=uptime,
@@ -513,20 +643,17 @@ class VLMWorker:
 
         try:
             while not self._shutdown_event.is_set():
-                for payload in self._collect_batch(subscriber):
-                    if self._shutdown_event.is_set():
-                        break
-                    try:
-                        self._process_trigger(payload, publisher)
-                    except Exception as exc:
-                        self._triggers_failed += 1
-                        logger.error(
-                            f"VLMWorker: trigger processing failed: {exc}",
-                            exc_info=True,
-                        )
-                    finally:
-                        # Always release accelerator memory back to YOLO
-                        self._vlm.cleanup()
+                batch = self._collect_batch(subscriber)
+                if not batch:
+                    continue
+                try:
+                    self._process_batch(batch, publisher)
+                except Exception as exc:
+                    self._triggers_failed += 1
+                    logger.error(
+                        f"VLMWorker: batch processing failed: {exc}",
+                        exc_info=True,
+                    )
 
         finally:
             publisher.close()
@@ -558,26 +685,41 @@ class VLMWorker:
         pending.extend(payload for _topic, payload in subscriber.drain(max_messages=512))
         self._triggers_received += len(pending)
 
-        newest: dict[str, dict] = {}
+        # Keyed by *subject*, not by label. Keying on the label alone was the
+        # defect that made a frame of five workers yield one judgement: four
+        # of the five were discarded here as "superseded" when they were in
+        # fact different people. An untracked payload carries track_id -1, so
+        # all of them share one key and the old per-label behaviour is
+        # reproduced exactly.
+        newest: dict[tuple[str, int], dict] = {}
         for payload in pending:
-            label = payload.get("label", "")
-            current = newest.get(label)
+            key = (payload.get("label", ""), payload.get("track_id", -1))
+            current = newest.get(key)
             if current is None or payload.get("timestamp", 0.0) > current.get(
                 "timestamp", 0.0
             ):
-                newest[label] = payload
+                newest[key] = payload
 
         coalesced = len(pending) - len(newest)
         if coalesced:
             self._triggers_coalesced += coalesced
             logger.debug(
                 f"Coalesced {coalesced} superseded trigger(s); "
-                f"processing {len(newest)} label(s)."
+                f"processing {len(newest)} subject(s)."
             )
 
-        return sorted(
+        batch = sorted(
             newest.values(), key=lambda p: p.get("timestamp", 0.0), reverse=True
         )
+
+        if len(batch) > _BATCH_HARD_CAP:
+            logger.warning(
+                f"Backlog of {len(batch)} subjects exceeds the batch ceiling; "
+                f"carrying {_BATCH_HARD_CAP} forward."
+            )
+            batch = batch[:_BATCH_HARD_CAP]
+
+        return batch
 
     def _infer(self, image: Image.Image, prompt: str) -> str:
         """Run a single VLM query under a hard timeout.
@@ -619,57 +761,168 @@ class VLMWorker:
             return None
 
     def _process_trigger(self, payload: dict, publisher: EventPublisher) -> None:
-        """Process a single detection trigger end to end."""
-        event = DetectionEvent(**payload)
+        """Process a single detection trigger end to end.
 
-        # ── Staleness check ──────────────────────────────────────
-        age = time.monotonic() - event.timestamp
-        if age > self._staleness_threshold:
-            self._triggers_stale += 1
-            logger.warning(
-                f"Discarding stale trigger: {event.label} "
-                f"from {age:.1f}s ago (threshold: {self._staleness_threshold}s)"
-            )
-            return
+        A one-element batch. Kept as its own entry point because a single
+        trigger is the natural unit to reason about and to test.
+        """
+        self._process_batch([payload], publisher)
 
-        # ── Select rules before doing any expensive work ─────────
-        rules = self._match_rules(event)
-        if not rules:
-            return
-
-        # ── Fetch frame from buffer ──────────────────────────────
+    def _read_frame(self, event: DetectionEvent) -> np.ndarray | None:
+        """Fetch the frame a detection came from, or None if it is gone."""
         frame_result = self._buffer.read_by_timestamp(event.timestamp, tolerance_ms=500.0)
+        if frame_result is not None:
+            return frame_result[0]
 
-        if frame_result is None:
-            # Try direct index access as fallback
+        # Try direct index access as fallback. frame_index is a ring-buffer
+        # *slot*, not a monotonic frame number, so once the buffer wraps that
+        # slot holds a different frame entirely. Verify the timestamp before
+        # trusting it — judging an unrelated frame and filing the verdict
+        # against this detection's bbox is worse than judging nothing.
+        try:
+            frame, ts = self._buffer.read_at_index(event.frame_index)
+        except (IndexError, RuntimeError):
+            return None
+
+        if frame is None or abs(ts - event.timestamp) > 0.5:
+            return None
+        return frame
+
+    def _process_batch(self, payloads: list[dict], publisher: EventPublisher) -> None:
+        """Judge a whole drained batch: crop everything first, then infer.
+
+        The ordering here is the point of the method, not an implementation
+        detail. Inference takes seconds; the ring buffer holds seconds. So if
+        the frame were fetched immediately before each inference — as it was
+        when a trigger was the unit of work — then the second subject in a
+        group would find its frame already overwritten and its trigger already
+        past the staleness threshold, and would be dropped without ever being
+        looked at. That is invisible in a single-subject scene and total in a
+        crowded one.
+
+        Cropping every subject up front costs ~1 ms each and a couple of
+        megabytes, and makes the buffer irrelevant by the time the slow part
+        starts.
+        """
+        events: list[DetectionEvent] = []
+        for payload in payloads:
             try:
-                frame, ts = self._buffer.read_at_index(event.frame_index)
-                frame_result = (frame, ts, event.frame_index)
-            except (IndexError, RuntimeError):
+                events.append(DetectionEvent(**payload))
+            except Exception as exc:
                 self._triggers_failed += 1
+                logger.warning(f"Discarding malformed detection payload: {exc}")
+
+        if not events:
+            return
+
+        # Subjects from one frame share a timestamp exactly — it is copied, not
+        # recomputed, per box — so this groups by source frame.
+        groups: dict[float, list[DetectionEvent]] = {}
+        for event in events:
+            groups.setdefault(event.timestamp, []).append(event)
+
+        prepared: list[tuple[DetectionEvent, list[dict], np.ndarray, bool]] = []
+
+        for timestamp in sorted(groups, reverse=True):
+            group = groups[timestamp]
+
+            # ── Staleness, once for the whole frame ──────────────
+            age = time.monotonic() - timestamp
+            if age > self._staleness_threshold:
+                self._triggers_stale += len(group)
                 logger.warning(
-                    f"Frame not found for trigger at t={event.timestamp:.3f} "
-                    f"(index={event.frame_index}). Buffer may have wrapped."
+                    f"Discarding {len(group)} stale trigger(s) from {age:.1f}s ago "
+                    f"(threshold: {self._staleness_threshold}s)"
                 )
-                return
+                continue
 
-        frame, _actual_ts, _slot_idx = frame_result
+            # ── Decide what is worth asking before touching pixels ──
+            pending = [(event, rules) for event in group if (rules := self._rules_to_judge(event))]
+            if not pending:
+                continue
 
-        # ── Crop to bounding box ─────────────────────────────────
-        cropped = crop_detection(frame, event.bbox, self._crop_padding)
+            frame = self._read_frame(group[0])
+            if frame is None:
+                self._triggers_failed += len(pending)
+                logger.warning(
+                    f"Frame not found for {len(pending)} trigger(s) at "
+                    f"t={timestamp:.3f}. Buffer has wrapped."
+                )
+                continue
+
+            for event, rules in pending:
+                cropped = crop_detection_focused(
+                    frame, event.bbox, self._crop_padding, self._focus_dim
+                )
+                prepared.append(
+                    (event, rules, cropped, self._is_new_subject(event.track_id))
+                )
+
+            del frame
+
+        if not prepared:
+            return
+
+        # Never-judged subjects first: under load the appliance should delay
+        # re-checking someone it already cleared, never delay a first look at
+        # someone it has not seen.
+        prepared.sort(key=lambda item: (not item[3], -item[0].timestamp))
+
+        if len(prepared) > self._max_instances_per_batch:
+            shed = len(prepared) - self._max_instances_per_batch
+            self._instances_shed += shed
+            logger.info(
+                f"Judging {self._max_instances_per_batch} of {len(prepared)} subjects; "
+                f"{shed} deferred to the next batch."
+            )
+            prepared = prepared[: self._max_instances_per_batch]
+
+        for event, rules, cropped, _is_new in prepared:
+            if self._shutdown_event.is_set():
+                break
+            try:
+                if not self._judge_instance(event, rules, cropped, publisher):
+                    # A hung inference. The executor has a single worker and
+                    # Moondream cannot be interrupted, so everything behind it
+                    # would queue on a thread that is never coming back.
+                    logger.error("Abandoning the rest of the batch after a timeout.")
+                    break
+            except Exception as exc:
+                self._triggers_failed += 1
+                logger.error(f"VLMWorker: judging failed: {exc}", exc_info=True)
+            finally:
+                # Always release accelerator memory back to YOLO
+                self._vlm.cleanup()
+
+    def _judge_instance(
+        self,
+        event: DetectionEvent,
+        rules: list[dict],
+        cropped: np.ndarray,
+        publisher: EventPublisher,
+    ) -> bool:
+        """Ask every pending rule about one subject and publish the verdicts.
+
+        Returns:
+            False if an inference timed out and the batch should be abandoned.
+        """
         pil_image = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
 
-        # One evidence JPEG per trigger, shared by every rule it fires.
+        # One evidence JPEG per subject, shared by every rule asked about them.
         snapshot_path: str | None = None
         snapshot_written = False
 
-        # ── Query VLM for each matching rule ─────────────────────
+        self._instances_judged += 1
+
         for rule in rules:
             prompt = rule["prompt"]
             rule_id = rule["rule_id"]
             rule_name = rule.get("rule_name", "")
 
-            logger.info(f"VLM query: [{event.label}] '{prompt[:80]}' (rule_id={rule_id})")
+            logger.info(
+                f"VLM query: [{event.label}#{event.track_id}] "
+                f"'{prompt[:80]}' (rule_id={rule_id})"
+            )
 
             start_time = time.monotonic()
             try:
@@ -682,9 +935,9 @@ class VLMWorker:
                 self._vlm.request_stop()
                 logger.error(
                     f"VLM inference exceeded {self._inference_timeout_s}s "
-                    f"for rule_id={rule_id}. Aborting and skipping trigger."
+                    f"for rule_id={rule_id}."
                 )
-                continue
+                return False
             except Exception as exc:
                 self._triggers_failed += 1
                 logger.error(f"VLM inference failed: {exc}")
@@ -704,6 +957,8 @@ class VLMWorker:
                 self._verdicts_positive += 1
             else:
                 self._verdicts_negative += 1
+
+            self._remember_verdict(event, rule_id, verdict)
 
             if not snapshot_written:
                 snapshot_path = self._save_snapshot(cropped)
@@ -732,6 +987,8 @@ class VLMWorker:
 
             # Hand off to the control plane (persist + broadcast + webhook)
             publisher.publish("vlm_result", result.model_dump())
+
+        return True
 
     def __repr__(self) -> str:
         status = "running" if self.is_running else "stopped"

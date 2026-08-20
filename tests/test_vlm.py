@@ -671,6 +671,261 @@ class TestUnmatchedDetections:
         assert len(worker._match_rules(self._event("forklift"))) == 1
 
 
+class TestMultiInstanceJudging:
+    """Every subject in a frame must be judged, not just the first per label.
+
+    Regression suite for the defect where "alert if a person has no helmet"
+    judged one arbitrary person out of a group, so a lone violator among
+    compliant workers was usually never looked at.
+    """
+
+    def _worker(self, backend=None, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        buffer.read_at_index.return_value = (frame, time.monotonic())
+
+        if backend is None:
+            backend = MagicMock()
+            backend.query.return_value = "Yes"
+            backend.model_name = "fake"
+
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person missing a hard hat?", rule_id=1)
+        return worker, buffer, backend
+
+    def _payload(self, track_id, timestamp=None, x=0.1):
+        return {
+            "timestamp": timestamp if timestamp is not None else time.monotonic(),
+            "camera_id": "test",
+            "label": "person",
+            "confidence": 0.9,
+            "bbox": {"x1": x, "y1": 0.1, "x2": x + 0.08, "y2": 0.5},
+            "frame_index": 0,
+            "track_id": track_id,
+        }
+
+    def test_five_people_in_one_frame_are_all_judged(self):
+        """The headline fix."""
+        worker, _buffer, backend = self._worker()
+        ts = time.monotonic()
+        batch = [self._payload(i, ts, x=0.1 * i) for i in range(1, 6)]
+
+        worker._process_batch(batch, MagicMock())
+
+        assert backend.query.call_count == 5
+
+    def test_one_frame_is_read_once_for_the_whole_group(self):
+        """Crops come from a single read, not one read per subject."""
+        worker, buffer, _backend = self._worker()
+        ts = time.monotonic()
+        batch = [self._payload(i, ts, x=0.1 * i) for i in range(1, 6)]
+
+        worker._process_batch(batch, MagicMock())
+
+        assert buffer.read_by_timestamp.call_count == 1
+
+    def test_crops_are_taken_before_any_inference_runs(self):
+        """The staleness trap: pixels must be in hand before the slow part.
+
+        Inference takes seconds and the ring buffer holds seconds, so a design
+        that fetched each frame just before its own inference would find the
+        frame gone for every subject after the first.
+        """
+        reads_at_query_time = []
+
+        worker, buffer, backend = self._worker()
+        backend.query.side_effect = lambda *a, **k: (
+            reads_at_query_time.append(buffer.read_by_timestamp.call_count) or "Yes"
+        )
+
+        ts = time.monotonic()
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 6)], MagicMock())
+
+        assert reads_at_query_time == [1, 1, 1, 1, 1], (
+            "The buffer was read during inference — crops are not taken up front"
+        )
+
+    def test_a_vanished_frame_cannot_silently_judge_a_different_one(self):
+        """A wrapped ring buffer must drop the trigger, not judge junk."""
+        worker, buffer, backend = self._worker()
+        buffer.read_by_timestamp.return_value = None
+        # The slot now holds a frame from a completely different moment.
+        buffer.read_at_index.return_value = (
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            time.monotonic() - 60.0,
+        )
+
+        worker._process_batch([self._payload(1)], MagicMock())
+
+        assert backend.query.call_count == 0
+
+    def test_each_subject_gets_its_own_verdict_published(self):
+        worker, _buffer, backend = self._worker()
+        backend.query.side_effect = ["Yes", "No", "No"]
+        publisher = MagicMock()
+
+        ts = time.monotonic()
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in (1, 2, 3)], publisher)
+
+        verdicts = [call.args[1]["verdict"] for call in publisher.publish.call_args_list]
+        track_ids = [
+            call.args[1]["query"]["detection"]["track_id"]
+            for call in publisher.publish.call_args_list
+        ]
+        assert verdicts == [True, False, False]
+        assert set(track_ids) == {1, 2, 3}
+
+    def test_the_batch_cap_bounds_the_work(self):
+        worker, _buffer, backend = self._worker(max_instances_per_batch=3)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.05 * i) for i in range(1, 11)], MagicMock())
+
+        assert backend.query.call_count == 3
+        assert worker.stats.instances_shed == 7
+
+    def test_never_seen_subjects_are_judged_before_re_checks(self):
+        """A crowd must delay re-checks, never a first look at someone new."""
+        worker, _buffer, _backend = self._worker(
+            max_instances_per_batch=2, verdict_ttl_s=0.0
+        )
+        publisher = MagicMock()
+        ts = time.monotonic()
+
+        # Subjects 1 and 2 are already known; 8 and 9 have never been seen.
+        worker._judged_tracks.update({1, 2})
+
+        worker._process_batch(
+            [self._payload(t, ts, x=0.05 * t) for t in (1, 2, 8, 9)], publisher
+        )
+
+        judged = {
+            call.args[1]["query"]["detection"]["track_id"]
+            for call in publisher.publish.call_args_list
+        }
+        assert judged == {8, 9}, (
+            f"Re-checks displaced first looks at new subjects: judged {judged}"
+        )
+
+    def test_a_stale_group_is_dropped_before_the_buffer_is_touched(self):
+        worker, buffer, backend = self._worker(staleness_threshold_s=2.0)
+        old = time.monotonic() - 30.0
+
+        worker._process_batch([self._payload(i, old, x=0.1 * i) for i in (1, 2, 3)], MagicMock())
+
+        assert buffer.read_by_timestamp.call_count == 0
+        assert backend.query.call_count == 0
+        assert worker.stats.triggers_stale == 3
+
+
+class TestVerdictMemo:
+    """Reusing a verdict is what keeps per-subject judging affordable."""
+
+    def _worker(self, **kwargs):
+        worker = VLMWorker(buffer=MagicMock(), backend=MagicMock(), **kwargs)
+        worker.add_rule("person", "Is this person missing a hard hat?", rule_id=1)
+        return worker
+
+    def _event(self, track_id=1, x=0.1):
+        return DetectionEvent(
+            timestamp=time.monotonic(),
+            camera_id="test",
+            label="person",
+            confidence=0.9,
+            bbox=BoundingBox(x1=x, y1=0.1, x2=x + 0.1, y2=0.5),
+            frame_index=0,
+            track_id=track_id,
+        )
+
+    def test_an_unjudged_subject_has_work_to_do(self):
+        worker = self._worker()
+        assert len(worker._rules_to_judge(self._event())) == 1
+
+    def test_a_judged_subject_is_not_asked_again(self):
+        worker = self._worker(verdict_ttl_s=300.0)
+        event = self._event()
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+
+        assert worker._rules_to_judge(event) == []
+
+    def test_a_different_subject_is_still_asked(self):
+        """The memo must be per person, or one worker would mask the rest."""
+        worker = self._worker(verdict_ttl_s=300.0)
+        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=False)
+
+        assert len(worker._rules_to_judge(self._event(track_id=2))) == 1
+
+    def test_the_memo_expires(self):
+        worker = self._worker(verdict_ttl_s=0.05)
+        event = self._event()
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+        assert worker._rules_to_judge(event) == []
+
+        time.sleep(0.1)
+        assert len(worker._rules_to_judge(event)) == 1
+
+    def test_movement_within_the_floor_does_not_re_judge(self):
+        """Without this floor a single walker saturates the VLM."""
+        worker = self._worker(verdict_ttl_s=300.0, min_rejudge_s=60.0, rejudge_iou=0.5)
+        worker._remember_verdict(self._event(track_id=1, x=0.1), rule_id=1, verdict=False)
+
+        # Same person, now nowhere near where they were judged.
+        moved = self._event(track_id=1, x=0.8)
+        assert worker._rules_to_judge(moved) == []
+
+    def test_movement_past_the_floor_does_re_judge(self):
+        worker = self._worker(verdict_ttl_s=300.0, min_rejudge_s=0.0, rejudge_iou=0.5)
+        worker._remember_verdict(self._event(track_id=1, x=0.1), rule_id=1, verdict=False)
+
+        moved = self._event(track_id=1, x=0.8)
+        assert len(worker._rules_to_judge(moved)) == 1
+
+    def test_a_stationary_subject_is_never_re_judged_by_movement(self):
+        worker = self._worker(verdict_ttl_s=300.0, min_rejudge_s=0.0, rejudge_iou=0.5)
+        event = self._event(track_id=1, x=0.1)
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+
+        assert worker._rules_to_judge(self._event(track_id=1, x=0.1)) == []
+
+    def test_untracked_detections_are_never_memoised(self):
+        """Otherwise every untracked subject collapses onto one key.
+
+        The appliance would judge the first person it ever saw and treat every
+        person thereafter as already answered.
+        """
+        worker = self._worker(verdict_ttl_s=300.0)
+        event = self._event(track_id=-1)
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+
+        assert len(worker._rules_to_judge(event)) == 1
+        assert worker._memo == {}
+
+    def test_the_memo_is_per_rule(self):
+        worker = self._worker(verdict_ttl_s=300.0)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=2)
+        event = self._event()
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+
+        remaining = worker._rules_to_judge(event)
+        assert [r["rule_id"] for r in remaining] == [2]
+
+    def test_a_zero_ttl_disables_reuse(self):
+        worker = self._worker(verdict_ttl_s=0.0)
+        event = self._event()
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+
+        assert len(worker._rules_to_judge(event)) == 1
+
+    def test_the_memo_stays_bounded(self):
+        """Track ids never repeat, so without pruning this grows forever."""
+        worker = self._worker(verdict_ttl_s=0.05)
+        for track_id in range(3000):
+            worker._remember_verdict(self._event(track_id=track_id), rule_id=1, verdict=False)
+
+        assert len(worker._memo) < 2000, f"Memo leaked to {len(worker._memo)} entries"
+
+
 class TestFocusedCrop:
     """The subject must be unambiguous when neighbours share the crop."""
 
