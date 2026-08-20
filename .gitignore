@@ -52,3 +52,6 @@ Thumbs.db
 
 # Note: uv.lock IS committed — it pins the exact dependency graph so
 # `uv sync` reproduces this environment.
+
+# Benchmark fixtures — regenerated from source footage by bench/make_fixtures.py.
+/bench/fixtures/
