@@ -51,6 +51,10 @@ let streamFallbackTimer = null;
  * never retries on its own — so a single transient failure at page load would
  * otherwise leave a permanently broken panel.
  */
+// How long to let the MJPEG stream prove it can render before giving up on it.
+// Generous, because the first frame waits on camera open plus YOLO warm-up.
+const STREAM_BLANK_TIMEOUT_MS = 8000;
+
 function startCameraStream() {
     const img = document.getElementById('camera-stream');
     if (!img) return;
@@ -63,6 +67,17 @@ function startCameraStream() {
     if (!img.getAttribute('src')) {
         img.src = `/api/stream/${CAMERA_ID}.mjpg`;
     }
+
+    // A stream that connects but renders nothing is the failure onerror cannot
+    // see: the response is open and valid, so the browser reports no error, and
+    // the panel just stays blank. naturalWidth is the only honest signal that
+    // no image ever arrived.
+    setTimeout(() => {
+        if (!streamFallbackTimer && img.naturalWidth === 0) {
+            console.warn('MJPEG stream produced no image; falling back to polling.');
+            useSnapshotFallback();
+        }
+    }, STREAM_BLANK_TIMEOUT_MS);
 }
 
 // Exposed on window so the inline onerror in index.html can reach it.
