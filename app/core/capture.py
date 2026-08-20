@@ -9,6 +9,9 @@ Features:
     - Supports RTSP streams, MP4/AVI files, and USB/webcam device indices
     - Exponential backoff reconnection for RTSP streams (1s → 2s → 4s → 8s → 16s)
     - Configurable target FPS with frame-skip logic
+    - File sources play at their native frame rate and loop seamlessly, so a
+      recorded clip behaves like a live camera instead of being decoded as
+      fast as the CPU allows
     - Runtime statistics: captured frames, dropped frames, current FPS
     - Graceful shutdown via ``threading.Event``
 
@@ -27,12 +30,33 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 
 from app.core.buffer import RollingFrameBuffer
 
 logger = logging.getLogger(__name__)
+
+# Schemes that denote a live network stream rather than a file on disk.
+_STREAM_SCHEMES = ("rtsp://", "rtmp://", "http://", "https://", "udp://", "tcp://")
+
+
+def is_file_source(source: str | int) -> bool:
+    """Whether ``source`` names a video file on disk.
+
+    Device indices and network stream URIs are live sources: they arrive in
+    real time on their own and must never be paced or rewound. Only a path
+    that exists on disk gets the recorded-clip treatment.
+    """
+    if not isinstance(source, str):
+        return False
+    if source.lower().startswith(_STREAM_SCHEMES):
+        return False
+    try:
+        return Path(source).is_file()
+    except OSError:
+        return False
 
 
 @dataclass
@@ -49,6 +73,8 @@ class CaptureStats:
     target_fps: int
     uptime_seconds: float
     reconnect_attempts: int
+    source_fps: float = 0.0
+    loops_completed: int = 0
 
 
 class VideoCapture:
@@ -67,6 +93,12 @@ class VideoCapture:
         reconnect_max_retries: Maximum consecutive reconnection attempts.
         reconnect_base_delay: Initial delay between reconnections (seconds).
                               Doubles with each attempt (exponential backoff).
+        loop_file: Rewind file sources to frame 0 on EOF instead of ending the
+                   session. Ignored for live sources.
+        realtime_file: Pace file sources at their recorded frame rate. Without
+                       it a clip is decoded as fast as the CPU allows, which
+                       turns a 17-second recording into a sub-second blur and
+                       hands Stage 1 frames that jump seconds apart.
     """
 
     # Minimum wall-clock duration a connection must last before a drop is
@@ -81,6 +113,8 @@ class VideoCapture:
         target_fps: int = 30,
         reconnect_max_retries: int = 5,
         reconnect_base_delay: float = 1.0,
+        loop_file: bool = True,
+        realtime_file: bool = True,
     ) -> None:
         self._source = source
         self._buffer = buffer
@@ -88,9 +122,17 @@ class VideoCapture:
         self._target_fps = target_fps
         self._reconnect_max_retries = reconnect_max_retries
         self._reconnect_base_delay = reconnect_base_delay
+        self._loop_file = loop_file
+        self._realtime_file = realtime_file
+        self._is_file = is_file_source(source)
 
         # Frame timing
         self._frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+
+        # Playback state for file sources
+        self._source_fps: float = 0.0
+        self._loops_completed = 0
+        self._frames_since_rewind = 0
 
         # Thread coordination
         self._shutdown_event = threading.Event()
@@ -185,6 +227,8 @@ class VideoCapture:
             target_fps=self._target_fps,
             uptime_seconds=uptime,
             reconnect_attempts=self._reconnect_attempts,
+            source_fps=self._source_fps,
+            loops_completed=self._loops_completed,
         )
 
     # ── Internal Capture Loop ────────────────────────────────────
@@ -270,9 +314,19 @@ class VideoCapture:
                     w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     fps = self._cap.get(cv2.CAP_PROP_FPS)
+                    # A file's declared FPS drives playback pacing. Some
+                    # containers report 0 or NaN; those fall back to target_fps.
+                    self._source_fps = fps if fps and fps > 0 and fps < 1000 else 0.0
+                    self._frames_since_rewind = 0
                     logger.info(
                         f"VideoCapture '{self._camera_id}': connected. "
                         f"Source resolution: {w}×{h} @ {fps:.1f} FPS"
+                        + (
+                            f" (file playback @ {1.0 / self._playback_interval():.1f} FPS"
+                            f"{', looping' if self._loop_file else ''})"
+                            if self._playback_interval() > 0.0
+                            else ""
+                        )
                     )
                     return True
 
@@ -296,22 +350,50 @@ class VideoCapture:
     def _run_capture(self) -> None:
         """Continuously grab and decode frames from the connected source.
 
-        Implements frame-rate control: if the source produces frames
-        faster than ``target_fps``, excess frames are grabbed (to keep
-        the RTSP buffer current) but not decoded or stored.
+        Two rates are in play and they do different jobs:
+
+        - **Grab rate.** Live sources are grabbed as fast as they arrive, which
+          keeps the RTSP buffer current. File sources are grabbed on a clock
+          derived from their recorded FPS, so a 17-second clip takes 17
+          seconds rather than being decoded at whatever rate the CPU manages.
+        - **Write rate.** Independently of the above, frames arriving faster
+          than ``target_fps`` are grabbed but not decoded or stored, so a
+          30 FPS file still writes at 2 FPS when asked to — in real time, by
+          skipping frames rather than by playing in slow motion.
+
+        On EOF a looping file seeks back to frame 0 and keeps the same
+        session, so the buffer never goes dark between passes.
         """
         if self._cap is None:
             return
 
+        grab_interval = self._playback_interval()
+        next_grab = time.monotonic()
+
         while not self._shutdown_event.is_set():
             try:
+                if grab_interval > 0.0:
+                    # Pace file playback. wait() rather than sleep() so a
+                    # shutdown lands immediately instead of after the frame.
+                    delay = next_grab - time.monotonic()
+                    if delay > 0 and self._shutdown_event.wait(timeout=delay):
+                        return
+                    next_grab += grab_interval
+                    # Never bank a catch-up burst: if decode fell behind (or
+                    # the process was suspended), resume from now instead of
+                    # replaying the backlog at full speed.
+                    next_grab = max(next_grab, time.monotonic())
+
                 # Always grab the latest frame (keeps RTSP stream current)
                 grabbed = self._cap.grab()
                 if not grabbed:
+                    if self._rewind():
+                        continue
                     # Stream ended or disconnected
                     self._is_connected = False
                     return
 
+                self._frames_since_rewind += 1
                 now = time.monotonic()
                 elapsed = now - self._last_write_time
 
@@ -347,6 +429,49 @@ class VideoCapture:
 
                 # Small delay to prevent tight error loops
                 self._shutdown_event.wait(timeout=0.01)
+
+    def _playback_interval(self) -> float:
+        """Seconds between grabs for a paced file source, or 0.0 for live ones.
+
+        Returns 0.0 whenever the source is live or pacing is disabled, which
+        is the caller's signal to grab as fast as frames arrive.
+        """
+        if not (self._is_file and self._realtime_file):
+            return 0.0
+
+        fps = self._source_fps if self._source_fps > 0 else float(self._target_fps)
+        return 1.0 / fps if fps > 0 else 0.0
+
+    def _rewind(self) -> bool:
+        """Seek a looping file source back to its first frame.
+
+        Returns:
+            True if the source was rewound and capture should continue.
+            False for live sources, for non-looping files, and when the
+            previous rewind yielded no frames — a container whose seek
+            silently fails would otherwise spin here forever, so it is handed
+            to the reconnect path, which reopens the file from scratch.
+        """
+        if self._cap is None or not (self._is_file and self._loop_file):
+            return False
+
+        if self._frames_since_rewind == 0:
+            logger.warning(
+                f"VideoCapture '{self._camera_id}': rewind produced no frames "
+                f"for '{self._source}' — reopening the source instead."
+            )
+            return False
+
+        if not self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
+            return False
+
+        self._frames_since_rewind = 0
+        self._loops_completed += 1
+        logger.debug(
+            f"VideoCapture '{self._camera_id}': looped "
+            f"'{self._source}' ({self._loops_completed} pass(es))."
+        )
+        return True
 
     def _release_capture(self) -> None:
         """Release the OpenCV capture handle."""
