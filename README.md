@@ -42,6 +42,51 @@ EYEQ_DEFAULT_SOURCE="/path/to/video.mp4" uv run eyeq
 The dashboard will be available at `http://localhost:8000`, with a live
 MJPEG preview, the rule editor, and the alert feed.
 
+Video files play at their recorded frame rate and loop seamlessly, so a
+recorded clip drives the appliance exactly like a live camera.
+
+## Try the Demo
+
+`cctv_demo.mp4` is 17 seconds of warehouse CCTV — staff in hi-vis vests packing
+cartons. `demo_cctv.py` points the appliance at it and seeds a rule set tuned
+for the footage. The clip itself is not committed (`*.mp4` is gitignored, and
+sample footage is large); drop it in the project root before running:
+
+```bash
+uv run python demo_cctv.py            # Full cascade + dashboard on :8000
+uv run python demo_cctv.py --stage1   # Stage 1 only — skips the 3.5 GB VLM load
+uv run python demo_cctv.py --window   # Native OpenCV window instead of the browser
+uv run python demo_cctv.py --reset    # Start from an empty alert log
+```
+
+YOLOv8n can only say *"person"* about these workers. The demo's rules are
+everything Stage 2 gets asked on top of that label, in plain English:
+
+| Rule | Prompt | Expect |
+|---|---|---|
+| Manual handling — bending over | *Is this person bending over?* | 🔴 on ~⅓ of workers |
+| PPE — missing hi-vis vest | *Is this person wearing plain dark clothing, with no high-visibility orange or yellow safety vest?* | 🟢 — everyone here is vested |
+| Manual handling — carrying a box | *Is this person carrying a box?* | disabled; enable it from the dashboard |
+
+The demo writes to `data/demo.db` and `data/demo_snapshots/`, so it never
+touches the alert history of a real deployment.
+
+### Writing your own rules
+
+Two things decide whether a prompt works, both learned from tuning the above:
+
+- **Phrase it so "Yes" means trouble.** An affirmative answer is recorded as a
+  violation and shown in red. *"Is this person wearing a vest?"* flags every
+  compliant worker.
+- **Ask one thing per rule.** Given *"Is this person bending over or leaning
+  across the table?"*, Moondream replies `"Bending over"` — it picks a branch
+  instead of answering Yes or No, and that non-answer is read conservatively as
+  "no violation". Split compound conditions into separate rules.
+
+Match the rule to what the camera can actually resolve, too. In this clip a
+worker's head is ~20 px tall, and hard-hat questions come back "No" regardless
+of what is on their head — which is why the demo ships no such rule.
+
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the architecture, component
 reference, and how to swap the VLM model.
 
@@ -59,6 +104,29 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_VLM_MODEL` | `vikhyatk/moondream2` | Swap in Qwen2-VL-2B, SmolVLM, etc. |
 | `EYEQ_API_PORT` | `8000` | Dashboard & API port |
 | `EYEQ_WEBHOOK_URL` | `None` | Webhook endpoint for alerts |
+| `EYEQ_TRACK_ENABLED` | `true` | Judge every subject in a frame, not one per label |
+| `EYEQ_TRACK_IOU_THRESHOLD` | `0.2` | Minimum overlap to treat two boxes as the same subject |
+| `EYEQ_VLM_VERDICT_TTL_S` | `300` | Seconds a subject's verdict is reused before re-judging |
+| `EYEQ_VLM_MIN_REJUDGE_S` | `20` | Floor between re-judgements of one subject |
+| `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Subjects judged per drain cycle |
+| `EYEQ_VLM_FOCUS_DIM` | `0.4` | Dimming outside the subject's box, so neighbours can't flip a verdict |
+
+### Sizing the verdict TTL
+
+Per-subject judging is affordable because a verdict is reused until the subject
+moves or the TTL expires. The arithmetic that matters:
+
+```
+duty cycle = subjects_in_view × seconds_per_inference ÷ EYEQ_VLM_VERDICT_TTL_S
+```
+
+At ~6 s per query on CPU, five subjects and a 300 s TTL is a 10% duty cycle.
+The same five at a 30 s TTL would saturate the VLM completely. If alerts start
+lagging in a busy scene, raise the TTL before anything else.
+
+Write rules about **one** subject — *"Is this person wearing a hard hat?"* —
+because each crop shows a single person. Scene-level phrasing like *"Is anyone
+missing a hard hat?"* no longer matches what the model is shown.
 
 ## Tech Stack
 

@@ -195,6 +195,26 @@ reconnect, blowing past `target_fps`. A connection that dies within
 `_MIN_SESSION_S` is treated as an immediate EOF and paced, which stops a
 finished video file from spinning the reconnect loop hundreds of times a second.
 
+**Recorded clips play in real time.** `is_file_source()` separates files on
+disk from device indices and `rtsp://`-style URIs, and files get two things a
+live source must never get:
+
+- **Pacing.** Grabs are clocked at the file's own `CAP_PROP_FPS`, so a 17s clip
+  takes 17s. Without it `cv2` decodes as fast as the CPU allows — the bundled
+  demo clip ran at ~13× real time, discarding 90% of its frames and handing
+  Stage 1 frames seconds apart. Live sources still grab as fast as frames
+  arrive, which is what keeps the RTSP buffer current.
+- **Seamless looping.** EOF seeks back to frame 0 inside the same session
+  instead of tearing down and reopening, so the buffer never goes dark between
+  passes and `reconnect_attempts` stays at zero. A container whose seek
+  silently fails is detected (a rewind that yields no frames) and handed to the
+  reconnect path rather than spun on.
+
+The two rates stay independent: `target_fps` still gates *writes*, so a 30 FPS
+file asked for 2 FPS skips frames rather than playing in slow motion. Both
+behaviours are on by default and disableable via `loop_file` / `realtime_file`.
+`CaptureStats` reports `source_fps` and `loops_completed`.
+
 ### `app/pipelines/detector.py` — `YOLOWatchdog`
 
 Stage 1. Loads YOLO with automatic CPU fallback if the accelerator rejects it,
@@ -461,3 +481,33 @@ uv run python demo.py --source demovideo.mp4 --labels person
 - **Watchdog ROI is global.** Per-rule ROI is enforced in Stage 2, so a
   detection outside every rule's ROI still costs a YOLO trigger and a buffer
   fetch (but no VLM call).
+- **A non-answer is silently a "no".** `BinaryVerdictParser` defaults to
+  `False` when it can find neither a Yes/No opener nor a decisive keyword —
+  the right bias for alert fatigue, but it makes a badly phrased rule fail
+  quietly rather than loudly. Compound prompts trip this reliably: asked
+  *"Is this person bending over or leaning across the table?"*, Moondream
+  answers `"Bending over"`, which parses as no violation. One predicate per
+  rule. The parser has no confidence signal to surface, so there is nothing
+  in the UI to distinguish a real "No" from an unparsed reply.
+- **Rule quality is bounded by what the camera resolves.** On the bundled demo
+  clip a worker's head is ~20 px tall, and every phrasing of a hard-hat
+  question returns "No" regardless of ground truth, while vest and posture
+  questions answer correctly. Validate a prompt against real crops from the
+  target camera before trusting it — `data/demo_snapshots/` holds exactly the
+  images the VLM was shown.
+- **Subject coverage is bounded by inference speed, not by design.** Stage 1
+  now tracks instances and triggers per subject, so a frame with six people
+  yields six triggers rather than one (measured on the bundled clip: 1 trigger
+  over 159 frames before, 11 after). But at ~6 s per query on CPU the VLM
+  judges roughly 10 subjects a minute, so a crowd of twenty takes about two
+  minutes to cover once. Never-judged subjects are always taken ahead of
+  re-checks, so the delay falls on re-confirming people already seen, never on
+  a first look at someone new.
+- **Tracking is greedy IoU, with no motion model.** Two subjects who occlude
+  each other and re-emerge may exchange ids. Both are still judged — a track
+  can be claimed by only one detection per frame, so two people in one frame
+  can never collapse into one id — but each inherits the other's verdict
+  history, which can delay a re-check. Id churn also costs redundant
+  inferences: measured on the bundled 6 FPS clip, roughly 2 ids per real
+  person at the default threshold. Higher-frame-rate cameras churn far less,
+  because boxes move less between frames.
