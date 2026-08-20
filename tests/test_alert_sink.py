@@ -242,3 +242,122 @@ class TestAlertSink:
         finally:
             publisher.close()
             await sink.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Schema Migration Tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+# The `alerts` DDL exactly as it shipped before per-instance judging. Kept
+# verbatim so the migration is tested against a real old database rather than
+# against a hand-waved approximation of one.
+LEGACY_ALERTS_DDL = """
+CREATE TABLE alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id         INTEGER NOT NULL,
+    camera_id       TEXT    NOT NULL,
+    timestamp       REAL    NOT NULL,
+    verdict         INTEGER NOT NULL,
+    raw_response    TEXT    NOT NULL,
+    inference_ms    REAL    NOT NULL,
+    bbox_json       TEXT    NOT NULL,
+    frame_snapshot  TEXT,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+async def _alert_columns(database: Database) -> set[str]:
+    cursor = await database._db.execute("PRAGMA table_info(alerts)")
+    return {row["name"] for row in await cursor.fetchall()}
+
+
+class TestSchemaMigration:
+    """An appliance upgraded in place must not lose its alert history.
+
+    `initialize_tables()` only runs CREATE TABLE IF NOT EXISTS, so new columns
+    reach an existing database solely through the ALTER TABLE migration.
+    """
+
+    async def test_fresh_database_has_the_new_columns(self, db):
+        assert {"track_id", "label"} <= await _alert_columns(db)
+
+    async def test_legacy_database_is_migrated_with_rows_intact(self, tmp_path):
+        path = str(tmp_path / "legacy.db")
+
+        # Build a database at the pre-change schema and put history in it.
+        legacy = await Database.create(path)
+        await legacy._db.executescript(LEGACY_ALERTS_DDL)
+        await legacy._db.execute(
+            """INSERT INTO alerts (rule_id, camera_id, timestamp, verdict,
+                                   raw_response, inference_ms, bbox_json)
+               VALUES (0, 'cam', 1.0, 1, 'Yes', 800.0, '{}')"""
+        )
+        await legacy._db.commit()
+        assert "track_id" not in await _alert_columns(legacy)
+        await legacy.close()
+
+        # Reopening runs the migration.
+        upgraded = await Database.create(path)
+        await upgraded.initialize_tables()
+        try:
+            assert {"track_id", "label"} <= await _alert_columns(upgraded)
+
+            cursor = await upgraded._db.execute(
+                "SELECT raw_response, track_id, label FROM alerts"
+            )
+            rows = await cursor.fetchall()
+            assert len(rows) == 1, "Existing alert history was lost"
+            assert rows[0]["raw_response"] == "Yes"
+            assert rows[0]["track_id"] == -1
+            assert rows[0]["label"] == ""
+        finally:
+            await upgraded.close()
+
+    async def test_migration_is_idempotent(self, tmp_path):
+        """Every restart calls initialize_tables(); it must stay a no-op."""
+        path = str(tmp_path / "repeat.db")
+        database = await Database.create(path)
+        try:
+            for _ in range(3):
+                await database.initialize_tables()
+
+            columns = await _alert_columns(database)
+            assert len([c for c in columns if c == "track_id"]) == 1
+            assert {"track_id", "label"} <= columns
+        finally:
+            await database.close()
+
+    async def test_create_alert_round_trips_the_new_columns(self, db):
+        await db.ensure_default_rule()  # alerts.rule_id is a foreign key
+        alert_id = await db.create_alert(
+            rule_id=DEFAULT_RULE_ID,
+            camera_id="cam",
+            timestamp=1.0,
+            verdict=True,
+            raw_response="Yes",
+            inference_ms=800.0,
+            bbox_json={"x1": 0.1, "y1": 0.1, "x2": 0.2, "y2": 0.2},
+            track_id=7,
+            label="person",
+        )
+        row = await db.get_alert(alert_id)
+        assert row["track_id"] == 7
+        assert row["label"] == "person"
+
+    async def test_create_alert_defaults_stay_backward_compatible(self, db):
+        """Callers that never heard of tracking must still work."""
+        await db.ensure_default_rule()
+        alert_id = await db.create_alert(
+            rule_id=DEFAULT_RULE_ID,
+            camera_id="cam",
+            timestamp=1.0,
+            verdict=False,
+            raw_response="No",
+            inference_ms=800.0,
+            bbox_json={"x1": 0.1, "y1": 0.1, "x2": 0.2, "y2": 0.2},
+        )
+        row = await db.get_alert(alert_id)
+        assert row["track_id"] == -1
+        assert row["label"] == ""

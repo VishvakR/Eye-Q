@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     inference_ms    REAL    NOT NULL,
     bbox_json       TEXT    NOT NULL,
     frame_snapshot  TEXT,
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    track_id        INTEGER NOT NULL DEFAULT -1,
+    label           TEXT    NOT NULL DEFAULT ''
 );
 
 -- Cameras: Registered video sources
@@ -79,6 +81,15 @@ CREATE INDEX IF NOT EXISTS idx_alerts_rule_id ON alerts(rule_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_rules_camera_id ON rules(camera_id);
 """
+
+# Columns added to `alerts` after the first release. `CREATE TABLE IF NOT EXISTS`
+# is a no-op on an existing database, so a deployed appliance would never see
+# them without an explicit ALTER. SQLite allows ADD COLUMN with NOT NULL as long
+# as the DEFAULT is a constant, which is why both defaults are literals.
+_ALERT_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("track_id", "INTEGER NOT NULL DEFAULT -1"),
+    ("label", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 class Database:
@@ -120,10 +131,30 @@ class Database:
         return cls(db, db_path)
 
     async def initialize_tables(self) -> None:
-        """Create tables and indexes if they don't exist."""
+        """Create tables and indexes if they don't exist, then migrate."""
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
+        await self._migrate_alerts()
         logger.info("Database tables initialized.")
+
+    async def _migrate_alerts(self) -> None:
+        """Add any `alerts` columns missing from an older database.
+
+        Idempotent: on a fresh database ``SCHEMA_SQL`` already created every
+        column and this does nothing. On an appliance upgraded in place it adds
+        only what is absent, leaving existing rows intact with their defaults.
+        """
+        cursor = await self._db.execute("PRAGMA table_info(alerts)")
+        existing = {row["name"] for row in await cursor.fetchall()}
+
+        added = [name for name, _ddl in _ALERT_MIGRATIONS if name not in existing]
+        for name, ddl in _ALERT_MIGRATIONS:
+            if name not in existing:
+                await self._db.execute(f"ALTER TABLE alerts ADD COLUMN {name} {ddl}")
+
+        if added:
+            await self._db.commit()
+            logger.info(f"Migrated alerts table: added {', '.join(added)}.")
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -288,12 +319,20 @@ class Database:
         inference_ms: float,
         bbox_json: dict,
         frame_snapshot: str | None = None,
+        track_id: int = -1,
+        label: str = "",
     ) -> int:
-        """Record a VLM verdict as an alert."""
+        """Record a VLM verdict as an alert.
+
+        ``track_id`` distinguishes alerts raised about different subjects in the
+        same frame; ``label`` is stored rather than re-attached in memory so it
+        survives into history reads, not just live broadcasts.
+        """
         cursor = await self._db.execute(
             """INSERT INTO alerts (rule_id, camera_id, timestamp, verdict,
-                                   raw_response, inference_ms, bbox_json, frame_snapshot)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   raw_response, inference_ms, bbox_json, frame_snapshot,
+                                   track_id, label)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rule_id,
                 camera_id,
@@ -303,6 +342,8 @@ class Database:
                 inference_ms,
                 json.dumps(bbox_json),
                 frame_snapshot,
+                track_id,
+                label,
             ),
         )
         await self._db.commit()

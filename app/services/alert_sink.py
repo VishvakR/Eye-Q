@@ -142,6 +142,8 @@ class AlertSink:
             inference_ms=result.inference_time_ms,
             bbox_json=detection.bbox.model_dump(),
             frame_snapshot=result.snapshot_path,
+            track_id=detection.track_id,
+            label=detection.label,
         )
 
         self._alerts_stored += 1
@@ -169,6 +171,7 @@ class AlertSink:
                         "prompt": result.query.prompt,
                         "camera_id": detection.camera_id,
                         "label": detection.label,
+                        "track_id": detection.track_id,
                         "confidence": detection.confidence,
                         "verdict": result.verdict,
                         "raw_response": result.raw_response,
