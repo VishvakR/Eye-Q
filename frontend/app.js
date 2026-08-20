@@ -208,11 +208,74 @@ function openRuleModal(editData = null) {
         document.getElementById('rule-cooldown').value = '5.0';
     }
 
+    scopeWarningAccepted = false;
+    document.getElementById('rule-scope-warning').classList.add('hidden');
     modal.classList.remove('hidden');
 }
 
 function closeRuleModal() {
     document.getElementById('rule-modal').classList.add('hidden');
+}
+
+// Set once the operator has chosen to keep a rule unscoped, so the warning
+// does not re-appear on the resubmit it triggered.
+let scopeWarningAccepted = false;
+
+/**
+ * Warn before saving a rule that asks about a specific object but watches all
+ * of them.
+ *
+ * An empty label list means every COCO class wakes the VLM. That is right for
+ * a scene-level question ("is anything blocking the exit?") and wrong for the
+ * far more common object-specific one, where it spends seconds per inference
+ * judging pallets and trucks against a question about people.
+ *
+ * @returns {Promise<boolean>} true to continue saving.
+ */
+async function confirmRuleScope(prompt, labels) {
+    if (labels.length > 0 || scopeWarningAccepted) return true;
+
+    let suggested = [];
+    try {
+        const res = await apiFetch(`/api/labels?prompt=${encodeURIComponent(prompt)}`);
+        suggested = res.suggested || [];
+    } catch {
+        return true;  // Never block saving because a hint could not be fetched.
+    }
+    if (suggested.length === 0) return true;
+
+    const box = document.getElementById('rule-scope-warning');
+    box.innerHTML = `
+        <p class="mb-2">
+            This rule watches <strong>every object class</strong>, but its prompt is about
+            <strong>${suggested.map(escapeHtml).join(', ')}</strong>.
+            Trucks, pallets and chairs will all be judged against it &mdash; several
+            seconds of inference each, spent on things you did not ask about.
+        </p>
+        <div class="flex gap-2">
+            <button type="button" id="scope-fix" class="btn-primary text-xs px-2 py-1">
+                Watch only ${suggested.map(escapeHtml).join(', ')}
+            </button>
+            <button type="button" id="scope-ignore" class="btn-secondary text-xs px-2 py-1">
+                Watch every class
+            </button>
+        </div>`;
+    box.classList.remove('hidden');
+
+    return new Promise(resolve => {
+        document.getElementById('scope-fix').onclick = () => {
+            document.getElementById('rule-labels').value = suggested.join(', ');
+            box.classList.add('hidden');
+            resolve(false);  // Resubmit with the labels now filled in.
+            document.getElementById('rule-form').requestSubmit();
+        };
+        document.getElementById('scope-ignore').onclick = () => {
+            scopeWarningAccepted = true;
+            box.classList.add('hidden');
+            resolve(false);
+            document.getElementById('rule-form').requestSubmit();
+        };
+    });
 }
 
 async function handleRuleSubmit(e) {
@@ -221,6 +284,9 @@ async function handleRuleSubmit(e) {
     const editId = document.getElementById('rule-edit-id').value;
     const labelsStr = document.getElementById('rule-labels').value;
     const labels = labelsStr ? labelsStr.split(',').map(l => l.trim()).filter(Boolean) : [];
+
+    const promptText = document.getElementById('rule-prompt').value;
+    if (!(await confirmRuleScope(promptText, labels))) return;
 
     const data = {
         camera_id: document.getElementById('rule-camera').value || 'default',

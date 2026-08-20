@@ -193,9 +193,16 @@
 
                 <div>
                     <label class="form-label">VLM Prompt (Plain English Question)</label>
-                    <textarea id="rule-prompt" class="form-input h-20 resize-none" placeholder="e.g., Is a pallet blocking the fire exit?" required></textarea>
+                    <textarea id="rule-prompt" class="form-input h-20 resize-none" placeholder="e.g., Is this person missing a hard hat?" required></textarea>
+                    <p class="text-xs text-text-secondary mt-1">
+                        Ask about <strong>one</strong> subject &mdash; &ldquo;Is <em>this person</em>&hellip;&rdquo;, not
+                        &ldquo;Is <em>anyone</em>&hellip;&rdquo;. Each subject is cropped and judged separately, so the
+                        model only ever sees one at a time. Keep it to a single question: a compound
+                        prompt makes the model answer with a phrase instead of yes or no.
+                    </p>
                 </div>
 
+                <div id="rule-scope-warning" class="hidden text-xs text-accent-amber bg-accent-amber/10 border border-accent-amber/20 rounded p-3 mb-4"></div>
                 <div id="rule-error" class="hidden text-xs text-accent-red bg-accent-red/10 border border-accent-red/20 rounded p-2 mb-4"></div>
                 <div class="grid grid-cols-2 gap-4">
                     <div>
