@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import CameraCreate, RuleCreate, RuleUpdate, ws_manager
 from app.core.database import Database
+from app.core.labels import COCO_CLASSES, labels_in_prompt, scope_warning
 from app.core.roi import RegionOfInterest
 
 logger = logging.getLogger(__name__)

@@ -385,3 +385,111 @@ class TestSnapshotMount:
             get_settings.cache_clear()
 
 
+class TestRuleScopeWarning:
+    """An unscoped rule about a specific object must not fail silently.
+
+    Leaving target_labels empty sends every detected object to the VLM. That is
+    legitimate for a scene-level question, so the API informs rather than
+    refuses — but it must inform.
+    """
+
+    async def test_creating_an_unscoped_rule_returns_a_warning(self, client):
+        response = await client.post(
+            "/api/rules",
+            json={
+                "camera_id": "default",
+                "name": "pep",
+                "prompt": "alert is person did not wear helmet",
+                "target_labels": [],
+                "confidence": 0.25,
+                "cooldown_s": 5.0,
+            },
+        )
+        assert response.status_code == 201
+        body = response.json()
+        assert "warning" in body
+        assert "person" in body["warning"]
+
+    async def test_a_scoped_rule_carries_no_warning(self, client):
+        response = await client.post(
+            "/api/rules",
+            json={
+                "camera_id": "default",
+                "name": "scoped",
+                "prompt": "alert is person did not wear helmet",
+                "target_labels": ["person"],
+                "confidence": 0.25,
+                "cooldown_s": 5.0,
+            },
+        )
+        assert response.status_code == 201
+        assert "warning" not in response.json()
+
+    async def test_a_scene_level_rule_carries_no_warning(self, client):
+        response = await client.post(
+            "/api/rules",
+            json={
+                "camera_id": "default",
+                "name": "exit",
+                "prompt": "Is anything blocking the fire exit?",
+                "target_labels": [],
+                "confidence": 0.25,
+                "cooldown_s": 5.0,
+            },
+        )
+        assert response.status_code == 201
+        assert "warning" not in response.json()
+
+    async def test_the_warning_does_not_block_the_rule(self, client):
+        """The rule must still be created, and still be active."""
+        created = await client.post(
+            "/api/rules",
+            json={
+                "camera_id": "default",
+                "name": "pep",
+                "prompt": "Is this worker wearing a hard hat?",
+                "target_labels": [],
+                "confidence": 0.25,
+                "cooldown_s": 5.0,
+            },
+        )
+        rule_id = created.json()["id"]
+        fetched = await client.get(f"/api/rules/{rule_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["enabled"] == 1
+
+    async def test_narrowing_a_rule_clears_the_warning(self, client):
+        created = await client.post(
+            "/api/rules",
+            json={
+                "camera_id": "default",
+                "name": "pep",
+                "prompt": "alert is person did not wear helmet",
+                "target_labels": [],
+                "confidence": 0.25,
+                "cooldown_s": 5.0,
+            },
+        )
+        rule_id = created.json()["id"]
+
+        updated = await client.put(
+            f"/api/rules/{rule_id}", json={"target_labels": ["person"]}
+        )
+        assert updated.status_code == 200
+        assert "warning" not in updated.json()
+
+    async def test_labels_endpoint_suggests_from_a_prompt(self, client):
+        response = await client.get(
+            "/api/labels", params={"prompt": "Is this worker wearing a hard hat?"}
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["suggested"] == ["person"]
+        assert "person" in body["labels"]
+
+    async def test_labels_endpoint_without_a_prompt_suggests_nothing(self, client):
+        body = (await client.get("/api/labels")).json()
+        assert body["suggested"] == []
+        assert len(body["labels"]) == 80
+
+
