@@ -253,6 +253,60 @@ class Settings(BaseSettings):
         le=1.0,
         description="Extra padding around bounding box as fraction of bbox size.",
     )
+    vlm_focus_dim: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Brightness multiplier applied outside the subject's own box "
+            "within its crop. The padding above exists to give the VLM spatial "
+            "context, but it also drags in whoever is standing nearby — and a "
+            "helmeted neighbour in the frame can flip the verdict on a "
+            "bare-headed subject. Dimming keeps the context readable while "
+            "leaving no doubt who the question is about. 1.0 disables."
+        ),
+    )
+    vlm_verdict_ttl_s: float = Field(
+        default=300.0,
+        ge=0.0,
+        description=(
+            "Seconds a per-instance verdict is reused before that subject is "
+            "judged again. This is the appliance's load control, and the "
+            "governing arithmetic is duty_cycle = subjects x inference_s / ttl "
+            "— at ~6s per query on CPU, five subjects and a 30s TTL would "
+            "saturate the VLM completely. Keep it well above 2 x subjects x "
+            "inference_s. 0 disables reuse (every trigger is judged)."
+        ),
+    )
+    vlm_rejudge_iou: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Re-judge a subject early when IoU against the box it was last "
+            "judged in falls below this — they have moved far enough that the "
+            "old verdict may no longer describe them."
+        ),
+    )
+    vlm_min_rejudge_s: float = Field(
+        default=20.0,
+        ge=0.0,
+        description=(
+            "Floor between re-judgements of one subject, however far they "
+            "moved. Without it a single walker re-judges roughly every 0.6s as "
+            "their box slides off its own footprint, which alone would "
+            "saturate an edge CPU."
+        ),
+    )
+    vlm_max_instances_per_batch: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Maximum subjects inferred from one drained batch. Never-judged "
+            "subjects are taken first, so a crowd delays re-checks rather than "
+            "first looks."
+        ),
+    )
 
     # ── Inference Device ─────────────────────────────────────────
     device: Literal["auto", "mps", "cuda", "cpu"] = Field(
