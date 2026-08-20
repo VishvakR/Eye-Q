@@ -487,7 +487,15 @@ def create_app() -> FastAPI:
             enabled=rule.enabled,
         )
         await sync_rules(request.app)
-        return await db.get_rule(rule_id)
+
+        created = await db.get_rule(rule_id)
+        # Non-blocking: an unscoped rule is legitimate for scene-level
+        # questions, so this informs rather than refuses.
+        warning = scope_warning(rule.prompt, rule.target_labels)
+        if warning:
+            logger.warning(f"Rule {rule_id} ('{rule.name}'): {warning}")
+            created = {**created, "warning": warning}
+        return created
 
     @app.delete("/api/rules")
     async def delete_all_rules(request: Request):

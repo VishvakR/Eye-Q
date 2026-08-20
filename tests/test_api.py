@@ -327,3 +327,61 @@ class TestClearAllRules:
         response = await client.delete("/api/rules")
         assert response.status_code == 200
         assert response.json()["deleted"] == 0
+class TestSnapshotMount:
+    """Evidence JPEGs must be served from wherever the worker writes them.
+
+    The mount used to hardcode ``data/snapshots`` while the VLM worker honoured
+    ``snapshot_dir``, so every alert thumbnail 404'd the moment the setting
+    pointed anywhere else — the dashboard rendered a broken-image icon with no
+    error to go on.
+    """
+
+    async def _client_with_snapshot_dir(self, tmp_path, monkeypatch, snapshot_dir):
+        monkeypatch.setenv("EYEQ_DATABASE_PATH", str(tmp_path / "snap_test.db"))
+        monkeypatch.setenv("EYEQ_ENABLE_PIPELINE", "false")
+        monkeypatch.setenv("EYEQ_SNAPSHOT_DIR", str(snapshot_dir))
+        get_settings.cache_clear()
+        return create_app()
+
+    async def test_serves_from_the_configured_directory(self, tmp_path, monkeypatch):
+        snapshot_dir = tmp_path / "custom_snapshots"
+        snapshot_dir.mkdir()
+        # Content only has to round-trip; it never gets decoded.
+        (snapshot_dir / "evidence.jpg").write_bytes(b"\xff\xd8\xff\xdb-not-a-real-jpeg")
+
+        app = await self._client_with_snapshot_dir(tmp_path, monkeypatch, snapshot_dir)
+        try:
+            async with lifespan(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as c:
+                    response = await c.get("/snapshots/evidence.jpg")
+
+            assert response.status_code == 200, (
+                "Configured snapshot directory is not mounted at /snapshots"
+            )
+            assert response.content == b"\xff\xd8\xff\xdb-not-a-real-jpeg"
+        finally:
+            get_settings.cache_clear()
+
+    async def test_directory_is_created_when_missing(self, tmp_path, monkeypatch):
+        """A fresh checkout has produced no alerts, so the mount must not 500."""
+        snapshot_dir = tmp_path / "not_yet_created"
+
+        app = await self._client_with_snapshot_dir(tmp_path, monkeypatch, snapshot_dir)
+        try:
+            assert snapshot_dir.is_dir(), "Snapshot directory was not created eagerly"
+
+            async with lifespan(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as c:
+                    response = await c.get("/snapshots/absent.jpg")
+
+            assert response.status_code == 404
+        finally:
+            get_settings.cache_clear()
+
+
