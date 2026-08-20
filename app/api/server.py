@@ -290,6 +290,7 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
             rejudge_iou=settings.vlm_rejudge_iou,
             min_rejudge_s=settings.vlm_min_rejudge_s,
             max_instances_per_batch=settings.vlm_max_instances_per_batch,
+            max_crop_edge=settings.vlm_max_crop_edge,
         )
         vlm_worker.start()
         app.state.vlm_worker = vlm_worker
@@ -765,6 +766,13 @@ def create_app() -> FastAPI:
                 "instances_memoised": vlm_stats.instances_memoised if vlm_stats else 0,
                 "instances_shed": vlm_stats.instances_shed if vlm_stats else 0,
                 "avg_inference_ms": vlm_stats.avg_inference_ms if vlm_stats else 0,
+                # Capture-to-verdict, the number an operator actually waits
+                # through. Compare against avg_inference_ms: when the two are
+                # close the appliance is keeping up, and when latency_p95
+                # climbs away from it the queue is the problem, not the model.
+                "avg_queued_ms": vlm_stats.avg_queued_ms if vlm_stats else 0,
+                "latency_p50_ms": vlm_stats.latency_p50_ms if vlm_stats else 0,
+                "latency_p95_ms": vlm_stats.latency_p95_ms if vlm_stats else 0,
             },
             "database": db_stats,
             "websocket_clients": ws_manager.active_count,

@@ -308,6 +308,21 @@ class Settings(BaseSettings):
         ),
     )
 
+    vlm_max_crop_edge: int = Field(
+        default=511,
+        ge=0,
+        description=(
+            "Longest side, in pixels, of the crop handed to the VLM. This "
+            "tracks a cliff in Moondream's preprocessor, not a quality dial: "
+            "at 512 px and above it stops encoding one 378 px image and starts "
+            "encoding the image plus 2-4 tiles, which measured 3.16 s against "
+            "1.42 s for the same one-word answer. Most crops are already well "
+            "under it; the case it catches is vlm_crop_padding falling back to "
+            "the whole frame for a subject filling most of it. Raise it only if "
+            "you switch to a backend with no such threshold, and 0 disables."
+        ),
+    )
+
     # ── Inference Device ─────────────────────────────────────────
     device: Literal["auto", "mps", "cuda", "cpu"] = Field(
         default="auto",

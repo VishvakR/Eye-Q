@@ -11,9 +11,9 @@ Eye-Q uses a **Two-Stage Cascade** to run Vision-Language Models efficiently on 
 ```
 RTSP Camera → VideoCapture → Ring Buffer (Shared Memory)
                                   ↓
-                          Stage 1: YOLOv8n (30 FPS, ~2ms/frame)
+                          Stage 1: YOLOv8n (~16ms/frame on M2 MPS)
                                   ↓ (ZMQ trigger)
-                          Stage 2: Moondream2 VLM (~800ms, wake-on-event)
+                          Stage 2: Moondream2 VLM (~4s, wake-on-event)
                                   ↓
                           Binary Verdict → Webhook / Dashboard
 ```
@@ -110,6 +110,7 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20` | Floor between re-judgements of one subject |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Subjects judged per drain cycle |
 | `EYEQ_VLM_FOCUS_DIM` | `0.4` | Dimming outside the subject's box, so neighbours can't flip a verdict |
+| `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Longest side of the crop shown to the VLM. Keeps Moondream on its single-pass encoder |
 
 ### Sizing the verdict TTL
 

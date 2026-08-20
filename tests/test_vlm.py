@@ -22,10 +22,32 @@ from app.pipelines.vlm_backends import MoondreamBackend
 from app.pipelines.vlm_judge import BinaryVerdictParser
 from app.pipelines.vlm_worker import (
     VLMWorker,
+    _percentile,
     crop_detection,
     crop_detection_focused,
+    downscale_for_vlm,
 )
 from app.schemas.events import BoundingBox, DetectionEvent
+
+
+def mock_backend(**kwargs) -> MagicMock:
+    """A stub backend wired the way the passthrough backends are.
+
+    Stage 2 asks the backend to ``encode()`` a crop once and then ``answer()``
+    each rule against that handle. Two of the three real backends cannot split
+    the work, so they return the image from ``encode()`` and route ``answer()``
+    back through ``query()`` — and this double does exactly the same. That
+    keeps every ``backend.query`` assertion in this file meaningful while still
+    driving the worker down its real code path.
+    """
+    backend = MagicMock(**kwargs)
+    backend.encode.side_effect = lambda image: image
+    backend.answer.side_effect = lambda handle, question: backend.query(handle, question)
+    # VLMResult validates this as a string, so a bare mock attribute fails
+    # construction well before any assertion in the test body is reached.
+    kwargs.setdefault("model_name", "fake")
+    backend.model_name = kwargs["model_name"]
+    return backend
 
 # ═══════════════════════════════════════════════════════════════════
 # Binary Verdict Parser Tests
@@ -583,12 +605,12 @@ class TestInferenceAbort:
         import concurrent.futures
 
         buffer = MagicMock()
-        backend = MagicMock()
+        backend = mock_backend()
         backend.query.side_effect = lambda *a, **k: time.sleep(5)
         worker = VLMWorker(buffer=buffer, backend=backend, inference_timeout_s=0.2)
 
         with pytest.raises(concurrent.futures.TimeoutError):
-            worker._infer(MagicMock(), "Is there a person?")
+            worker._answer(MagicMock(), "Is there a person?")
 
         # The worker calls request_stop() on the timeout path in _process_trigger;
         # verify the backend exposes and records it.
@@ -686,7 +708,7 @@ class TestMultiInstanceJudging:
         buffer.read_at_index.return_value = (frame, time.monotonic())
 
         if backend is None:
-            backend = MagicMock()
+            backend = mock_backend()
             backend.query.return_value = "Yes"
             backend.model_name = "fake"
 
@@ -823,7 +845,7 @@ class TestVerdictMemo:
     """Reusing a verdict is what keeps per-subject judging affordable."""
 
     def _worker(self, **kwargs):
-        worker = VLMWorker(buffer=MagicMock(), backend=MagicMock(), **kwargs)
+        worker = VLMWorker(buffer=MagicMock(), backend=mock_backend(), **kwargs)
         worker.add_rule("person", "Is this person missing a hard hat?", rule_id=1)
         return worker
 
@@ -972,3 +994,318 @@ class TestFocusedCrop:
         crop_detection_focused(frame, bbox, dim=0.1)
 
         assert frame[0, 0, 0] == 200
+
+
+class TestEncodeHoisting:
+    """The vision half of the model is per-subject work, not per-rule work."""
+
+    def _worker(self, backend, rules, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        for rule_id, prompt in enumerate(rules, start=1):
+            worker.add_rule("person", prompt, rule_id=rule_id)
+        return worker
+
+    def _payload(self, track_id=1, timestamp=None):
+        return {
+            "timestamp": timestamp if timestamp is not None else time.monotonic(),
+            "camera_id": "test",
+            "label": "person",
+            "confidence": 0.9,
+            "bbox": {"x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.6},
+            "frame_index": 0,
+            "track_id": track_id,
+        }
+
+    def test_three_rules_encode_the_crop_once(self):
+        backend = mock_backend()
+        backend.query.return_value = "Yes"
+        worker = self._worker(backend, ["Bending over?", "No vest?", "Carrying a box?"])
+
+        worker._process_batch([self._payload()], MagicMock())
+
+        assert backend.encode.call_count == 1, (
+            "the crop is identical across rules, so the vision tower must run once"
+        )
+        assert backend.answer.call_count == 3, "every rule still gets asked"
+
+    def test_each_subject_is_encoded_separately(self):
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        worker = self._worker(backend, ["Bending over?", "No vest?"])
+
+        ts = time.monotonic()
+        worker._process_batch([self._payload(i, ts) for i in (1, 2, 3)], MagicMock())
+
+        assert backend.encode.call_count == 3, "different people are different images"
+        assert backend.answer.call_count == 6
+
+    def test_a_failed_encode_does_not_abandon_the_batch(self):
+        """A broken image is that subject's problem, not the whole queue's."""
+        backend = mock_backend()
+        backend.encode.side_effect = RuntimeError("corrupt tensor")
+        worker = self._worker(backend, ["Bending over?"])
+
+        worker._process_batch([self._payload()], MagicMock())
+
+        assert backend.answer.call_count == 0
+        assert worker.stats.triggers_failed == 1
+
+    def test_a_hung_encode_abandons_the_batch(self):
+        """Unlike a failure, a timeout means the executor thread is still wedged."""
+        backend = mock_backend()
+        backend.encode.side_effect = lambda image: time.sleep(5)
+        worker = self._worker(
+            backend, ["Bending over?"], inference_timeout_s=0.2
+        )
+
+        assert worker._judge_instance(
+            DetectionEvent(**self._payload()),
+            [{"rule_id": 1, "rule_name": "r", "prompt": "p"}],
+            np.zeros((64, 64, 3), dtype=np.uint8),
+            MagicMock(),
+        ) is False
+        backend.request_stop.assert_called()
+
+
+class TestCropDownscaling:
+    """Moondream switches to a 3-5x costlier path at 512 px. Stay under it."""
+
+    def test_a_crop_that_already_fits_is_not_copied(self):
+        crop = np.zeros((360, 118, 3), dtype=np.uint8)
+        assert downscale_for_vlm(crop, 511) is crop
+
+    def test_an_oversized_crop_is_capped(self):
+        out = downscale_for_vlm(np.zeros((720, 1280, 3), dtype=np.uint8), 511)
+        assert max(out.shape[:2]) == 511
+
+    def test_aspect_ratio_survives(self):
+        out = downscale_for_vlm(np.zeros((720, 1280, 3), dtype=np.uint8), 511)
+        assert abs(out.shape[1] / out.shape[0] - 1280 / 720) < 0.01
+
+    def test_zero_disables_the_cap(self):
+        crop = np.zeros((720, 1280, 3), dtype=np.uint8)
+        assert downscale_for_vlm(crop, 0) is crop
+
+    def test_the_full_frame_fallback_is_what_this_catches(self):
+        """A subject filling the frame makes crop_bounds return the whole thing."""
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        huge = BoundingBox(x1=0.02, y1=0.02, x2=0.98, y2=0.98)
+        assert huge.area > 0.8
+
+        cropped = crop_detection(frame, huge)
+        assert max(cropped.shape[:2]) >= 512, "the un-capped crop takes the slow path"
+        assert max(downscale_for_vlm(cropped, 511).shape[:2]) < 512
+
+
+class TestLatencyAccounting:
+    """Capture-to-verdict is the number an operator waits through."""
+
+    def _worker(self, backend, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person bending over?", rule_id=1)
+        return worker
+
+    def test_the_published_result_carries_the_full_latency(self):
+        backend = mock_backend()
+        backend.query.return_value = "Yes"
+        backend.model_name = "fake"
+        worker = self._worker(backend)
+        publisher = MagicMock()
+
+        # A frame that was captured half a second before it reached Stage 2.
+        worker._process_batch(
+            [{
+                "timestamp": time.monotonic() - 0.5,
+                "camera_id": "test",
+                "label": "person",
+                "confidence": 0.9,
+                "bbox": {"x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.6},
+                "frame_index": 0,
+                "track_id": 1,
+            }],
+            publisher,
+        )
+
+        result = publisher.publish.call_args.args[1]
+        assert result["queued_ms"] >= 500, "the wait before inference is counted"
+        assert result["latency_ms"] >= result["queued_ms"]
+        assert result["latency_ms"] >= result["inference_time_ms"]
+
+    def test_percentiles_are_reported_once_verdicts_exist(self):
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        backend.model_name = "fake"
+        worker = self._worker(backend)
+
+        ts = time.monotonic()
+        worker._process_batch(
+            [{
+                "timestamp": ts,
+                "camera_id": "test",
+                "label": "person",
+                "confidence": 0.9,
+                "bbox": {"x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.6},
+                "frame_index": 0,
+                "track_id": 1,
+            }],
+            MagicMock(),
+        )
+
+        stats = worker.stats
+        assert stats.latency_p50_ms > 0
+        assert stats.latency_p95_ms >= stats.latency_p50_ms
+
+
+class TestPercentile:
+    """The stats path must not need numpy."""
+
+    def test_empty_is_zero(self):
+        assert _percentile([], 50) == 0.0
+
+    def test_single_sample(self):
+        assert _percentile([7.5], 95) == 7.5
+
+    def test_nearest_rank(self):
+        assert _percentile(range(1, 101), 50) == 50
+        assert _percentile(range(1, 101), 95) == 95
+
+    def test_p95_of_a_short_window_is_the_worst_sample(self):
+        assert _percentile(range(1, 11), 95) == 10
+
+    def test_input_order_does_not_matter(self):
+        assert _percentile([9, 1, 5], 100) == 9
+
+
+class TestBatchPreemption:
+    """A person who walks in mid-batch must not wait out every queued re-check."""
+
+    def _worker(self, backend, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        kwargs.setdefault("verdict_ttl_s", 300.0)
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person bending over?", rule_id=1)
+        return worker
+
+    def _payload(self, track_id, timestamp=None):
+        return {
+            "timestamp": timestamp if timestamp is not None else time.monotonic(),
+            "camera_id": "test",
+            "label": "person",
+            "confidence": 0.9,
+            "bbox": {"x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.6},
+            "frame_index": 0,
+            "track_id": track_id,
+        }
+
+    def _judged_ids(self, publisher):
+        return [
+            call.args[1]["query"]["detection"]["track_id"]
+            for call in publisher.publish.call_args_list
+        ]
+
+    def test_a_newcomer_overtakes_queued_re_checks(self):
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        worker = self._worker(backend)
+
+        # Subjects 1-3 have all been seen before, so they are re-checks.
+        ts = time.monotonic()
+        for track_id in (1, 2, 3):
+            worker._remember_verdict(
+                DetectionEvent(**self._payload(track_id, ts)), rule_id=1, verdict=False
+            )
+        # Force them back into contention by expiring the memo's reuse window.
+        worker._verdict_ttl_s = 0.0
+        prepared = worker._prepare([self._payload(i, ts) for i in (1, 2, 3)])
+        worker._verdict_ttl_s = 300.0
+        assert len(prepared) == 3
+
+        # Subject 99 arrives after the batch has already started.
+        subscriber = MagicMock()
+        subscriber.drain.side_effect = [
+            [],                                              # before the 1st
+            [("detection", self._payload(99, time.monotonic()))],  # before the 2nd
+            [], [], [],
+        ]
+
+        publisher = MagicMock()
+        worker._judge_prepared(prepared, publisher, subscriber)
+
+        judged = self._judged_ids(publisher)
+        assert 99 in judged, "the new arrival must be judged in this batch"
+        assert judged.index(99) == 1, (
+            f"the newcomer should be taken next, not last; order was {judged}"
+        )
+
+    def test_the_cap_still_bounds_the_work(self):
+        """Preemption changes who gets the budget, never how big it is."""
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        worker = self._worker(backend, max_instances_per_batch=2)
+
+        ts = time.monotonic()
+        prepared = worker._prepare([self._payload(i, ts) for i in (1, 2, 3, 4)])
+
+        subscriber = MagicMock()
+        subscriber.drain.return_value = [
+            ("detection", self._payload(99, time.monotonic()))
+        ]
+
+        publisher = MagicMock()
+        worker._judge_prepared(prepared, publisher, subscriber)
+
+        assert len(self._judged_ids(publisher)) == 2
+        assert worker.stats.instances_shed >= 1
+
+    def test_a_subject_already_waiting_is_not_judged_twice(self):
+        """The memo only records a verdict after judging, so dedupe on id."""
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        worker = self._worker(backend)
+
+        ts = time.monotonic()
+        prepared = worker._prepare([self._payload(7, ts)])
+
+        subscriber = MagicMock()
+        # The same subject re-triggers while it sits in the queue.
+        subscriber.drain.return_value = [
+            ("detection", self._payload(7, time.monotonic()))
+        ]
+
+        publisher = MagicMock()
+        worker._judge_prepared(prepared, publisher, subscriber)
+
+        assert self._judged_ids(publisher) == [7]
+
+    def test_without_a_subscriber_the_batch_is_unchanged(self):
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        worker = self._worker(backend)
+
+        ts = time.monotonic()
+        publisher = MagicMock()
+        worker._process_batch([self._payload(i, ts) for i in (1, 2, 3)], publisher)
+
+        assert sorted(self._judged_ids(publisher)) == [1, 2, 3]
+
+    def test_a_quiet_scene_costs_one_poll_per_subject(self):
+        backend = mock_backend()
+        backend.query.return_value = "No"
+        worker = self._worker(backend)
+
+        ts = time.monotonic()
+        prepared = worker._prepare([self._payload(i, ts) for i in (1, 2)])
+
+        subscriber = MagicMock()
+        subscriber.drain.return_value = []
+
+        worker._judge_prepared(prepared, MagicMock(), subscriber)
+        assert subscriber.drain.call_count == 2

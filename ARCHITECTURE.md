@@ -19,8 +19,8 @@ The whole design falls out of one measurement:
 
 | Stage | Model | Cost per call |
 |---|---|---|
-| Stage 1 | YOLOv8n object detection | **2–4 ms** |
-| Stage 2 | Moondream2 vision-language model | **~8,300 ms** |
+| Stage 1 | YOLOv8n object detection | **~16 ms** |
+| Stage 2 | Moondream2 vision-language model | **~4,200 ms** |
 
 Three orders of magnitude. A VLM cannot look at a 30 FPS video stream; it can barely look at one
 frame every eight seconds. So Eye-Q is a **cascade**: a cheap detector looks at everything and a
@@ -704,7 +704,7 @@ authoritative configuration documentation.
 |---|---|---|
 | `EYEQ_YOLO_MODEL` | `models/yolov8n.pt` | |
 | `EYEQ_YOLO_CONFIDENCE` | `0.25` | 0–1 |
-| `EYEQ_YOLO_IMGSZ` | `640` | 416 is ~2.1× faster on ARM |
+| `EYEQ_YOLO_IMGSZ` | `640` | 416 is ~2.1× faster on ARM CPU; no gain on MPS |
 | `EYEQ_DETECTION_COOLDOWN_S` | `5.0` | Per *instance* when tracking is on |
 | `EYEQ_WATCHDOG_FPS` | `30.0` | ≤120 — **the main CPU lever** |
 
@@ -736,6 +736,7 @@ authoritative configuration documentation.
 | `EYEQ_VLM_REJUDGE_IOU` | `0.5` | Below this counts as "moved" |
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20.0` | Floor on movement-triggered re-judging |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Hard cap on inferences per batch |
+| `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Below Moondream's 512 px hi-res cliff; `0` disables |
 
 **Devices**
 

@@ -153,6 +153,26 @@ class VLMResult(BaseModel):
     inference_time_ms: float = Field(
         ..., ge=0.0, description="Wall-clock inference time in milliseconds."
     )
+    queued_ms: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Milliseconds between the frame being captured and this inference "
+            "starting. Everything the appliance chose to do before answering "
+            "this question — draining, coalescing, cropping, and every subject "
+            "judged earlier in the same batch — lands here, so it is the term "
+            "that grows under load while inference_time_ms stays flat."
+        ),
+    )
+    latency_ms: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Milliseconds from frame capture to verdict: queued_ms plus the "
+            "inference. This is the number an operator experiences, and the "
+            "only one that reveals a backlog."
+        ),
+    )
     model_name: str = Field(
         default="moondream2", description="Name of the VLM model used."
     )

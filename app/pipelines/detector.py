@@ -556,13 +556,25 @@ class YOLOWatchdog:
             if result.boxes is None or len(result.boxes) == 0:
                 continue
 
-            for box in result.boxes:
-                self._detections_total += 1
+            # One device-to-host transfer for the whole frame, rather than
+            # three per box. Every `.item()` and `.tolist()` is a
+            # synchronization point on an accelerator, so the per-box form
+            # measured 5.4 ms for eleven boxes on MPS against 0.15 ms here —
+            # a third of Stage 1's entire per-frame budget spent fetching
+            # sixty-six numbers. Columns are [x1, y1, x2, y2, conf, cls];
+            # read the last two from the right, since Ultralytics inserts a
+            # track id before them when its own tracker is driving.
+            detections = result.boxes.data.cpu().numpy()
+            self._detections_total += len(detections)
 
-                # Extract detection info
-                cls_id = int(box.cls[0].item())
-                confidence = float(box.conf[0].item())
-                label = result.names.get(cls_id, f"class_{cls_id}")
+            # Normalize and clamp every box at once.
+            scale = np.array([frame_w, frame_h, frame_w, frame_h], dtype=np.float64)
+            xyxy_norm = np.clip(detections[:, :4] / scale, 0.0, 1.0)
+
+            for box_norm, confidence, cls_id in zip(
+                xyxy_norm, detections[:, -2], detections[:, -1]
+            ):
+                confidence = float(confidence)
 
                 # ── Confidence threshold ─────────────────────────
                 # (Already filtered by YOLO `conf` param, but double-check
@@ -571,13 +583,14 @@ class YOLOWatchdog:
                     self._detections_filtered_confidence += 1
                     continue
 
-                # ── Extract normalized bounding box ──────────────
-                xyxy = box.xyxy[0].tolist()  # [x1, y1, x2, y2] in pixels
+                cls_id = int(cls_id)
+                label = result.names.get(cls_id, f"class_{cls_id}")
+
                 bbox = BoundingBox(
-                    x1=max(0.0, min(1.0, xyxy[0] / frame_w)),
-                    y1=max(0.0, min(1.0, xyxy[1] / frame_h)),
-                    x2=max(0.0, min(1.0, xyxy[2] / frame_w)),
-                    y2=max(0.0, min(1.0, xyxy[3] / frame_h)),
+                    x1=float(box_norm[0]),
+                    y1=float(box_norm[1]),
+                    x2=float(box_norm[2]),
+                    y2=float(box_norm[3]),
                 )
 
                 candidates.append((label, bbox, confidence))

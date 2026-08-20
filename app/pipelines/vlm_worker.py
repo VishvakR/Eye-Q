@@ -32,10 +32,12 @@ Example:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -68,6 +70,20 @@ _MEMO_PRUNE_AT = 1024
 # control — that is max_instances_per_batch, applied after the memo has had its
 # say — purely a guard against an unbounded backlog materialising as crops.
 _BATCH_HARD_CAP = 64
+
+
+def _percentile(samples, pct: float) -> float:
+    """Nearest-rank percentile of ``samples``, or 0.0 when empty.
+
+    Hand-rolled rather than pulled from numpy: the sample window is 100 floats,
+    so sorting it costs nothing, and this keeps the stats path free of any
+    dependency that a stripped-down edge install might not carry.
+    """
+    ordered = sorted(samples)
+    if not ordered:
+        return 0.0
+    rank = math.ceil(pct / 100.0 * len(ordered))
+    return ordered[max(0, min(len(ordered) - 1, rank - 1))]
 
 
 # ── Frame Cropping ───────────────────────────────────────────────
@@ -203,6 +219,48 @@ def crop_detection_focused(
     return out
 
 
+def downscale_for_vlm(image: np.ndarray, max_edge: int) -> np.ndarray:
+    """Shrink a crop so its longest side fits ``max_edge``, or pass it through.
+
+    This exists because of a cliff inside Moondream's preprocessor rather than
+    any generic "smaller is faster" intuition. Below 512 px it resizes the
+    whole image to 378x378 and runs the vision tower **once**. At 512 px or
+    above it switches to a hi-res path: resize to 756 px, split into 378 px
+    tiles, and push the full image *plus* every tile through the encoder — 3 to
+    5 forward passes instead of 1. Measured on an M2: 1.42 s at 360 px against
+    3.16 s at 792 px, for the same one-word answer.
+
+    Crops normally land well under the threshold, so this usually does nothing.
+    It bites when :func:`crop_bounds` falls back to the **entire frame** — for a
+    subject filling more than 80% of it, or a box too small to crop — at which
+    point a yes/no question costs triple.
+
+    Args:
+        image: The crop, in BGR.
+        max_edge: Longest permitted side in pixels. 0 or less disables.
+
+    Returns:
+        The original array when it already fits, otherwise a new smaller one.
+    """
+    if max_edge <= 0:
+        return image
+
+    h, w = image.shape[:2]
+    longest = max(h, w)
+    if longest <= max_edge:
+        return image
+
+    scale = max_edge / longest
+    return cv2.resize(
+        image,
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        # INTER_AREA is the correct filter for shrinking — it averages the
+        # source pixels rather than sampling them, so thin features like a vest
+        # strap survive the reduction instead of aliasing away.
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 # ── Worker Statistics ────────────────────────────────────────────
 
 
@@ -226,6 +284,12 @@ class VLMWorkerStats:
     instances_shed: int
     avg_inference_ms: float
     last_inference_ms: float
+    # Capture-to-verdict, which is what an operator actually waits through.
+    # Reported as percentiles because the mean hides exactly the case that
+    # matters: most subjects answered promptly while a few wait out a batch.
+    avg_queued_ms: float
+    latency_p50_ms: float
+    latency_p95_ms: float
     uptime_seconds: float
 
 
@@ -267,6 +331,9 @@ class VLMWorker:
         rejudge_iou: Re-judge early below this IoU against the judged box.
         min_rejudge_s: Floor between re-judgements of one subject.
         max_instances_per_batch: Cap on subjects inferred per drained batch.
+        max_crop_edge: Longest side a crop may have when handed to the VLM.
+            See :func:`downscale_for_vlm` for why 512 is a cliff and not a
+            preference.
     """
 
     def __init__(
@@ -288,6 +355,7 @@ class VLMWorker:
         rejudge_iou: float = 0.5,
         min_rejudge_s: float = 20.0,
         max_instances_per_batch: int = 8,
+        max_crop_edge: int = 511,
     ) -> None:
         self._buffer = buffer
         self._zmq_endpoint = zmq_endpoint
@@ -302,6 +370,7 @@ class VLMWorker:
         self._rejudge_iou = rejudge_iou
         self._min_rejudge_s = min_rejudge_s
         self._max_instances_per_batch = max_instances_per_batch
+        self._max_crop_edge = max_crop_edge
 
         # Verdict memo: (track_id, rule_id) -> (verdict, judged_at, judged_bbox).
         # This is the appliance's load control. Judging every tracked subject on
@@ -352,7 +421,9 @@ class VLMWorker:
         self._instances_judged = 0
         self._instances_memoised = 0
         self._instances_shed = 0
-        self._inference_times: list[float] = []
+        self._inference_times: deque[float] = deque(maxlen=100)
+        self._queued_times: deque[float] = deque(maxlen=100)
+        self._latencies: deque[float] = deque(maxlen=100)
         self._last_inference_ms: float = 0.0
         self._start_time: float = 0.0
 
@@ -601,8 +672,11 @@ class VLMWorker:
     def stats(self) -> VLMWorkerStats:
         """Current worker statistics snapshot."""
         uptime = time.monotonic() - self._start_time if self._start_time else 0.0
-        recent = self._inference_times[-50:]
+        recent = list(self._inference_times)[-50:]
         avg_ms = sum(recent) / len(recent) if recent else 0.0
+
+        queued = list(self._queued_times)
+        avg_queued = sum(queued) / len(queued) if queued else 0.0
 
         return VLMWorkerStats(
             is_running=self.is_running,
@@ -621,6 +695,9 @@ class VLMWorker:
             instances_shed=self._instances_shed,
             avg_inference_ms=avg_ms,
             last_inference_ms=self._last_inference_ms,
+            avg_queued_ms=avg_queued,
+            latency_p50_ms=_percentile(self._latencies, 50),
+            latency_p95_ms=_percentile(self._latencies, 95),
             uptime_seconds=uptime,
         )
 
@@ -647,7 +724,7 @@ class VLMWorker:
                 if not batch:
                     continue
                 try:
-                    self._process_batch(batch, publisher)
+                    self._process_batch(batch, publisher, subscriber)
                 except Exception as exc:
                     self._triggers_failed += 1
                     logger.error(
@@ -683,6 +760,31 @@ class VLMWorker:
 
         pending = [first[1]]
         pending.extend(payload for _topic, payload in subscriber.drain(max_messages=512))
+        return self._coalesce(pending)
+
+    def _drain_now(self, subscriber: EventSubscriber) -> list[dict]:
+        """Take whatever has arrived since the last look, without waiting.
+
+        Called between subjects mid-batch so a person who walks in does not
+        have to wait out every re-check queued ahead of them. Returns an empty
+        list when the scene is quiet, which is the common case and costs one
+        non-blocking poll.
+        """
+        pending = [payload for _topic, payload in subscriber.drain(max_messages=512)]
+        return self._coalesce(pending) if pending else []
+
+    def _coalesce(self, pending: list[dict]) -> list[dict]:
+        """Reduce a burst of triggers to the newest one per subject.
+
+        Args:
+            pending: Raw payloads in arrival order.
+
+        Returns:
+            One payload per subject, newest first, capped at the hard ceiling.
+        """
+        if not pending:
+            return []
+
         self._triggers_received += len(pending)
 
         # Keyed by *subject*, not by label. Keying on the label alone was the
@@ -721,20 +823,30 @@ class VLMWorker:
 
         return batch
 
-    def _infer(self, image: Image.Image, prompt: str) -> str:
-        """Run a single VLM query under a hard timeout.
-
-        Args:
-            image: Cropped detection image.
-            prompt: Question to ask.
+    def _encode(self, image: Image.Image) -> object:
+        """Run the backend's shareable per-image work under a hard timeout.
 
         Returns:
-            Raw VLM text response.
+            An opaque handle to pass to :meth:`_answer`.
+
+        Raises:
+            concurrent.futures.TimeoutError: If encoding exceeds the timeout.
+        """
+        future = self._executor.submit(self._vlm.encode, image)
+        return future.result(timeout=self._inference_timeout_s)
+
+    def _answer(self, handle: object, prompt: str) -> str:
+        """Ask one question against an encoded image, under a hard timeout.
+
+        The encode and each answer are bounded separately, so a subject with
+        several rules can in principle spend more than ``inference_timeout_s``
+        in total. That is intended: the timeout is a runaway guard on a single
+        wedged model call, not a budget for the subject.
 
         Raises:
             concurrent.futures.TimeoutError: If inference exceeds the timeout.
         """
-        future = self._executor.submit(self._vlm.query, image, prompt)
+        future = self._executor.submit(self._vlm.answer, handle, prompt)
         return future.result(timeout=self._inference_timeout_s)
 
     def _save_snapshot(self, image_bgr: np.ndarray) -> str | None:
@@ -788,7 +900,12 @@ class VLMWorker:
             return None
         return frame
 
-    def _process_batch(self, payloads: list[dict], publisher: EventPublisher) -> None:
+    def _process_batch(
+        self,
+        payloads: list[dict],
+        publisher: EventPublisher,
+        subscriber: EventSubscriber | None = None,
+    ) -> None:
         """Judge a whole drained batch: crop everything first, then infer.
 
         The ordering here is the point of the method, not an implementation
@@ -803,6 +920,32 @@ class VLMWorker:
         Cropping every subject up front costs ~1 ms each and a couple of
         megabytes, and makes the buffer irrelevant by the time the slow part
         starts.
+
+        Args:
+            payloads: Coalesced detection triggers.
+            publisher: Where verdicts are published.
+            subscriber: When given, the batch re-polls it between subjects so a
+                newly arrived person can overtake queued re-checks. Omitted by
+                the single-trigger path and by tests that drive one batch.
+        """
+        prepared = self._prepare(payloads)
+        if not prepared:
+            return
+
+        self._judge_prepared(prepared, publisher, subscriber)
+
+    def _prepare(
+        self, payloads: list[dict]
+    ) -> list[tuple[DetectionEvent, list[dict], np.ndarray, bool]]:
+        """Turn raw payloads into croppped, judgeable work items.
+
+        Everything cheap happens here and everything slow happens to the
+        result: parse, shed stale groups, consult the memo, read each source
+        frame once, and crop every surviving subject. See :meth:`_process_batch`
+        for why the cropping cannot be deferred to inference time.
+
+        Returns:
+            ``(event, rules, crop, is_new_subject)`` tuples, unordered.
         """
         events: list[DetectionEvent] = []
         for payload in payloads:
@@ -813,7 +956,7 @@ class VLMWorker:
                 logger.warning(f"Discarding malformed detection payload: {exc}")
 
         if not events:
-            return
+            return []
 
         # Subjects from one frame share a timestamp exactly — it is copied, not
         # recomputed, per box — so this groups by source frame.
@@ -851,8 +994,11 @@ class VLMWorker:
                 continue
 
             for event, rules in pending:
-                cropped = crop_detection_focused(
-                    frame, event.bbox, self._crop_padding, self._focus_dim
+                cropped = downscale_for_vlm(
+                    crop_detection_focused(
+                        frame, event.bbox, self._crop_padding, self._focus_dim
+                    ),
+                    self._max_crop_edge,
                 )
                 prepared.append(
                     (event, rules, cropped, self._is_new_subject(event.track_id))
@@ -860,39 +1006,81 @@ class VLMWorker:
 
             del frame
 
-        if not prepared:
-            return
+        return prepared
 
-        # Never-judged subjects first: under load the appliance should delay
-        # re-checking someone it already cleared, never delay a first look at
-        # someone it has not seen.
-        prepared.sort(key=lambda item: (not item[3], -item[0].timestamp))
+    def _judge_prepared(
+        self,
+        prepared: list[tuple[DetectionEvent, list[dict], np.ndarray, bool]],
+        publisher: EventPublisher,
+        subscriber: EventSubscriber | None = None,
+    ) -> None:
+        """Judge a prepared batch, letting new arrivals overtake re-checks.
 
-        if len(prepared) > self._max_instances_per_batch:
-            shed = len(prepared) - self._max_instances_per_batch
-            self._instances_shed += shed
-            logger.info(
-                f"Judging {self._max_instances_per_batch} of {len(prepared)} subjects; "
-                f"{shed} deferred to the next batch."
-            )
-            prepared = prepared[: self._max_instances_per_batch]
+        The priority rule is the same one the sort has always expressed —
+        never-judged subjects ahead of re-checks — but it used to be applied
+        once, to whatever happened to be in hand when the batch started. With
+        inference at seconds per subject and a cap of eight, a batch can run
+        for a minute; a person walking in a second after it began was invisible
+        to that sort and waited out every re-check ahead of them. Re-polling
+        between subjects lets them take the place the sort always intended.
 
-        for event, rules, cropped, _is_new in prepared:
+        The cap still bounds how many subjects are judged per batch, so this
+        changes *which* subjects get the budget, never how large it is.
+        """
+        judged = 0
+        while prepared and judged < self._max_instances_per_batch:
             if self._shutdown_event.is_set():
                 break
+
+            if subscriber is not None:
+                prepared.extend(self._prepare(self._newcomers(subscriber, prepared)))
+
+            # Never-judged subjects first, then freshest. Re-applied on every
+            # pass so a late arrival is ranked against what is still waiting,
+            # not against the queue as it looked when the batch began.
+            prepared.sort(key=lambda item: (not item[3], -item[0].timestamp))
+
+            event, rules, cropped, _is_new = prepared.pop(0)
+            judged += 1
+
             try:
                 if not self._judge_instance(event, rules, cropped, publisher):
                     # A hung inference. The executor has a single worker and
                     # Moondream cannot be interrupted, so everything behind it
                     # would queue on a thread that is never coming back.
                     logger.error("Abandoning the rest of the batch after a timeout.")
-                    break
+                    return
             except Exception as exc:
                 self._triggers_failed += 1
                 logger.error(f"VLMWorker: judging failed: {exc}", exc_info=True)
             finally:
                 # Always release accelerator memory back to YOLO
                 self._vlm.cleanup()
+
+        if prepared:
+            self._instances_shed += len(prepared)
+            logger.info(
+                f"Judged {judged} subject(s); {len(prepared)} deferred to the "
+                f"next batch."
+            )
+
+    def _newcomers(
+        self,
+        subscriber: EventSubscriber,
+        prepared: list[tuple[DetectionEvent, list[dict], np.ndarray, bool]],
+    ) -> list[dict]:
+        """Freshly arrived triggers for subjects not already queued in this batch.
+
+        Filtering by track id matters: the memo only records a verdict once the
+        subject has been judged, so a subject still waiting its turn would
+        otherwise be prepared a second time and judged twice in one batch.
+        """
+        waiting = {event.track_id for event, _rules, _crop, _new in prepared}
+        return [
+            payload
+            for payload in self._drain_now(subscriber)
+            if payload.get("track_id", -1) not in waiting
+        ]
 
     def _judge_instance(
         self,
@@ -914,6 +1102,32 @@ class VLMWorker:
 
         self._instances_judged += 1
 
+        # Encode once for the whole subject rather than once per rule. Every
+        # rule matching this subject asks about the identical crop, so the
+        # vision tower's output is identical too; re-deriving it per rule was
+        # pure repetition. Backends with no separable vision half return the
+        # image here and lose nothing.
+        subject_start = time.monotonic()
+        try:
+            handle = self._encode(pil_image)
+        except FutureTimeoutError:
+            self._triggers_timed_out += 1
+            self._vlm.request_stop()
+            logger.error(
+                f"VLM image encoding exceeded {self._inference_timeout_s}s "
+                f"for [{event.label}#{event.track_id}]."
+            )
+            return False
+        except Exception as exc:
+            self._triggers_failed += 1
+            logger.error(f"VLM image encoding failed: {exc}")
+            return True
+
+        # Charged to the first rule below, since that is the verdict whose
+        # production actually paid for it. Later rules are genuinely cheaper
+        # and their timings should say so.
+        unbilled_encode_ms = (time.monotonic() - subject_start) * 1000.0
+
         for rule in rules:
             prompt = rule["prompt"]
             rule_id = rule["rule_id"]
@@ -925,8 +1139,15 @@ class VLMWorker:
             )
 
             start_time = time.monotonic()
+            # Measured from the frame's own timestamp, so this covers the whole
+            # journey — Stage 1's gating, the ZMQ hop, the drain, the crop, and
+            # every subject judged ahead of this one — not just the model call.
+            # The first rule's clock starts at the encode, which was work done
+            # on its behalf; later rules start at their own query.
+            work_start = subject_start if unbilled_encode_ms else start_time
+            queued_ms = max(0.0, (work_start - event.timestamp) * 1000.0)
             try:
-                raw_response = self._infer(pil_image, prompt + VERDICT_SUFFIX)
+                raw_response = self._answer(handle, prompt + VERDICT_SUFFIX)
             except FutureTimeoutError:
                 self._triggers_timed_out += 1
                 # Ask the backend to abandon generation. Without this the
@@ -942,12 +1163,17 @@ class VLMWorker:
                 self._triggers_failed += 1
                 logger.error(f"VLM inference failed: {exc}")
                 continue
-            inference_ms = (time.monotonic() - start_time) * 1000.0
+            # The encode is billed to whichever rule triggered it, so a
+            # subject's total cost stays honest no matter how it is split.
+            inference_ms = (time.monotonic() - start_time) * 1000.0 + unbilled_encode_ms
+            unbilled_encode_ms = 0.0
+
+            latency_ms = queued_ms + inference_ms
 
             self._last_inference_ms = inference_ms
             self._inference_times.append(inference_ms)
-            if len(self._inference_times) > 100:
-                self._inference_times = self._inference_times[-100:]
+            self._queued_times.append(queued_ms)
+            self._latencies.append(latency_ms)
 
             # Parse verdict
             verdict = self._verdict_parser.parse(raw_response)
@@ -974,6 +1200,8 @@ class VLMWorker:
                 verdict=verdict,
                 raw_response=raw_response,
                 inference_time_ms=inference_ms,
+                queued_ms=queued_ms,
+                latency_ms=latency_ms,
                 model_name=self._vlm.model_name,
                 snapshot_path=snapshot_path,
             )
@@ -982,6 +1210,8 @@ class VLMWorker:
             logger.info(
                 f"VLM result: {verdict_str} | "
                 f"inference={inference_ms:.0f}ms | "
+                f"queued={queued_ms:.0f}ms | "
+                f"latency={latency_ms:.0f}ms | "
                 f"response='{raw_response[:100]}'"
             )
 

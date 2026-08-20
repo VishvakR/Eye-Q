@@ -20,6 +20,65 @@ from app.pipelines.detector import CooldownGate, YOLOWatchdog
 from app.schemas.events import BoundingBox
 
 # ═══════════════════════════════════════════════════════════════════
+# Ultralytics Result Stubs
+# ═══════════════════════════════════════════════════════════════════
+
+
+class _StubTensor:
+    """Minimal stand-in for the torch tensor Ultralytics hands back."""
+
+    def __init__(self, array: np.ndarray) -> None:
+        self._array = array
+
+    def cpu(self) -> _StubTensor:
+        return self
+
+    def numpy(self) -> np.ndarray:
+        return self._array
+
+
+class _StubBoxes:
+    """Stands in for ``ultralytics.engine.results.Boxes``.
+
+    Stage 1 reads a frame's detections as one ``(N, 6)`` block —
+    ``[x1, y1, x2, y2, conf, cls]`` — rather than field by field per box, so
+    the stub carries a real array. Mocking the per-box accessors instead would
+    let the production code drift back to the synchronization-heavy form
+    without a test noticing.
+    """
+
+    def __init__(self, rows: list[list[float]]) -> None:
+        self.data = _StubTensor(np.array(rows, dtype=np.float32).reshape(-1, 6))
+
+    def __len__(self) -> int:
+        return len(self.data.numpy())
+
+
+def _stub_result(detections):
+    """Build a stub ultralytics result from the given detections.
+
+    Each entry is ``(label, conf)`` — which keeps the original box, so callers
+    written before tracking existed are unaffected — or ``(label, conf, xyxy)``
+    to place boxes apart, which multi-instance tests need: identical pixels are
+    correctly one object, not several.
+    """
+    names, rows = {}, []
+    for i, detection in enumerate(detections):
+        if len(detection) == 3:
+            label, conf, xyxy = detection
+        else:
+            label, conf = detection
+            xyxy = [10.0, 10.0, 50.0, 50.0]
+
+        names[i] = label
+        rows.append([*xyxy, conf, float(i)])
+
+    result = MagicMock()
+    result.names = names
+    result.boxes = _StubBoxes(rows)
+    return result
+
+# ═══════════════════════════════════════════════════════════════════
 # Bounding Box Geometry Tests
 # ═══════════════════════════════════════════════════════════════════
 
@@ -465,32 +524,7 @@ class TestDisplayVsTriggerScope:
         return YOLOWatchdog(buffer=MagicMock(), publisher=MagicMock(), **kwargs)
 
     def _fake_result(self, detections):
-        """Build a stub ultralytics result from the given detections.
-
-        Each entry is ``(label, conf)`` — which keeps the original box, so
-        callers written before tracking existed are unaffected — or
-        ``(label, conf, xyxy)`` to place boxes apart, which multi-instance
-        tests need: identical pixels are correctly one object, not several.
-        """
-        names, boxes = {}, []
-        for i, detection in enumerate(detections):
-            if len(detection) == 3:
-                label, conf, xyxy = detection
-            else:
-                label, conf = detection
-                xyxy = [10.0, 10.0, 50.0, 50.0]
-
-            names[i] = label
-            box = MagicMock()
-            box.cls = [MagicMock(item=lambda i=i: i)]
-            box.conf = [MagicMock(item=lambda c=conf: c)]
-            box.xyxy = [MagicMock(tolist=lambda xy=list(xyxy): xy)]
-            boxes.append(box)
-
-        result = MagicMock()
-        result.names = names
-        result.boxes = boxes
-        return result
+        return _stub_result(detections)
 
     def _run_frame(self, watchdog, detections):
         watchdog._model = MagicMock()
@@ -558,19 +592,7 @@ class TestMultiInstanceTriggering:
         return YOLOWatchdog(buffer=MagicMock(), publisher=MagicMock(), **kwargs)
 
     def _fake_result(self, detections):
-        names, boxes = {}, []
-        for i, (label, conf, xyxy) in enumerate(detections):
-            names[i] = label
-            box = MagicMock()
-            box.cls = [MagicMock(item=lambda i=i: i)]
-            box.conf = [MagicMock(item=lambda c=conf: c)]
-            box.xyxy = [MagicMock(tolist=lambda xy=list(xyxy): xy)]
-            boxes.append(box)
-
-        result = MagicMock()
-        result.names = names
-        result.boxes = boxes
-        return result
+        return _stub_result(detections)
 
     def _run_frame(self, watchdog, detections):
         watchdog._model = MagicMock()
