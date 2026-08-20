@@ -20,6 +20,53 @@ from app.pipelines.detector import CooldownGate, YOLOWatchdog
 from app.schemas.events import BoundingBox
 
 # ═══════════════════════════════════════════════════════════════════
+# Bounding Box Geometry Tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBoundingBoxIoU:
+    """IoU underpins both frame-to-frame tracking and re-judge decisions."""
+
+    def test_identical_boxes_fully_overlap(self):
+        box = BoundingBox(x1=0.1, y1=0.1, x2=0.5, y2=0.5)
+        assert box.iou(box) == pytest.approx(1.0)
+
+    def test_disjoint_boxes_do_not_overlap(self):
+        left = BoundingBox(x1=0.0, y1=0.0, x2=0.2, y2=0.2)
+        right = BoundingBox(x1=0.6, y1=0.6, x2=0.9, y2=0.9)
+        assert left.iou(right) == 0.0
+
+    def test_touching_edges_do_not_overlap(self):
+        """Shared edge, zero area — adjacency is not identity."""
+        left = BoundingBox(x1=0.0, y1=0.0, x2=0.4, y2=0.4)
+        right = BoundingBox(x1=0.4, y1=0.0, x2=0.8, y2=0.4)
+        assert left.iou(right) == 0.0
+
+    def test_half_overlap_is_one_third(self):
+        """Two unit-area boxes sharing half their area: 0.5 / 1.5."""
+        a = BoundingBox(x1=0.0, y1=0.0, x2=0.4, y2=0.4)
+        b = BoundingBox(x1=0.2, y1=0.0, x2=0.6, y2=0.4)
+        assert a.iou(b) == pytest.approx(1.0 / 3.0)
+
+    def test_contained_box_scores_the_area_ratio(self):
+        outer = BoundingBox(x1=0.0, y1=0.0, x2=0.4, y2=0.4)
+        inner = BoundingBox(x1=0.1, y1=0.1, x2=0.3, y2=0.3)
+        assert outer.iou(inner) == pytest.approx(0.25)
+
+    def test_is_symmetric(self):
+        a = BoundingBox(x1=0.1, y1=0.2, x2=0.5, y2=0.7)
+        b = BoundingBox(x1=0.3, y1=0.1, x2=0.8, y2=0.6)
+        assert a.iou(b) == pytest.approx(b.iou(a))
+
+    def test_degenerate_box_returns_zero_not_an_error(self):
+        """A zero-area box must not divide by zero — YOLO can emit one."""
+        flat = BoundingBox(x1=0.3, y1=0.3, x2=0.3, y2=0.7)
+        real = BoundingBox(x1=0.1, y1=0.1, x2=0.5, y2=0.9)
+        assert flat.iou(real) == 0.0
+        assert flat.iou(flat) == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Region of Interest Tests
 # ═══════════════════════════════════════════════════════════════════
 
@@ -418,14 +465,26 @@ class TestDisplayVsTriggerScope:
         return YOLOWatchdog(buffer=MagicMock(), publisher=MagicMock(), **kwargs)
 
     def _fake_result(self, detections):
-        """Build a stub ultralytics result with the given (label, conf) pairs."""
+        """Build a stub ultralytics result from the given detections.
+
+        Each entry is ``(label, conf)`` — which keeps the original box, so
+        callers written before tracking existed are unaffected — or
+        ``(label, conf, xyxy)`` to place boxes apart, which multi-instance
+        tests need: identical pixels are correctly one object, not several.
+        """
         names, boxes = {}, []
-        for i, (label, conf) in enumerate(detections):
+        for i, detection in enumerate(detections):
+            if len(detection) == 3:
+                label, conf, xyxy = detection
+            else:
+                label, conf = detection
+                xyxy = [10.0, 10.0, 50.0, 50.0]
+
             names[i] = label
             box = MagicMock()
             box.cls = [MagicMock(item=lambda i=i: i)]
             box.conf = [MagicMock(item=lambda c=conf: c)]
-            box.xyxy = [MagicMock(tolist=lambda: [10.0, 10.0, 50.0, 50.0])]
+            box.xyxy = [MagicMock(tolist=lambda xy=list(xyxy): xy)]
             boxes.append(box)
 
         result = MagicMock()
@@ -474,3 +533,184 @@ class TestDisplayVsTriggerScope:
         self._run_frame(watchdog, [("person", 0.2)])
 
         assert watchdog.recent_detections(max_age_s=60) == []
+
+
+class TestMultiInstanceTriggering:
+    """A frame with several subjects must wake the VLM about each of them.
+
+    This is the regression suite for the defect where a rule like "alert if a
+    person has no helmet" judged exactly one person per frame, chosen by
+    whichever box YOLO happened to emit first — so in a group where one worker
+    was non-compliant, the violation was usually never looked at.
+    """
+
+    # Four people standing apart, in pixels on the 100x100 test frame.
+    FOUR_PEOPLE = [
+        ("person", 0.9, [5.0, 10.0, 20.0, 60.0]),
+        ("person", 0.9, [30.0, 10.0, 45.0, 60.0]),
+        ("person", 0.9, [55.0, 10.0, 70.0, 60.0]),
+        ("person", 0.9, [78.0, 10.0, 93.0, 60.0]),
+    ]
+
+    def _watchdog(self, **kwargs):
+        from app.pipelines.detector import YOLOWatchdog
+
+        return YOLOWatchdog(buffer=MagicMock(), publisher=MagicMock(), **kwargs)
+
+    def _fake_result(self, detections):
+        names, boxes = {}, []
+        for i, (label, conf, xyxy) in enumerate(detections):
+            names[i] = label
+            box = MagicMock()
+            box.cls = [MagicMock(item=lambda i=i: i)]
+            box.conf = [MagicMock(item=lambda c=conf: c)]
+            box.xyxy = [MagicMock(tolist=lambda xy=list(xyxy): xy)]
+            boxes.append(box)
+
+        result = MagicMock()
+        result.names = names
+        result.boxes = boxes
+        return result
+
+    def _run_frame(self, watchdog, detections):
+        watchdog._model = MagicMock()
+        watchdog._model.predict.return_value = [self._fake_result(detections)]
+        watchdog._process_frame(np.zeros((100, 100, 3), dtype=np.uint8), 1.0, 0)
+
+    def test_every_person_in_the_frame_triggers(self):
+        """The headline fix: four people, four triggers — not one."""
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        assert watchdog.stats.detections_published == 4
+        assert watchdog.stats.detections_filtered_cooldown == 0
+
+    def test_each_trigger_carries_a_distinct_track_id(self):
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        published = watchdog._publisher.publish.call_args_list
+        track_ids = [call.args[1]["track_id"] for call in published]
+        assert len(set(track_ids)) == 4, f"Ids collided: {track_ids}"
+
+    def test_the_same_people_do_not_retrigger_on_the_next_frame(self):
+        """Identity is what stops four subjects becoming a trigger firehose."""
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        assert watchdog.stats.detections_published == 4
+        assert watchdog.stats.detections_filtered_cooldown == 4
+
+    def test_a_new_arrival_triggers_while_others_are_in_cooldown(self):
+        """The case that used to fail silently: someone walks in mid-cooldown."""
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+        assert watchdog.stats.detections_published == 4
+
+        newcomer = ("person", 0.9, [5.0, 70.0, 20.0, 95.0])
+        self._run_frame(watchdog, [*self.FOUR_PEOPLE, newcomer])
+
+        assert watchdog.stats.detections_published == 5, (
+            "A newly arrived subject was suppressed by another subject's cooldown"
+        )
+
+    def test_a_moving_subject_keeps_its_id(self):
+        """Drift must not look like a new person and burn a fresh inference."""
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, [("person", 0.9, [10.0, 10.0, 30.0, 60.0])])
+        self._run_frame(watchdog, [("person", 0.9, [13.0, 10.0, 33.0, 60.0])])
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_cooldown == 1
+
+    def test_tracking_off_restores_the_original_behaviour(self):
+        """The kill switch: one trigger per label, exactly as before."""
+        watchdog = self._watchdog(cooldown_seconds=999.0, track_enabled=False)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_cooldown == 3
+
+        published = watchdog._publisher.publish.call_args_list
+        assert published[0].args[1]["track_id"] == -1
+
+    def test_out_of_roi_subjects_are_still_excluded(self):
+        """Per-instance triggering must not widen the ROI gate."""
+        roi = RegionOfInterest.from_rect(0.0, 0.0, 0.5, 1.0)
+        watchdog = self._watchdog(cooldown_seconds=999.0, roi=roi)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        assert watchdog.stats.detections_published == 2
+        assert watchdog.stats.detections_filtered_roi == 2
+
+    def test_every_subject_is_still_drawn_regardless_of_gating(self):
+        watchdog = self._watchdog(cooldown_seconds=999.0)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        assert len(watchdog.recent_detections(max_age_s=60)) == 8
+
+    def test_tracks_active_is_reported(self):
+        watchdog = self._watchdog()
+        self._run_frame(watchdog, self.FOUR_PEOPLE)
+
+        assert watchdog.stats.tracks_active == 4
+
+
+class TestCooldownPruning:
+    """Per-instance keys mean the gate's map grows with track churn."""
+
+    def test_map_stays_bounded_under_churn(self):
+        gate = CooldownGate(cooldown_seconds=0.01)
+        for i in range(5000):
+            gate.should_trigger(f"person#{i}")
+
+        assert gate.tracked_keys < 1000, (
+            f"Cooldown map leaked to {gate.tracked_keys} keys"
+        )
+
+    def test_realistic_churn_never_resurrects_a_live_key(self):
+        """Below the hard cap, pruning is exact — it drops only dead entries."""
+        gate = CooldownGate(cooldown_seconds=60.0)
+        gate.should_trigger("person#live")
+
+        # Well past the prune threshold, well short of the hard cap. This is
+        # the range any real scene occupies.
+        for i in range(2000):
+            gate.should_trigger(f"person#{i}")
+
+        assert gate.should_trigger("person#live") is False
+
+    def test_hard_cap_degrades_by_forgetting_the_nearest_to_expiry(self):
+        """Past the hard cap something must give; document which.
+
+        Retaining every key would be an unbounded leak, so the cap drops the
+        oldest entries — the ones with the least cooldown left to run, whose
+        loss causes the least premature re-triggering. Reaching this at all
+        means over 4096 distinct instances inside one cooldown window, which is
+        two orders of magnitude beyond what the VLM can judge, so the practical
+        consequence is a few redundant inferences, not missed alerts.
+        """
+        gate = CooldownGate(cooldown_seconds=1e6)
+        gate.should_trigger("person#oldest")
+        for i in range(5000):
+            gate.should_trigger(f"person#{i}")
+
+        assert gate.tracked_keys <= 4096
+        # The oldest was sacrificed; the most recent are all still suppressing.
+        assert gate.should_trigger("person#4999") is False
+
+    def test_bounded_even_when_nothing_ages_out(self):
+        """A very long cooldown means age-based pruning alone cannot bound it."""
+        gate = CooldownGate(cooldown_seconds=1e6)
+        for i in range(20000):
+            gate.should_trigger(f"person#{i}")
+
+        assert gate.tracked_keys <= 4096
+
+    def test_is_known_reports_membership(self):
+        gate = CooldownGate(cooldown_seconds=60.0)
+        assert gate.is_known("person#1") is False
+        gate.should_trigger("person#1")
+        assert gate.is_known("person#1") is True

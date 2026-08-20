@@ -42,6 +42,7 @@ import numpy as np
 from app.core.buffer import RollingFrameBuffer
 from app.core.ipc import EventPublisher
 from app.core.roi import RegionOfInterest
+from app.pipelines.tracker import GreedyIoUTracker
 from app.schemas.events import BoundingBox, DetectionEvent
 
 logger = logging.getLogger(__name__)
@@ -50,52 +51,96 @@ logger = logging.getLogger(__name__)
 # ── Cooldown Gate ────────────────────────────────────────────────
 
 
-class CooldownGate:
-    """Per-label cooldown to prevent trigger flooding.
+# Above this many live keys the gate prunes. Keys are per *instance* now, so
+# the map grows with track churn rather than with the handful of COCO labels
+# an operator watches.
+_COOLDOWN_PRUNE_AT = 512
 
-    After a label triggers a detection event, further detections of
-    the same label are suppressed for ``cooldown_seconds``. This
-    prevents the VLM worker from being overwhelmed by redundant
-    triggers (e.g., a person standing in view generates 30 detections
-    per second without cooldown).
+# Backstop for the pathological case: a very long cooldown means almost nothing
+# ages out, so age-based pruning alone would not bound the map.
+_COOLDOWN_HARD_CAP = 4096
+
+
+class CooldownGate:
+    """Per-key cooldown to prevent trigger flooding.
+
+    After a key triggers a detection event, further detections under the same
+    key are suppressed for ``cooldown_seconds``. This prevents the VLM worker
+    from being overwhelmed by redundant triggers (e.g., a person standing in
+    view generates 30 detections per second without cooldown).
+
+    The key is opaque to this class. Stage 1 keys it by *instance*
+    (``"person#7"``) when tracking is on, and by bare label (``"person"``)
+    when it is off — which is what makes a frame of five workers produce five
+    triggers rather than one.
 
     Args:
-        cooldown_seconds: Minimum seconds between triggers for the same label.
+        cooldown_seconds: Minimum seconds between triggers for the same key.
     """
 
     def __init__(self, cooldown_seconds: float = 5.0) -> None:
         self._cooldown = cooldown_seconds
         self._last_trigger: dict[str, float] = {}
 
-    def should_trigger(self, label: str) -> bool:
-        """Check if a label is eligible to trigger (cooldown elapsed).
+    def should_trigger(self, key: str) -> bool:
+        """Check if a key is eligible to trigger (cooldown elapsed).
 
-        If eligible, updates the last-trigger timestamp for this label.
+        If eligible, updates the last-trigger timestamp for this key.
 
         Args:
-            label: Detection class label (e.g., ``"person"``).
+            key: Cooldown key — a label, or a label/instance pair.
 
         Returns:
             True if the cooldown period has elapsed since the last trigger.
         """
         now = time.monotonic()
-        last = self._last_trigger.get(label, 0.0)
+        last = self._last_trigger.get(key, 0.0)
 
         if now - last >= self._cooldown:
-            self._last_trigger[label] = now
+            if len(self._last_trigger) >= _COOLDOWN_PRUNE_AT:
+                self._prune(now)
+            self._last_trigger[key] = now
             return True
         return False
 
-    def reset(self, label: str | None = None) -> None:
-        """Reset cooldown for a specific label or all labels.
+    def _prune(self, now: float) -> None:
+        """Drop keys that can no longer suppress anything.
+
+        An entry older than the cooldown would pass ``should_trigger`` anyway,
+        so discarding it is exact rather than lossy — the gate behaves
+        identically with or without the prune. Without it, per-instance keying
+        would leak one entry per track for the life of the process, which on an
+        appliance meant to run for weeks is a real leak.
+        """
+        self._last_trigger = {
+            key: ts for key, ts in self._last_trigger.items() if now - ts < self._cooldown
+        }
+
+        if len(self._last_trigger) > _COOLDOWN_HARD_CAP:
+            # Nothing aged out (a very long cooldown). Keep the most recent,
+            # since those are the only ones still able to suppress.
+            newest = sorted(self._last_trigger.items(), key=lambda kv: kv[1], reverse=True)
+            self._last_trigger = dict(newest[:_COOLDOWN_HARD_CAP])
+
+    def is_known(self, key: str) -> bool:
+        """Whether this key has ever triggered within the current window."""
+        return key in self._last_trigger
+
+    @property
+    def tracked_keys(self) -> int:
+        """Number of keys currently held, for leak monitoring."""
+        return len(self._last_trigger)
+
+    def reset(self, key: str | None = None) -> None:
+        """Reset cooldown for a specific key or all keys.
 
         Args:
-            label: If provided, reset only this label. If None, reset all.
+            key: If provided, reset only this key. If None, reset all.
         """
-        if label is None:
+        if key is None:
             self._last_trigger.clear()
         else:
-            self._last_trigger.pop(label, None)
+            self._last_trigger.pop(key, None)
 
     @property
     def cooldown_seconds(self) -> float:
@@ -127,6 +172,9 @@ class WatchdogStats:
     detections_filtered_label: int
     current_fps: float
     uptime_seconds: float
+    tracks_active: int = 0
+    cooldown_keys: int = 0
+    frames_repeated: int = 0
 
 
 # ── YOLO Watchdog ────────────────────────────────────────────────
@@ -148,9 +196,14 @@ class YOLOWatchdog:
         imgsz: YOLO input image size (pixels, square).
         target_labels: Set of COCO labels to detect. If None, all labels pass.
         roi: Region of interest polygon. If None, full-frame is used.
-        cooldown_seconds: Per-label trigger cooldown.
+        cooldown_seconds: Per-instance trigger cooldown.
         camera_id: Camera identifier attached to published events.
         target_fps: Maximum detector frame rate.
+        track_enabled: Assign stable per-instance ids so every subject in a
+            frame can trigger, not just the first of its label. Turning this
+            off restores the original per-label behaviour exactly.
+        track_iou_threshold: Minimum IoU to continue an existing track.
+        track_max_age_frames: Frames a track survives unmatched.
     """
 
     def __init__(
@@ -166,6 +219,9 @@ class YOLOWatchdog:
         cooldown_seconds: float = 5.0,
         camera_id: str = "default",
         target_fps: float = 30.0,
+        track_enabled: bool = True,
+        track_iou_threshold: float = 0.2,
+        track_max_age_frames: int = 60,
     ) -> None:
         self._buffer = buffer
         self._publisher = publisher
@@ -179,6 +235,17 @@ class YOLOWatchdog:
         self._camera_id = camera_id
         self._target_fps = target_fps
         self._frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+
+        # Instance identity. Without it the cooldown below is keyed by label,
+        # so a frame of five workers wakes the VLM about exactly one of them.
+        self._tracker = (
+            GreedyIoUTracker(
+                iou_threshold=track_iou_threshold,
+                max_age_frames=track_max_age_frames,
+            )
+            if track_enabled
+            else None
+        )
 
         # Thread coordination
         self._shutdown_event = threading.Event()
@@ -197,12 +264,14 @@ class YOLOWatchdog:
         self._detections_filtered_label = 0
         self._start_time: float = 0.0
         self._fps_counter = _WatchdogFPSCounter(window_size=30)
+        self._last_timestamp: float | None = None
+        self._frames_repeated = 0
 
         # Recently seen detections, for the dashboard's live overlay. Holds
         # every detection above the confidence threshold — including labels no
         # rule watches, and detections suppressed by ROI or cooldown — so the
         # live feed shows the whole scene rather than only what triggers.
-        self._recent: deque[tuple[DetectionEvent, float, bool]] = deque(maxlen=64)
+        self._recent: deque[tuple[DetectionEvent, float, bool]] = deque(maxlen=256)
         self._recent_lock = threading.Lock()
 
     @property
@@ -298,6 +367,9 @@ class YOLOWatchdog:
             detections_filtered_label=self._detections_filtered_label,
             current_fps=self._fps_counter.fps,
             uptime_seconds=uptime,
+            tracks_active=self._tracker.active_count if self._tracker else 0,
+            cooldown_keys=self._cooldown.tracked_keys,
+            frames_repeated=self._frames_repeated,
         )
 
     # ── Configuration Mutators ───────────────────────────────────
@@ -369,6 +441,18 @@ class YOLOWatchdog:
                     self._shutdown_event.wait(timeout=0.1)
                     continue
 
+                # Never run inference twice on the same frame. The loop is
+                # paced independently of capture, so whenever the camera is
+                # slower than target_fps — a 6 FPS clip, an RTSP stream that
+                # drops, any CPU-bound board — the buffer keeps returning the
+                # frame already processed. Detecting the same objects again
+                # costs a full YOLO pass and changes nothing.
+                if timestamp == self._last_timestamp:
+                    self._frames_repeated += 1
+                    self._shutdown_event.wait(timeout=min(0.02, self._frame_interval))
+                    continue
+                self._last_timestamp = timestamp
+
                 # Run YOLO inference
                 self._process_frame(frame, timestamp, frame_index)
 
@@ -438,14 +522,17 @@ class YOLOWatchdog:
     ) -> None:
         """Run YOLO inference on a single frame and publish qualifying detections.
 
-        Pipeline:
-            1. Run YOLO predict (stream=True for memory efficiency)
-            2. For each detection:
-               a. Check label against whitelist
-               b. Check confidence against threshold
-               c. Check bbox center against ROI polygon
-               d. Check per-label cooldown
-            3. Publish DetectionEvent for qualifying detections
+        Two passes, because tracking is a whole-frame operation:
+
+            1. Decode every box and apply the confidence filter, collecting the
+               survivors.
+            2. Assign track ids to that whole set at once.
+            3. Per detection, apply label / ROI / cooldown gating and publish.
+
+        The pass split is what makes multi-instance alerting work. The cooldown
+        is keyed by instance, so five workers in one frame produce five
+        triggers — but only if identity is resolved before the gate, and
+        identity can only be resolved by looking at the frame's boxes together.
         """
         if self._model is None:
             return
@@ -461,6 +548,9 @@ class YOLOWatchdog:
         )
 
         frame_h, frame_w = frame.shape[:2]
+
+        # ── Pass 1: decode and filter by confidence ──────────────────
+        candidates: list[tuple[str, BoundingBox, float]] = []
 
         for result in results:
             if result.boxes is None or len(result.boxes) == 0:
@@ -490,56 +580,80 @@ class YOLOWatchdog:
                     y2=max(0.0, min(1.0, xyxy[3] / frame_h)),
                 )
 
-                event = DetectionEvent(
-                    timestamp=timestamp,
-                    camera_id=self._camera_id,
-                    label=label,
-                    confidence=confidence,
-                    bbox=bbox,
-                    frame_index=frame_index,
+                candidates.append((label, bbox, confidence))
+
+        if not candidates:
+            # Still age the tracker, or a subject that walks out of frame would
+            # keep its id forever and be treated as already-judged on return.
+            if self._tracker is not None:
+                self._tracker.update([])
+            return
+
+        # ── Pass 2: resolve identity for the whole frame at once ─────
+        if self._tracker is not None:
+            track_ids = self._tracker.update([(lbl, bb) for lbl, bb, _ in candidates])
+        else:
+            track_ids = [-1] * len(candidates)
+
+        # ── Pass 3: gate and publish ─────────────────────────────────
+        for (label, bbox, confidence), track_id in zip(candidates, track_ids):
+            event = DetectionEvent(
+                timestamp=timestamp,
+                camera_id=self._camera_id,
+                label=label,
+                confidence=confidence,
+                bbox=bbox,
+                frame_index=frame_index,
+                track_id=track_id,
+            )
+
+            # ── Trigger gating ───────────────────────────────
+            # Scope (label whitelist), ROI, and cooldown decide whether to
+            # WAKE THE VLM. They deliberately do not decide what the live
+            # feed shows: a rule watching "person" must not blind the
+            # operator to the forklift beside them. YOLO scores every class
+            # regardless, so displaying them all is free.
+            #
+            # The cooldown key carries the instance, so one worker's cooldown
+            # cannot suppress the worker standing next to them. With tracking
+            # off the key degrades to the bare label, which is exactly the
+            # original behaviour.
+            key = f"{label}#{track_id}" if track_id >= 0 else label
+
+            fired = False
+            if self._target_labels is not None and label not in self._target_labels:
+                self._detections_filtered_label += 1
+            elif not self._roi.contains_bbox_center(bbox):
+                self._detections_filtered_roi += 1
+            elif not self._cooldown.should_trigger(key):
+                self._detections_filtered_cooldown += 1
+            else:
+                fired = True
+
+            # Record every confident detection for the live overlay —
+            # in-scope or not, triggering or not.
+            with self._recent_lock:
+                self._recent.append((event, time.monotonic(), fired))
+
+            if not fired:
+                continue
+
+            # ── Publish detection event ──────────────────────
+            success = self._publisher.publish(
+                "detection",
+                event.model_dump(),
+            )
+
+            if success:
+                self._detections_published += 1
+                logger.info(
+                    f"Detection published: {key} ({confidence:.2f}) "
+                    f"at [{bbox.x1:.2f}, {bbox.y1:.2f}, {bbox.x2:.2f}, {bbox.y2:.2f}]"
                 )
-
-                # ── Trigger gating ───────────────────────────────
-                # Scope (label whitelist), ROI, and cooldown decide whether to
-                # WAKE THE VLM. They deliberately do not decide what the live
-                # feed shows: a rule watching "person" must not blind the
-                # operator to the forklift beside them. YOLO scores every class
-                # regardless, so displaying them all is free.
-                fired = False
-                if self._target_labels is not None and label not in self._target_labels:
-                    self._detections_filtered_label += 1
-                elif not self._roi.contains_bbox_center(bbox):
-                    self._detections_filtered_roi += 1
-                elif not self._cooldown.should_trigger(label):
-                    self._detections_filtered_cooldown += 1
-                else:
-                    fired = True
-
-                # Record every confident detection for the live overlay —
-                # in-scope or not, triggering or not.
-                with self._recent_lock:
-                    self._recent.append((event, time.monotonic(), fired))
-
-                if not fired:
-                    continue
-
-                # ── Publish detection event ──────────────────────
-                success = self._publisher.publish(
-                    "detection",
-                    event.model_dump(),
+            else:
+                logger.warning(
+                    f"Failed to publish detection for {key} (ZMQ send dropped)."
                 )
-
-                if success:
-                    self._detections_published += 1
-                    logger.info(
-                        f"Detection published: {label} ({confidence:.2f}) "
-                        f"at [{bbox.x1:.2f}, {bbox.y1:.2f}, {bbox.x2:.2f}, {bbox.y2:.2f}]"
-                    )
-                else:
-                    logger.warning(
-                        f"Failed to publish detection for {label} "
-                        f"(ZMQ send dropped)."
-                    )
 
     def __repr__(self) -> str:
         status = "running" if self.is_running else "stopped"
