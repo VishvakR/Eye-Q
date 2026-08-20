@@ -368,6 +368,13 @@ function renderAlerts(alertList) {
             ? escapeHtml(alert.rule_name)
             : `Rule #${alert.rule_id}`;
 
+        // Which subject this verdict is about. Several alerts can now come from
+        // one frame, and without the id they read as duplicates of each other
+        // rather than as different people.
+        const subject = alert.label
+            ? escapeHtml(alert.label) + (alert.track_id >= 0 ? ` #${alert.track_id}` : '')
+            : '';
+
         return `
             <div class="alert-card ${cardClass}">
                 <div class="alert-header">
@@ -382,6 +389,7 @@ function renderAlerts(alertList) {
                 </div>
                 <div class="alert-meta">
                     <span>${ruleLabel}</span>
+                    ${subject ? `<span>${subject}</span>` : ''}
                     <span>Camera: ${escapeHtml(alert.camera_id)}</span>
                     <span>VLM: ${(alert.inference_ms || 0).toFixed(0)}ms</span>
                 </div>
