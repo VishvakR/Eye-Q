@@ -123,7 +123,60 @@ class Settings(BaseSettings):
     detection_cooldown_s: float = Field(
         default=5.0,
         ge=0.0,
-        description="Minimum seconds between triggers for the same label.",
+        description=(
+            "Minimum seconds between triggers for the same subject. With "
+            "tracking on this is per instance, so one worker's cooldown never "
+            "suppresses the worker standing beside them."
+        ),
+    )
+
+    watchdog_fps: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=120.0,
+        description=(
+            "Maximum rate at which Stage 1 runs YOLO. The main CPU lever on a "
+            "board with no GPU: the watchdog is paced independently of "
+            "capture, so left at 30 it will use every cycle it can get and "
+            "starve the VLM and the API. There is no benefit to setting it "
+            "above the camera's frame rate — repeated frames are skipped "
+            "without inference either way."
+        ),
+    )
+
+    # ── Tracking (Stage 1) ───────────────────────────────────────
+    track_enabled: bool = Field(
+        default=True,
+        description=(
+            "Assign stable per-instance ids so every subject in a frame can be "
+            "judged, not just the first of its label. Set false to restore the "
+            "original one-per-label behaviour exactly."
+        ),
+    )
+    track_iou_threshold: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum IoU for a detection to continue an existing track. Set "
+            "deliberately low: a subject who is not matched gets a fresh id and "
+            "is judged again, so a strict threshold shows up as wasted "
+            "inferences. Measured on the bundled 6 FPS clip, 0.45 produced 4.2 "
+            "ids per real person against 2.0 at this value. Two people in one "
+            "frame can never share an id whatever this is set to, so lowering "
+            "it cannot hide a subject. Raise it for high-frame-rate cameras "
+            "where boxes barely move between frames."
+        ),
+    )
+    track_max_age_frames: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Frames a track survives unmatched before its id is retired. Long "
+            "enough to ride out a subject passing behind an obstacle — who "
+            "would otherwise return as a stranger and cost a fresh inference — "
+            "and short enough that a departed subject stops costing memory."
+        ),
     )
 
     # ── VLM (Stage 2) ───────────────────────────────────────────
