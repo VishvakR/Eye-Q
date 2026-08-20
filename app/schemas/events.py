@@ -57,6 +57,31 @@ class BoundingBox(BaseModel):
         """Normalized area of the bounding box."""
         return self.width * self.height
 
+    def iou(self, other: BoundingBox) -> float:
+        """Intersection over union with another box.
+
+        Used to decide whether two boxes in consecutive frames describe the
+        same object, and whether a tracked subject has moved far enough since
+        its last verdict to be worth re-judging.
+
+        Returns:
+            Overlap ratio in [0, 1]. Zero when the boxes are disjoint, and
+            zero when either box is degenerate — a box with no area cannot
+            meaningfully overlap anything, and returning 0.0 keeps callers
+            free of a division guard.
+        """
+        ix1 = max(self.x1, other.x1)
+        iy1 = max(self.y1, other.y1)
+        ix2 = min(self.x2, other.x2)
+        iy2 = min(self.y2, other.y2)
+
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter <= 0.0:
+            return 0.0
+
+        union = self.area + other.area - inter
+        return inter / union if union > 0.0 else 0.0
+
 
 class DetectionEvent(BaseModel):
     """Published by Stage 1 (YOLO Watchdog) when a relevant object is detected.
@@ -78,6 +103,19 @@ class DetectionEvent(BaseModel):
     bbox: BoundingBox = Field(..., description="Normalized bounding box of the detection.")
     frame_index: int = Field(
         ..., ge=0, description="Slot index in the ring buffer for direct access."
+    )
+    # Deliberately optional and deliberately unconstrained: -1 must validate.
+    # Stage 2 reconstructs events with DetectionEvent(**payload), so a default
+    # keeps an untracked publisher wire-compatible — and -1 is the value that
+    # makes every per-instance code path downstream fall back to today's
+    # per-label behaviour, which is how tracking is switched off.
+    track_id: int = Field(
+        default=-1,
+        description=(
+            "Stable per-instance id assigned by Stage 1's tracker, so each "
+            "subject is judged rather than only the first of its label. "
+            "-1 when tracking is disabled."
+        ),
     )
 
 
