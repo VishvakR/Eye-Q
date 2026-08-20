@@ -6,10 +6,13 @@ and rule-synchronisation logic are exercised without loading YOLO or the VLM.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import MagicMock
 
+import cv2
 import httpx
+import numpy as np
 import pytest
 
 from app.api.server import _parse_labels, _parse_roi, create_app, lifespan, sync_rules
@@ -327,6 +330,8 @@ class TestClearAllRules:
         response = await client.delete("/api/rules")
         assert response.status_code == 200
         assert response.json()["deleted"] == 0
+
+
 class TestSnapshotMount:
     """Evidence JPEGs must be served from wherever the worker writes them.
 
@@ -493,3 +498,97 @@ class TestRuleScopeWarning:
         assert len(body["labels"]) == 80
 
 
+class TestPreviewStreamResilience:
+    """The live feed must never go quietly blank.
+
+    A stream carrying no parts is not an error: the response is open and valid,
+    so the browser's <img> never fires onerror and the snapshot fallback never
+    engages. The operator sees an empty panel with nothing to explain it, which
+    is the worst possible failure for a monitoring appliance.
+    """
+
+    async def _first_part(self, app, timeout=5.0):
+        """Pull one multipart chunk out of the generator, or time out."""
+        from app.api.server import _mjpeg_generator
+
+        agen = _mjpeg_generator(app)
+        try:
+            return await asyncio.wait_for(agen.__anext__(), timeout=timeout)
+        finally:
+            await agen.aclose()
+
+    async def test_a_part_is_sent_even_with_no_frames_yet(self, client):
+        """Before the first capture there is nothing to show — say so."""
+        app = client.app
+        app.state.buffer = None
+
+        part = await self._first_part(app)
+
+        assert b"--frame" in part
+        assert b"Content-Type: image/jpeg" in part
+        assert len(part) > 500, "Placeholder carried no image data"
+
+    async def test_a_part_is_sent_when_the_buffer_is_empty(self, client):
+        """A camera that has dropped must not silence the stream."""
+        app = client.app
+        buffer = MagicMock()
+        buffer.read_latest.side_effect = RuntimeError("Buffer is empty")
+        app.state.buffer = buffer
+
+        part = await self._first_part(app)
+        assert b"--frame" in part
+
+    async def test_a_rendering_failure_does_not_end_the_stream(self, client):
+        """One bad frame must not cost the operator the feed until they reload."""
+        from app.api.server import _mjpeg_generator
+
+        app = client.app
+        buffer = MagicMock()
+        buffer.read_latest.side_effect = ValueError("corrupt frame")
+        app.state.buffer = buffer
+
+        agen = _mjpeg_generator(app)
+        try:
+            parts = [
+                await asyncio.wait_for(agen.__anext__(), timeout=5.0) for _ in range(3)
+            ]
+        finally:
+            await agen.aclose()
+
+        assert len(parts) == 3, "The stream died on a rendering error"
+        assert all(b"--frame" in part for part in parts)
+
+    async def test_the_stream_recovers_once_frames_return(self, client):
+        """A reconnecting camera must bring the real picture back by itself."""
+        from app.api.server import _mjpeg_generator
+
+        app = client.app
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        buffer = MagicMock()
+        buffer.read_latest.side_effect = [
+            RuntimeError("Buffer is empty"),
+            (frame, 1.0, 0),
+        ]
+        app.state.buffer = buffer
+        app.state.watchdog = None
+
+        agen = _mjpeg_generator(app)
+        try:
+            placeholder = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            recovered = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+        finally:
+            await agen.aclose()
+
+        assert b"--frame" in placeholder
+        assert b"--frame" in recovered
+        assert placeholder != recovered, "Never switched back to the live frame"
+
+    async def test_the_placeholder_is_a_decodable_jpeg(self, client):
+        """A malformed placeholder would leave the panel as blank as no part."""
+        from app.api.server import _placeholder_jpeg
+
+        data = _placeholder_jpeg(640, 70, "Waiting for camera...")
+        decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+        assert decoded is not None
+        assert decoded.shape[1] == 640

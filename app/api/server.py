@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -25,6 +26,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -329,8 +331,23 @@ def _render_preview_frame(app: FastAPI, quality: int, max_width: int) -> bytes |
         roi = watchdog.roi
         if len(roi.vertices) > 3 or roi.vertices != [(0, 0), (1, 0), (1, 1), (0, 1)]:
             draw_roi(frame, roi)
+        # Keep only the newest box per subject. recent_detections() returns
+        # every frame from the last second, so without this a stationary person
+        # is drawn ~30 times over — and the smearing gets worse the busier the
+        # scene, which is exactly when the operator needs to read it.
+        latest: dict[tuple[str, int], tuple] = {}
         for event, triggered in watchdog.recent_detections(max_age_s=1.0):
-            draw_detection(frame, event.bbox, event.label, event.confidence, triggered)
+            latest[(event.label, event.track_id)] = (event, triggered)
+
+        for event, triggered in latest.values():
+            draw_detection(
+                frame,
+                event.bbox,
+                event.label,
+                event.confidence,
+                triggered,
+                track_id=event.track_id,
+            )
 
     height, width = frame.shape[:2]
     if width > max_width:
@@ -341,30 +358,95 @@ def _render_preview_frame(app: FastAPI, quality: int, max_width: int) -> bytes |
     return encoded.tobytes() if ok else None
 
 
+@functools.lru_cache(maxsize=8)
+def _placeholder_jpeg(width: int, quality: int, message: str) -> bytes:
+    """A dark card carrying ``message``, encoded once and reused.
+
+    The stream must always have something to send. See
+    :func:`_mjpeg_generator` for why silence is worse than a placeholder.
+    """
+    height = max(90, int(width * 9 / 16))
+    frame = np.full((height, width, 3), 15, dtype=np.uint8)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, width / 1280)
+    thickness = max(1, int(scale * 1.5))
+    (text_w, text_h), _ = cv2.getTextSize(message, font, scale, thickness)
+
+    cv2.putText(
+        frame,
+        message,
+        ((width - text_w) // 2, (height + text_h) // 2),
+        font,
+        scale,
+        (120, 120, 130),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return encoded.tobytes() if ok else b""
+
+
 async def _mjpeg_generator(app: FastAPI):
     """Yield ``multipart/x-mixed-replace`` parts at the configured frame rate.
 
     Each part is preceded by CRLF because RFC 2046 defines the delimiter as
     ``CRLF--boundary``. Emitting the first boundary without it is tolerated by
     Chrome and Firefox but leaves Safari unable to parse the stream at all.
+
+    Two rules keep the panel alive, both learned from it going blank:
+
+    **Never go silent.** A stream carrying no parts is not an error — the HTTP
+    response is open and healthy, it simply has nothing in it. The browser's
+    ``<img>`` therefore never fires ``onerror``, the snapshot fallback never
+    engages, and the operator gets an empty box with no indication anything is
+    wrong. That happens routinely: for the seconds before the first frame is
+    captured, and again whenever a camera drops and ``read_latest`` has nothing
+    to hand back. So when there is no frame, say so in a placeholder rather
+    than sending nothing.
+
+    **Never die.** A single exception here ends the response for good, and an
+    ``<img>`` that has already started rendering will not reconnect. One
+    corrupt frame must not cost the operator their camera feed until they
+    happen to reload the page.
     """
     settings = app.state.settings
     interval = 1.0 / settings.stream_fps
+    consecutive_failures = 0
 
     while True:
         started = time.monotonic()
 
-        jpeg = await asyncio.to_thread(
-            _render_preview_frame, app, settings.stream_quality, settings.stream_width
-        )
-
-        if jpeg is not None:
-            yield (
-                b"\r\n--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-                + jpeg
+        try:
+            jpeg = await asyncio.to_thread(
+                _render_preview_frame, app, settings.stream_quality, settings.stream_width
             )
+            consecutive_failures = 0
+        except Exception as exc:
+            consecutive_failures += 1
+            jpeg = None
+            # Log the first failure in a run at full volume, then back off:
+            # a persistently broken camera should not fill the disk.
+            if consecutive_failures == 1 or consecutive_failures % 100 == 0:
+                logger.error(
+                    f"Preview render failed ({consecutive_failures}x): {exc}",
+                    exc_info=consecutive_failures == 1,
+                )
+
+        if jpeg is None:
+            jpeg = _placeholder_jpeg(
+                settings.stream_width,
+                settings.stream_quality,
+                "Camera unavailable" if consecutive_failures else "Waiting for camera...",
+            )
+
+        yield (
+            b"\r\n--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+            + jpeg
+        )
 
         elapsed = time.monotonic() - started
         await asyncio.sleep(max(0.0, interval - elapsed))
@@ -409,9 +491,15 @@ def create_app() -> FastAPI:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return response
 
-    # Alert evidence JPEGs. Created eagerly so the mount never 500s on a
+    # Alert evidence JPEGs, served from wherever the VLM worker writes them.
+    # This has to follow ``snapshot_dir`` rather than hardcode the default:
+    # the worker honours the setting, so a mount pinned to "data/snapshots"
+    # silently serves 404s to every thumbnail the moment EYEQ_SNAPSHOT_DIR
+    # points somewhere else. Created eagerly so the mount never 500s on a
     # fresh checkout that has not yet produced an alert.
-    snapshot_dir = Path("data/snapshots")
+    from app.config.settings import get_settings
+
+    snapshot_dir = Path(get_settings().snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/snapshots", StaticFiles(directory=str(snapshot_dir)), name="snapshots")
 
@@ -474,6 +562,19 @@ def create_app() -> FastAPI:
         db: Database = request.app.state.db
         return await db.list_rules(camera_id=camera_id)
 
+    @app.get("/api/labels")
+    async def list_labels(prompt: str | None = Query(None)):
+        """The classes Stage 1 can detect, and which ones a prompt is about.
+
+        The dashboard uses ``suggested`` to catch the common misconfiguration
+        where a rule asks about people but watches all eighty classes, and so
+        spends its inference budget on pallets and trucks.
+        """
+        return {
+            "labels": list(COCO_CLASSES),
+            "suggested": labels_in_prompt(prompt) if prompt else [],
+        }
+
     @app.post("/api/rules", status_code=201)
     async def create_rule(request: Request, rule: RuleCreate):
         db: Database = request.app.state.db
@@ -527,6 +628,14 @@ def create_app() -> FastAPI:
         fields = rule.model_dump(exclude_unset=True)
         updated = await db.update_rule(rule_id, **fields)
         await sync_rules(request.app)
+
+        warning = scope_warning(
+            updated.get("prompt", ""),
+            json.loads(updated.get("target_labels") or "[]"),
+        )
+        if warning:
+            logger.warning(f"Rule {rule_id}: {warning}")
+            updated = {**updated, "warning": warning}
         return updated
 
     @app.delete("/api/rules/{rule_id}", status_code=204)
