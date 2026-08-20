@@ -260,6 +260,10 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
         imgsz=settings.yolo_imgsz,
         cooldown_seconds=settings.detection_cooldown_s,
         camera_id=DEFAULT_CAMERA_ID,
+        target_fps=settings.watchdog_fps,
+        track_enabled=settings.track_enabled,
+        track_iou_threshold=settings.track_iou_threshold,
+        track_max_age_frames=settings.track_max_age_frames,
     )
     watchdog.start()
     app.state.watchdog = watchdog
@@ -278,6 +282,11 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
             inference_timeout_s=settings.vlm_timeout_s,
             snapshot_dir=settings.snapshot_dir,
             default_prompt=settings.vlm_default_prompt,
+            focus_dim=settings.vlm_focus_dim,
+            verdict_ttl_s=settings.vlm_verdict_ttl_s,
+            rejudge_iou=settings.vlm_rejudge_iou,
+            min_rejudge_s=settings.vlm_min_rejudge_s,
+            max_instances_per_batch=settings.vlm_max_instances_per_batch,
         )
         vlm_worker.start()
         app.state.vlm_worker = vlm_worker
@@ -620,6 +629,8 @@ def create_app() -> FastAPI:
                 "detections_published": (
                     watchdog_stats.detections_published if watchdog_stats else 0
                 ),
+                "tracks_active": watchdog_stats.tracks_active if watchdog_stats else 0,
+                "cooldown_keys": watchdog_stats.cooldown_keys if watchdog_stats else 0,
             },
             "vlm": {
                 "is_running": vlm_stats.is_running if vlm_stats else False,
@@ -629,6 +640,12 @@ def create_app() -> FastAPI:
                 "triggers_stale": vlm_stats.triggers_stale if vlm_stats else 0,
                 "triggers_coalesced": vlm_stats.triggers_coalesced if vlm_stats else 0,
                 "verdicts_positive": vlm_stats.verdicts_positive if vlm_stats else 0,
+                # Whether per-subject judging is paying for itself: memoised
+                # should climb far faster than judged once a scene settles, and
+                # a rising shed count means the crowd outpaces the VLM.
+                "instances_judged": vlm_stats.instances_judged if vlm_stats else 0,
+                "instances_memoised": vlm_stats.instances_memoised if vlm_stats else 0,
+                "instances_shed": vlm_stats.instances_shed if vlm_stats else 0,
                 "avg_inference_ms": vlm_stats.avg_inference_ms if vlm_stats else 0,
             },
             "database": db_stats,
