@@ -207,18 +207,22 @@ class Settings(BaseSettings):
         default="EMPTY", description="API key for the local VLM server (usually unused)."
     )
     vlm_max_tokens: int = Field(
-        default=24,
+        default=2,
         ge=1,
         description=(
             "Maximum tokens the VLM may generate per query. Verdicts are "
             "binary and BinaryVerdictParser only reads the leading word, so "
-            "this is a worst-case guard against a model that ignores the "
+            "2 is enough for 'Yes' or 'No' plus its punctuation, and the rest "
+            "is a worst-case guard against a model that ignores the "
             "'answer Yes or No' instruction and rambles — each extra token is "
-            "another sequential forward pass. It does not speed up a model "
-            "that already stops at EOS. It matters most to a batched "
+            "another sequential forward pass. This is not a latency lever: it "
+            "does not speed up a model that already stops at EOS, and Stage 2 "
+            "is ~99% prefill regardless. It matters to a batched "
             "generate(), which runs until every row in the batch has "
             "finished — without this cap one rambling answer would hold the "
-            "whole batch to its own token budget."
+            "whole batch to its own token budget. Raise it if a backend "
+            "prefixes its answer, because a truncated leading word parses as "
+            "'no alert' and disappears silently."
         ),
     )
     vlm_revision: str = Field(

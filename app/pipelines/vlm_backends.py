@@ -199,6 +199,21 @@ class ProbeUnsupportedError(RuntimeError):
     """
 
 
+class VLMUnavailableError(RuntimeError):
+    """Raised when the backend's endpoint itself is unusable.
+
+    Distinct from a query that failed on its own merits: this says *nothing
+    will get through right now*, so every query queued behind this one would
+    pay a full doomed round-trip to learn the same thing. The worker abandons
+    the rest of the batch on it rather than grinding through the remainder.
+
+    Raised for transport failures (refused connection, connect or read
+    timeout) and for 5xx replies, which mean the server is up but not
+    serving. A 4xx is left alone — that is a malformed request, which is our
+    bug to fix and not a reason to drop traffic.
+    """
+
+
 @runtime_checkable
 class BinaryProbeBackend(Protocol):
     """Optional capability: decide a yes/no question without generating text."""
@@ -951,7 +966,11 @@ class OpenAICompatBackend:
         model: Model name to request.
         api_key: Ignored by most local servers, but sent for compatibility.
         max_tokens: Generation cap. Verdicts are short — keep this small.
-        timeout_s: Per-request HTTP timeout.
+        timeout_s: Per-request read/write timeout — how long the server gets
+            to answer once connected.
+        connect_timeout_s: How long to wait for the connection itself. Kept
+            short and separate from ``timeout_s``: a local server either
+            accepts immediately or is not there.
     """
 
     def __init__(
@@ -962,12 +981,14 @@ class OpenAICompatBackend:
         max_tokens: int = 128,
         timeout_s: float = 30.0,
         probe_threshold: float = 0.5,
+        connect_timeout_s: float = 2.0,
     ) -> None:
         self._api_base = api_base.rstrip("/")
         self._model = model
         self._api_key = api_key or "EMPTY"
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
+        self._connect_timeout_s = connect_timeout_s
         self._probe_threshold = probe_threshold
         self._client = None
         self._loaded = False
@@ -998,7 +1019,20 @@ class OpenAICompatBackend:
 
         import httpx
 
-        self._client = httpx.Client(timeout=self._timeout_s)
+        # Connect is bounded far tighter than read. A read has to allow the
+        # server a full prefill on a 729-token image, but a connect that has
+        # not landed in two seconds is not going to — and the scalar form
+        # applied timeout_s to both, so an unreachable (rather than actively
+        # refused) host pinned the single-worker executor for a whole minute
+        # before anything noticed.
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=self._connect_timeout_s,
+                read=self._timeout_s,
+                write=self._timeout_s,
+                pool=self._timeout_s,
+            )
+        )
         self._loaded = True
 
         try:
@@ -1031,7 +1065,8 @@ class OpenAICompatBackend:
 
         Raises:
             RuntimeError: If the backend was never loaded.
-            httpx.HTTPError: If the request fails.
+            VLMUnavailableError: If the endpoint is unreachable or 5xx.
+            httpx.HTTPError: If the request fails for any other reason.
         """
         if not self._loaded or self._client is None:
             raise RuntimeError("VLM backend is not loaded. Call load() first.")
@@ -1070,12 +1105,40 @@ class OpenAICompatBackend:
         ]
 
     def _post(self, payload: dict) -> dict:
-        """POST a chat completion and return the decoded body."""
-        resp = self._client.post(  # type: ignore[union-attr]
-            f"{self._api_base}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {self._api_key}"},
-        )
+        """POST a chat completion and return the decoded body.
+
+        Every request in this backend funnels through here, which makes it the
+        one place that can tell "the server is gone" apart from "this query
+        failed". The former is raised as :class:`VLMUnavailableError` so the
+        worker can drop the whole batch instead of re-learning it per rule.
+
+        Raises:
+            VLMUnavailableError: If the endpoint is unreachable, timed out, or
+                answered 5xx.
+            httpx.HTTPStatusError: On a 4xx, which is a malformed request
+                rather than an outage.
+        """
+        import httpx
+
+        try:
+            resp = self._client.post(  # type: ignore[union-attr]
+                f"{self._api_base}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+            )
+        except httpx.TransportError as exc:
+            # ConnectError, ConnectTimeout and ReadTimeout all land here.
+            raise VLMUnavailableError(
+                f"VLM server at {self._api_base} is unreachable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if resp.status_code >= 500:
+            raise VLMUnavailableError(
+                f"VLM server at {self._api_base} returned "
+                f"{resp.status_code} — up but not serving."
+            )
+
         resp.raise_for_status()
         return resp.json()
 

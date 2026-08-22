@@ -489,6 +489,28 @@ A backend that refuses raises `ProbeUnsupportedError`, and the worker **latches*
 the session — re-checking would buy a doomed request before every single generate. The query that
 triggered the fallback is still answered the old way, so the transition costs nothing.
 
+#### Losing the endpoint
+
+Putting inference behind a socket adds a failure mode the in-process backends do not have: the server
+can be gone. `OpenAICompatBackend._post` is the single choke point every request passes through, so it
+is where the distinction is drawn. Transport failures and 5xx replies raise `VLMUnavailableError`,
+which the worker reads as a statement about the *endpoint* rather than the query and answers by
+abandoning the rest of the batch — otherwise every remaining subject pays its own doomed round-trip to
+learn the same thing. Measured against a dead port, a batch of eight costs one connection attempt and
+~10 ms instead of eight.
+
+A 4xx is deliberately excluded. That is a malformed request, which is our bug to fix; shedding traffic
+on it would hide a payload defect behind what looks like an infrastructure problem.
+
+Two supporting details. The connect timeout is split out of `vlm_timeout_s` and bounded at 2 s: a read
+has to allow a full prefill over 729 image tokens, but a connection to loopback either lands at once or
+is not going to, and the scalar form previously gave connect the same minute — pinning the single-worker
+executor for that long before anything noticed. And the outage log is latched, because `_collect_batch`
+delivers a new batch roughly every second and a refused connection fails fast, so an unthrottled ERROR
+would repeat several times a second for the duration. `/api/status` carries `backend_unavailable` and
+`batches_dropped_unavailable`, since a backend that is down is indistinguishable from a quiet scene in
+every other counter.
+
 Note for anyone writing tests here: since Python 3.12 `runtime_checkable` `isinstance` uses
 `inspect.getattr_static`, which does not see attributes a `MagicMock` conjures on access. A mock
 double is therefore reported as probe-*incapable* however it is specced. `tests/test_vlm.py` uses a
@@ -704,8 +726,12 @@ not a validation error afterwards.
 8. **Measured, counter-intuitive defaults.** `vlm_device` defaults to `cpu` because Moondream2
    measured 5.6 s on CPU versus 6.1 s on MPS, with ~10 s more load time. Device detection uses a
    *functional* probe (`torch.zeros(1, device="mps")`), not a capability flag, because the flag lies.
-9. **Prompt-side latency engineering.** `max_tokens=24` and a forced Yes/No suffix — each extra token
-   is another sequential forward pass through the model.
+9. **Prompt-side latency engineering.** `max_tokens=2` and a forced Yes/No suffix — each extra token
+   is another sequential forward pass through the model. Note the ceiling is a *guard*, not a lever:
+   it bounds a model that ignores the instruction and rambles, and it stops a batched `generate()`
+   being held to one row's budget. It does not speed up a model that already stops at EOS, and at
+   ~99% prefill there is little decode to remove — which is why probing, not the token cap, is what
+   actually moves Stage 2.
 10. **Both verdicts stored, the DB row broadcast.** History stays interpretable, and live and
     historical views can't diverge.
 11. **Graceful degradation everywhere it counts:** GPU warm-up failure → CPU; rule deleted mid-flight
@@ -765,7 +791,7 @@ authoritative configuration documentation.
 | `EYEQ_VLM_API_BASE` | `http://127.0.0.1:11434/v1` | `openai_compat` only |
 | `EYEQ_VLM_API_MODEL` | `moondream` | |
 | `EYEQ_VLM_API_KEY` | `EMPTY` | |
-| `EYEQ_VLM_MAX_TOKENS` | `24` | Each token is another forward pass |
+| `EYEQ_VLM_MAX_TOKENS` | `2` | Guard against a rambling model, not a latency lever |
 | `EYEQ_VLM_TIMEOUT_S` | `60.0` | Runaway guard, not a latency target |
 | `EYEQ_VLM_STALENESS_S` | `5.0` | Shed frames older than this |
 | `EYEQ_VLM_DEFAULT_PROMPT` | *(none)* | Fallback for unmatched detections |

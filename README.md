@@ -202,6 +202,27 @@ The fallback is latched after a single refusal — re-checking would buy a doome
 request before every generate — and the query that triggered it is still
 answered the old way, so the transition costs nothing.
 
+This is the reason to prefer llama.cpp over Ollama for the same model on the
+same hardware: Ollama is one command to get running, but it cannot be probed,
+so it pays a decode for every verdict. `.env.pi5` points at llama.cpp on
+`:8080`; `.env.ollama` is the convenience profile and says so in its header.
+
+### When the server is not there
+
+`openai_compat` puts inference behind a socket, which adds a failure mode the
+in-process backends do not have: the endpoint can simply be gone. A refused
+connection is reported as `VLMUnavailableError` and is treated as a statement
+about the *endpoint*, not the query — the worker abandons the rest of the batch
+rather than paying a doomed round-trip for every remaining subject. Measured
+against a dead port, a batch of eight costs one connection attempt and ~10 ms
+instead of eight.
+
+The outage logs once and clears itself when verdicts resume; `/api/status`
+carries `backend_unavailable` and `batches_dropped_unavailable`, because a
+backend that is down looks exactly like a quiet scene in every other counter.
+A 4xx is deliberately *not* treated this way — that is a malformed request,
+which is a bug to fix rather than a reason to shed traffic.
+
 ### Sizing the verdict TTL
 
 Per-subject judging is affordable because a verdict is reused until the subject
@@ -224,7 +245,7 @@ missing a hard hat?"* no longer matches what the model is shown.
 - **Runtime**: Python 3.13+ / `uv`
 - **Detection**: YOLOv8n (Ultralytics) on Apple MPS
 - **VLM**: Moondream2 (1.86B) by default; swappable for Qwen2-VL-2B, SmolVLM,
-  or any model behind a local Ollama/llama.cpp server
+  or any model behind a local llama.cpp/Ollama server (`.env.pi5`, `.env.ollama`)
 - **IPC**: ZeroMQ (PUB/SUB)
 - **Buffer**: POSIX Shared Memory (zero-copy)
 - **API**: FastAPI + SQLite (aiosqlite)

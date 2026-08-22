@@ -773,6 +773,15 @@ def create_app() -> FastAPI:
                 "instances_too_small": (
                     vlm_stats.instances_too_small if vlm_stats else 0
                 ),
+                # Whether Stage 2 has a working endpoint at all. A backend
+                # that is down looks identical to a quiet scene in every
+                # counter above — both just stop producing verdicts.
+                "backend_unavailable": (
+                    vlm_stats.backend_unavailable if vlm_stats else False
+                ),
+                "batches_dropped_unavailable": (
+                    vlm_stats.batches_dropped_unavailable if vlm_stats else 0
+                ),
                 "avg_inference_ms": vlm_stats.avg_inference_ms if vlm_stats else 0,
                 # Capture-to-verdict, the number an operator actually waits
                 # through. Compare against avg_inference_ms: when the two are

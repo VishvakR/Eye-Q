@@ -23,6 +23,7 @@ from app.pipelines.vlm_backends import (
     MoondreamBackend,
     OpenAICompatBackend,
     ProbeUnsupportedError,
+    VLMUnavailableError,
     decide_probe,
     resolve_yes_no_ids,
 )
@@ -1870,10 +1871,14 @@ class TestDecideProbe:
 class TestOpenAICompatProbe:
     """The edge path: llama.cpp implements logprobs, Ollama does not."""
 
-    def _backend(self, payload) -> OpenAICompatBackend:
+    def _backend(self, payload, status_code: int = 200) -> OpenAICompatBackend:
         backend = OpenAICompatBackend(model="test-model")
         client = MagicMock()
+        # status_code is set explicitly rather than left to MagicMock's
+        # auto-attribute, because _post compares it against 500 to tell an
+        # outage from a bad request.
         client.post.return_value = MagicMock(
+            status_code=status_code,
             json=MagicMock(return_value=payload),
             raise_for_status=MagicMock(),
         )
@@ -1960,6 +1965,276 @@ class TestOpenAICompatProbe:
         backend = OpenAICompatBackend()
         with pytest.raises(RuntimeError, match="not loaded"):
             backend.probe_binary(MagicMock(), "q")
+
+
+class TestOpenAICompatQuery:
+    """The generate path's request shape.
+
+    ``probe_binary`` was covered from the start; ``query()`` never was, which
+    left the image encoding and the sampling parameters — the two things a
+    server silently reinterprets if they are wrong — asserted nowhere.
+    """
+
+    def _backend(self, content="Yes", **kwargs) -> OpenAICompatBackend:
+        backend = OpenAICompatBackend(model="test-model", **kwargs)
+        client = MagicMock()
+        client.post.return_value = MagicMock(
+            status_code=200,
+            json=MagicMock(
+                return_value={"choices": [{"message": {"content": content}}]}
+            ),
+            raise_for_status=MagicMock(),
+        )
+        backend._client = client
+        backend._loaded = True
+        return backend
+
+    @staticmethod
+    def _image():
+        from PIL import Image
+
+        return Image.fromarray(
+            np.random.randint(0, 255, (64, 48, 3), dtype=np.uint8)
+        )
+
+    @staticmethod
+    def _sent(backend) -> dict:
+        return backend._client.post.call_args.kwargs["json"]
+
+    def test_sampling_is_pinned_deterministic(self):
+        """Same crop, same rule, same verdict — every run."""
+        backend = self._backend()
+        backend.query(self._image(), "Is this person missing a hard hat?")
+
+        assert self._sent(backend)["temperature"] == 0.0
+
+    def test_the_token_budget_is_carried_through(self):
+        backend = self._backend(max_tokens=2)
+        backend.query(self._image(), "Anything?")
+
+        assert self._sent(backend)["max_tokens"] == 2
+
+    def test_the_crop_travels_as_a_jpeg_data_uri(self):
+        """The wire format the server actually parses.
+
+        A bare base64 string with no ``data:`` prefix, or a PNG mislabelled as
+        JPEG, is accepted by the schema and rejected by the model — so this
+        asserts the prefix and then decodes the payload back into a real image
+        rather than trusting the string.
+        """
+        import base64
+        import io
+
+        from PIL import Image
+
+        backend = self._backend()
+        backend.query(self._image(), "Anything?")
+
+        content = self._sent(backend)["messages"][0]["content"]
+        part = next(p for p in content if p["type"] == "image_url")
+        url = part["image_url"]["url"]
+
+        assert url.startswith("data:image/jpeg;base64,")
+
+        raw = base64.b64decode(url.split(",", 1)[1])
+        decoded = Image.open(io.BytesIO(raw))
+        assert decoded.format == "JPEG"
+        assert decoded.size == (48, 64)
+
+    def test_the_question_rides_in_the_same_user_turn(self):
+        backend = self._backend()
+        backend.query(self._image(), "Is the aisle blocked?")
+
+        messages = self._sent(backend)["messages"]
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+        texts = [p["text"] for p in messages[0]["content"] if p["type"] == "text"]
+        assert texts == ["Is the aisle blocked?"]
+
+    def test_a_two_token_answer_still_parses(self):
+        """The guard on lowering vlm_max_tokens to 2.
+
+        The parser reads the leading word and defaults to "no alert" on
+        anything it cannot recognise, so a budget too tight to fit that word
+        turns a violation into a silent miss.
+        """
+        backend = self._backend(content="Yes,", max_tokens=2)
+        answer = backend.query(self._image(), "Anything?")
+
+        assert BinaryVerdictParser.parse(answer) is True
+
+
+class TestBackendUnavailable:
+    """An endpoint that is down must be distinguishable from a bad query.
+
+    The two need opposite responses: a failed query is worth retrying for the
+    next subject, while a dead endpoint means every subject behind this one
+    would pay its own doomed round-trip to learn the same thing.
+    """
+
+    def _backend(self) -> OpenAICompatBackend:
+        backend = OpenAICompatBackend(model="test-model")
+        backend._client = MagicMock()
+        backend._loaded = True
+        return backend
+
+    @staticmethod
+    def _image():
+        from PIL import Image
+
+        return Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8))
+
+    def _response(self, status_code):
+        import httpx
+
+        resp = MagicMock(status_code=status_code)
+        if status_code >= 400:
+            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                f"{status_code}", request=MagicMock(), response=resp
+            )
+        return resp
+
+    @pytest.mark.parametrize(
+        "exc_name", ["ConnectError", "ConnectTimeout", "ReadTimeout"]
+    )
+    def test_transport_failures_are_reported_as_unavailable(self, exc_name):
+        import httpx
+
+        backend = self._backend()
+        backend._client.post.side_effect = getattr(httpx, exc_name)("boom")
+
+        with pytest.raises(VLMUnavailableError):
+            backend.query(self._image(), "Anything?")
+
+    def test_a_5xx_is_unavailable(self):
+        """Up, but not serving — a restarting or overloaded server."""
+        backend = self._backend()
+        backend._client.post.return_value = self._response(503)
+
+        with pytest.raises(VLMUnavailableError):
+            backend.query(self._image(), "Anything?")
+
+    def test_a_4xx_is_not_unavailable(self):
+        """A malformed request is our bug, not an outage.
+
+        Dropping traffic on it would hide a payload defect behind what looks
+        like an infrastructure problem.
+        """
+        import httpx
+
+        backend = self._backend()
+        backend._client.post.return_value = self._response(400)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            backend.query(self._image(), "Anything?")
+
+    def test_the_probe_path_reports_outages_too(self):
+        """Both request paths funnel through _post and must agree."""
+        import httpx
+
+        backend = self._backend()
+        backend._client.post.side_effect = httpx.ConnectError("boom")
+
+        with pytest.raises(VLMUnavailableError):
+            backend.probe_binary(self._image(), "Anything?")
+
+    def test_connect_is_bounded_tighter_than_read(self):
+        """A local server accepts at once or is not there.
+
+        The scalar timeout gave connect the same minute as a full prefill, so
+        an unreachable host held the single-worker executor that whole time.
+        """
+        backend = OpenAICompatBackend(timeout_s=60.0, connect_timeout_s=2.0)
+        backend.load()
+
+        timeout = backend._client.timeout
+        assert timeout.connect == 2.0
+        assert timeout.read == 60.0
+        backend.unload()
+
+
+class TestUnavailableDropsTheBatch:
+    """A dead endpoint must cost one round-trip, not one per subject."""
+
+    def _worker(self, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        buffer.read_at_index.return_value = (frame, time.monotonic())
+
+        backend = mock_backend()
+        backend.model_name = "fake"
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person missing a hard hat?", rule_id=1)
+        return worker, backend
+
+    @staticmethod
+    def _payload(track_id, timestamp, x=0.1):
+        return {
+            "timestamp": timestamp,
+            "camera_id": "test",
+            "label": "person",
+            "confidence": 0.9,
+            "bbox": {"x1": x, "y1": 0.1, "x2": x + 0.08, "y2": 0.5},
+            "frame_index": 0,
+            "track_id": track_id,
+        }
+
+    def test_the_rest_of_the_batch_is_abandoned(self):
+        worker, backend = self._worker()
+        backend.query.side_effect = VLMUnavailableError("server is gone")
+
+        ts = time.monotonic()
+        worker._process_batch(
+            [self._payload(i, ts, x=0.1 * i) for i in range(1, 6)], MagicMock()
+        )
+
+        assert backend.query.call_count == 1, (
+            "Every subject paid its own doomed round-trip"
+        )
+
+    def test_the_outage_is_visible_in_stats(self):
+        worker, backend = self._worker()
+        backend.query.side_effect = VLMUnavailableError("server is gone")
+
+        ts = time.monotonic()
+        worker._process_batch([self._payload(1, ts)], MagicMock())
+
+        assert worker.stats.backend_unavailable is True
+        assert worker.stats.batches_dropped_unavailable == 1
+
+    def test_the_worker_survives_and_recovers(self):
+        """The endpoint coming back must not need a restart."""
+        worker, backend = self._worker()
+        backend.query.side_effect = VLMUnavailableError("server is gone")
+
+        ts = time.monotonic()
+        worker._process_batch([self._payload(1, ts)], MagicMock())
+        assert worker.stats.backend_unavailable is True
+
+        backend.query.side_effect = None
+        backend.query.return_value = "Yes"
+        worker._process_batch([self._payload(2, time.monotonic())], MagicMock())
+
+        assert worker.stats.backend_unavailable is False
+        assert worker.stats.verdicts_positive == 1
+
+    def test_an_ordinary_failure_still_judges_the_rest(self):
+        """The contrast that gives the drop its meaning.
+
+        A query that fails on its own merits must not take the batch with it —
+        otherwise one bad crop silently costs every subject behind it.
+        """
+        worker, backend = self._worker()
+        backend.query.side_effect = RuntimeError("one bad query")
+
+        ts = time.monotonic()
+        worker._process_batch(
+            [self._payload(i, ts, x=0.1 * i) for i in range(1, 6)], MagicMock()
+        )
+
+        assert backend.query.call_count == 5
+        assert worker.stats.batches_dropped_unavailable == 0
 
 
 class TestWorkerProbing:

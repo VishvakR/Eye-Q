@@ -55,6 +55,7 @@ from app.pipelines.vlm_backends import (
     MoondreamBackend,
     ProbeUnsupportedError,
     VLMBackend,
+    VLMUnavailableError,
 )
 from app.pipelines.vlm_judge import BinaryVerdictParser
 from app.schemas.events import BoundingBox, DetectionEvent, VLMQuery, VLMResult
@@ -451,6 +452,11 @@ class VLMWorkerStats:
     instances_memoised: int
     instances_shed: int
     instances_too_small: int
+    # Batches abandoned because the endpoint was down. A non-zero value here
+    # with a flat triggers_failed means the outage was caught early, which is
+    # the whole point of dropping rather than grinding.
+    batches_dropped_unavailable: int
+    backend_unavailable: bool
     avg_inference_ms: float
     last_inference_ms: float
     # Capture-to-verdict, which is what an operator actually waits through.
@@ -624,6 +630,13 @@ class VLMWorker:
         self._instances_memoised = 0
         self._instances_shed = 0
         self._instances_too_small = 0
+        # How many batches were abandoned because the backend's endpoint was
+        # down. Distinct from triggers_failed, which counts individual queries
+        # that failed on their own merits.
+        self._batches_dropped_unavailable = 0
+        # Latched while the endpoint is unreachable, so a sustained outage
+        # logs once instead of once per subject per collection cycle.
+        self._backend_unavailable = False
         self._inference_times: deque[float] = deque(maxlen=100)
         self._queued_times: deque[float] = deque(maxlen=100)
         self._latencies: deque[float] = deque(maxlen=100)
@@ -918,6 +931,8 @@ class VLMWorker:
             instances_memoised=self._instances_memoised,
             instances_shed=self._instances_shed,
             instances_too_small=self._instances_too_small,
+            batches_dropped_unavailable=self._batches_dropped_unavailable,
+            backend_unavailable=self._backend_unavailable,
             avg_inference_ms=avg_ms,
             last_inference_ms=self._last_inference_ms,
             avg_queued_ms=avg_queued,
@@ -1154,6 +1169,26 @@ class VLMWorker:
             logger.warning(message)
         else:
             logger.info(message)
+
+    def _note_unavailable(self, reason: object) -> None:
+        """Record a dropped batch and log the outage once, not per subject.
+
+        ``_collect_batch`` hands over a new batch roughly every second, and a
+        refused connection fails fast, so an endpoint that stays down would
+        otherwise emit an identical ERROR several times a second for as long
+        as the outage lasts. Latch on the first one; :meth:`_record_verdict`
+        clears the latch when traffic comes back.
+        """
+        self._batches_dropped_unavailable += 1
+
+        if self._backend_unavailable:
+            return
+
+        self._backend_unavailable = True
+        logger.error(
+            f"VLM backend unavailable; dropping batches until it returns. "
+            f"({reason})"
+        )
 
     def _probe(self, handle: object, prompt: str) -> BinaryProbe:
         """Probe one verdict under the same hard timeout as an answer."""
@@ -1444,10 +1479,16 @@ class VLMWorker:
                     ok = self._judge_chunk(chunk, publisher)
 
                 if not ok:
-                    # A hung inference. The executor has a single worker and
-                    # Moondream cannot be interrupted, so everything behind it
-                    # would queue on a thread that is never coming back.
-                    logger.error("Abandoning the rest of the batch after a timeout.")
+                    # Either a hung inference — the executor has a single
+                    # worker and Moondream cannot be interrupted, so everything
+                    # behind it would queue on a thread that is never coming
+                    # back — or an endpoint that is down. The outage case has
+                    # already logged itself, and throttled; saying "timeout"
+                    # again here would both misname it and defeat that.
+                    if not self._backend_unavailable:
+                        logger.error(
+                            "Abandoning the rest of the batch after a timeout."
+                        )
                     return
             except Exception as exc:
                 self._triggers_failed += 1
@@ -1562,6 +1603,13 @@ class VLMWorker:
                     f"for rule_id={rule_id}."
                 )
                 return False
+            except VLMUnavailableError as exc:
+                # The endpoint is down, not this query. Every rule and every
+                # subject behind this one would pay its own doomed round-trip
+                # to discover the same thing, so stop here.
+                self._triggers_failed += 1
+                self._note_unavailable(exc)
+                return False
             except Exception as exc:
                 self._triggers_failed += 1
                 logger.error(f"VLM inference failed: {exc}")
@@ -1647,6 +1695,10 @@ class VLMWorker:
                     f"abandoning the rest of the batch."
                 )
                 return False
+            except VLMUnavailableError as exc:
+                self._triggers_failed += len(units)
+                self._note_unavailable(exc)
+                return False
             except Exception as exc:
                 self._triggers_failed += len(units)
                 logger.error(f"VLM batch inference failed: {exc}")
@@ -1717,6 +1769,13 @@ class VLMWorker:
                 batch — amortizing that would understate the wait an operator
                 actually sits through by up to the batch size.
         """
+        # A verdict landed, so whatever outage was latched is over. Logging
+        # the recovery matters as much as logging the failure — otherwise the
+        # last thing in the log is an ERROR and nothing says it ended.
+        if self._backend_unavailable:
+            self._backend_unavailable = False
+            logger.info("VLM backend is answering again; resuming batches.")
+
         event = subject.event
         if latency_ms is None:
             latency_ms = queued_ms + inference_ms
