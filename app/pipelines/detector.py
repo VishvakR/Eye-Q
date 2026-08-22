@@ -87,6 +87,16 @@ class CooldownGate:
 
         If eligible, updates the last-trigger timestamp for this key.
 
+        A key that has never triggered is always eligible, and that has to be
+        said explicitly. Standing in for "never" with ``0.0`` compares against
+        ``time.monotonic()``, whose zero is the last *boot* on Linux and
+        macOS — so on a freshly restarted appliance ``now - 0.0`` is small, the
+        cooldown appears un-elapsed, and every first detection is suppressed
+        until the machine has been up longer than ``cooldown_seconds``. The
+        window is short at the 5 s default and unbounded at a long one, which
+        is exactly the configuration an operator reaches for when triggers are
+        expensive.
+
         Args:
             key: Cooldown key — a label, or a label/instance pair.
 
@@ -94,12 +104,16 @@ class CooldownGate:
             True if the cooldown period has elapsed since the last trigger.
         """
         now = time.monotonic()
-        last = self._last_trigger.get(key, 0.0)
+        last = self._last_trigger.get(key)
 
-        if now - last >= self._cooldown:
+        if last is None or now - last >= self._cooldown:
+            # Record first, prune second, so the hard cap counts the entry
+            # just written. Pruning first left room for one more and the map
+            # settled at cap+1 — harmless in size, but it meant the stated
+            # bound was not the one the code enforced.
+            self._last_trigger[key] = now
             if len(self._last_trigger) >= _COOLDOWN_PRUNE_AT:
                 self._prune(now)
-            self._last_trigger[key] = now
             return True
         return False
 
@@ -111,6 +125,10 @@ class CooldownGate:
         identically with or without the prune. Without it, per-instance keying
         would leak one entry per track for the life of the process, which on an
         appliance meant to run for weeks is a real leak.
+
+        Called after the new entry is recorded, so the key that triggered this
+        prune is inside the count being bounded. It is also the newest, so the
+        hard-cap path never discards the caller's own entry.
         """
         self._last_trigger = {
             key: ts for key, ts in self._last_trigger.items() if now - ts < self._cooldown

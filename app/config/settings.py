@@ -215,8 +215,10 @@ class Settings(BaseSettings):
             "this is a worst-case guard against a model that ignores the "
             "'answer Yes or No' instruction and rambles — each extra token is "
             "another sequential forward pass. It does not speed up a model "
-            "that already stops at EOS. Ignored by the moondream backend, "
-            "whose wrapper sets its own limit."
+            "that already stops at EOS. It matters most to a batched "
+            "generate(), which runs until every row in the batch has "
+            "finished — without this cap one rambling answer would hold the "
+            "whole batch to its own token budget."
         ),
     )
     vlm_revision: str = Field(
@@ -254,7 +256,7 @@ class Settings(BaseSettings):
         description="Extra padding around bounding box as fraction of bbox size.",
     )
     vlm_focus_dim: float = Field(
-        default=0.4,
+        default=1.0,
         ge=0.0,
         le=1.0,
         description=(
@@ -263,7 +265,13 @@ class Settings(BaseSettings):
             "context, but it also drags in whoever is standing nearby — and a "
             "helmeted neighbour in the frame can flip the verdict on a "
             "bare-headed subject. Dimming keeps the context readable while "
-            "leaving no doubt who the question is about. 1.0 disables."
+            "leaving no doubt who the question is about. 1.0 disables. "
+            "Defaults to disabled: dimming is a synthetic edit no VLM saw in "
+            "training, and vlm_square_edge now bounds the crop so context is "
+            "cheaper than it was when this was introduced. The mechanism is "
+            "kept because the failure it fixed is real — set this to 0.4 to "
+            "restore it if crowded scenes start answering about the wrong "
+            "person."
         ),
     )
     vlm_verdict_ttl_s: float = Field(
@@ -320,6 +328,99 @@ class Settings(BaseSettings):
             "under it; the case it catches is vlm_crop_padding falling back to "
             "the whole frame for a subject filling most of it. Raise it only if "
             "you switch to a backend with no such threshold, and 0 disables."
+        ),
+    )
+
+    vlm_batch_size: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "How many crops the VLM may answer about in one forward pass. "
+            "1 — the default — dispatches one query at a time, which is what "
+            "this appliance has always done. Raising it is measured, not "
+            "assumed: Stage 2 carries 729 image tokens against a one-token "
+            "answer, making it ~99% prefill, and prefill is compute-bound at "
+            "roughly 280 FLOP/byte. Batching amortizes a weight read that "
+            "prefill is not waiting on, so it buys little — while the KV cache "
+            "grows linearly with this value (~295 MB per sequence for "
+            "Moondream at fp32). Measure with bench/benchmark_vlm.py before "
+            "raising it, and never raise it on a memory-bound board."
+        ),
+    )
+    vlm_min_subject_px: int = Field(
+        default=96,
+        ge=0,
+        description=(
+            "Skip a detection whose own box, before padding, is smaller than "
+            "this on its longer side. Such a subject cannot support the "
+            "question: "
+            "demo_cctv.py already records that at this camera distance a head "
+            "is about 20 px and Moondream answers 'No' to every phrasing of a "
+            "hard-hat question regardless of what is on the worker's head. "
+            "Before this existed the crop fell back to the whole frame, so the "
+            "least answerable subject bought the most expensive inference and "
+            "the answer was filed against that person's box anyway. 0 disables. "
+            "Raised from 24 to 96 to discard crops no model can solve — but "
+            "note what it trades: a skipped subject is never judged at all, so "
+            "this buys precision with recall. It is also measured in "
+            "*captured* pixels, so it interacts with frame resolution: over "
+            "cctv_demo.mp4 a floor of 96 skips 6.5% of detections at 1920x1080 "
+            "but 38.7% at the 960x540 .env.pi5 profile, where 64 is the right "
+            "value. Watch instances_too_small on /api/status after changing "
+            "it; if it swallows most detections at your camera distance, lower "
+            "it rather than accepting the blind spot."
+        ),
+    )
+
+    vlm_square_edge: int = Field(
+        default=378,
+        ge=0,
+        description=(
+            "Edge, in pixels, of the square canvas each crop is letterboxed "
+            "into before it reaches the VLM. Subjects are tall and narrow — "
+            "the demo's crops run about 1:3 — and a model that resizes to a "
+            "square input stretches them, so a person arrives roughly three "
+            "times too wide. Letterboxing scales the long side to fit and pads "
+            "the short one, preserving the shape the model was trained on. "
+            "Because every crop then lands at the same size, the image-token "
+            "count is constant and prefill cost stops varying with subject "
+            "geometry. 378 is Moondream's native SigLIP edge and stays under "
+            "the 512 px tiling cliff described on vlm_max_crop_edge; 392 "
+            "(14x28) lands exactly on Qwen2-VL's 28 px grid and avoids its "
+            "smart_resize rounding. 0 disables letterboxing and falls back to "
+            "vlm_max_crop_edge downscaling."
+        ),
+    )
+
+    # ── Verdict Probing ──────────────────────────────────────────
+    vlm_probe: Literal["auto", "on", "off"] = Field(
+        default="auto",
+        description=(
+            "Whether to read the verdict from the model's token probabilities "
+            "instead of generating an answer and parsing it. A Stage 2 query "
+            "is ~99% prefill and needs exactly one bit back, so generating "
+            "prose spends a full forward pass per token on text that a string "
+            "parser then discards — and that parser defaults to 'no alert' on "
+            "anything it fails to recognise, turning a malformed answer into a "
+            "silent false negative. 'auto' probes wherever the backend can and "
+            "falls back permanently on the first backend that cannot: the "
+            "transformers backend always can, llama.cpp can via logprobs, "
+            "Ollama and the in-process Moondream wrapper cannot. 'off' forces "
+            "generate-and-parse; 'on' is the same as 'auto' but logs the "
+            "fallback as a warning rather than an informational message."
+        ),
+    )
+    vlm_probe_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Yes-probability above which a probed verdict counts as a "
+            "violation, after renormalizing over the Yes/No pair alone. 0.5 is "
+            "the neutral comparison and matches what generate-and-parse did "
+            "implicitly. Raise it to make alerts harder to trigger — this is "
+            "the dial the old text path never offered, because a parsed 'Yes' "
+            "carried no strength."
         ),
     )
 

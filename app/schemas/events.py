@@ -150,6 +150,19 @@ class VLMResult(BaseModel):
         ..., description="True if the VLM confirms a violation, False otherwise."
     )
     raw_response: str = Field(..., description="Full text output from the VLM.")
+    confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Probability the model assigned to 'Yes', renormalized over the "
+            "Yes/No pair, when the verdict was read from its token "
+            "probabilities. None when the verdict came from parsing generated "
+            "text, which carries no usable strength — a parsed 'Yes' and a "
+            "barely-preferred 'Yes' are the same string. Lets an operator see "
+            "which alerts were close calls."
+        ),
+    )
     inference_time_ms: float = Field(
         ..., ge=0.0, description="Wall-clock inference time in milliseconds."
     )

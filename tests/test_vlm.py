@@ -18,14 +18,26 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from app.pipelines.vlm_backends import MoondreamBackend
+from app.pipelines.vlm_backends import (
+    BinaryProbe,
+    MoondreamBackend,
+    OpenAICompatBackend,
+    ProbeUnsupportedError,
+    decide_probe,
+    resolve_yes_no_ids,
+)
 from app.pipelines.vlm_judge import BinaryVerdictParser
 from app.pipelines.vlm_worker import (
+    _LETTERBOX_GREY,
+    _MIN_CROP_PX,
     VLMWorker,
     _percentile,
+    crop_bounds,
     crop_detection,
     crop_detection_focused,
     downscale_for_vlm,
+    letterbox_square,
+    subject_pixel_size,
 )
 from app.schemas.events import BoundingBox, DetectionEvent
 
@@ -43,6 +55,9 @@ def mock_backend(**kwargs) -> MagicMock:
     backend = MagicMock(**kwargs)
     backend.encode.side_effect = lambda image: image
     backend.answer.side_effect = lambda handle, question: backend.query(handle, question)
+    backend.query_batch.side_effect = lambda images, questions: [
+        backend.query(image, q) for image, q in zip(images, questions, strict=True)
+    ]
     # VLMResult validates this as a string, so a bare mock attribute fails
     # construction well before any assertion in the test body is reached.
     kwargs.setdefault("model_name", "fake")
@@ -948,6 +963,418 @@ class TestVerdictMemo:
         assert len(worker._memo) < 2000, f"Memo leaked to {len(worker._memo)} entries"
 
 
+class TestCropGeometryIsAlwaysKept:
+    """Neither degenerate case may fall back to the whole frame.
+
+    Stage 2's prompt carries 729 image tokens against a one-token answer, so a
+    whole-frame crop is the most expensive query the appliance can run. Both
+    old fallbacks spent that on the subjects least able to justify it.
+    """
+
+    def test_a_frame_filling_subject_keeps_its_own_box(self):
+        """The >80% case used to discard the geometry entirely."""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        bbox = BoundingBox(x1=0.05, y1=0.05, x2=0.95, y2=0.95)
+
+        assert bbox.area > 0.8
+        bounds = crop_bounds(frame.shape, bbox, padding_ratio=0.0)
+
+        assert bounds == (32, 24, 608, 456)
+
+    def test_a_frame_filling_subject_can_still_be_dimmed(self):
+        """Losing the geometry cost the focused crop its whole point."""
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        bbox = BoundingBox(x1=0.05, y1=0.05, x2=0.95, y2=0.95)
+
+        assert bbox.area > 0.8
+        # Enough padding to leave a context strip, not enough to reach the
+        # frame edge — the old code returned the whole frame regardless.
+        out = crop_detection_focused(frame, bbox, padding_ratio=0.02, dim=0.25)
+
+        # The subject is at full brightness and the strip outside it is not,
+        # which is only possible if the crop kept the subject's box.
+        assert out[out.shape[0] // 2, out.shape[1] // 2, 0] == 200
+        assert out[-1, -1, 0] < 200
+
+    def test_a_tiny_box_is_widened_around_its_centre(self):
+        """Not replaced by the frame — grown where the subject actually is."""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # 6x10 px box sitting well inside the frame.
+        bbox = BoundingBox(x1=0.5, y1=0.5, x2=0.509375, y2=0.52)
+
+        x1, y1, x2, y2 = crop_bounds(frame.shape, bbox, padding_ratio=0.0)
+
+        assert (x2 - x1) == _MIN_CROP_PX
+        assert (y2 - y1) == _MIN_CROP_PX
+        assert (x1, y1, x2, y2) != (0, 0, 640, 480)
+        # Still centred on the subject.
+        assert x1 < 320 < x2
+        assert y1 < 240 < y2
+
+    def test_a_tiny_box_at_the_edge_stays_inside_the_frame(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        bbox = BoundingBox(x1=0.0, y1=0.0, x2=0.005, y2=0.005)
+
+        x1, y1, x2, y2 = crop_bounds(frame.shape, bbox, padding_ratio=0.0)
+
+        assert (x1, y1) == (0, 0)
+        assert (x2 - x1) == _MIN_CROP_PX
+        assert (y2 - y1) == _MIN_CROP_PX
+
+    def test_a_frame_smaller_than_the_floor_yields_the_whole_extent(self):
+        """The one case where the whole frame is genuinely the right answer."""
+        frame = np.zeros((40, 40, 3), dtype=np.uint8)
+        bbox = BoundingBox(x1=0.4, y1=0.4, x2=0.45, y2=0.45)
+
+        assert crop_bounds(frame.shape, bbox, padding_ratio=0.0) == (0, 0, 40, 40)
+
+    def test_the_crop_never_exceeds_the_frame(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        for x1, y1, x2, y2 in [
+            (0.0, 0.0, 0.002, 0.002),
+            (0.99, 0.99, 1.0, 1.0),
+            (0.0, 0.45, 1.0, 0.55),
+        ]:
+            bounds = crop_bounds(
+                frame.shape, BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2), padding_ratio=0.3
+            )
+            assert 0 <= bounds[0] < bounds[2] <= 640
+            assert 0 <= bounds[1] < bounds[3] <= 480
+
+    def test_subject_pixel_size_ignores_padding(self):
+        """The size test must read the subject, not the context around it."""
+        bbox = BoundingBox(x1=0.25, y1=0.25, x2=0.75, y2=0.75)
+
+        assert subject_pixel_size((480, 640, 3), bbox) == (320, 240)
+
+
+class TestUnreadableSubjectsAreSkipped:
+    """A subject with nothing legible in it must not buy an inference.
+
+    demo_cctv.py already records the failure this prevents: at that camera
+    distance a head is ~20 px and Moondream answers "No" to every phrasing of
+    a hard-hat question regardless of what is on the worker's head. Before
+    this, such a detection fell back to a whole-frame crop — the largest query
+    in the system — and the answer was filed against that person's box anyway.
+    """
+
+    def _worker(self, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        buffer.read_at_index.return_value = (frame, time.monotonic())
+
+        backend = mock_backend()
+        backend.query.return_value = "Yes"
+
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        return worker, backend
+
+    def _payload(self, x1, y1, x2, y2, track_id=1):
+        return {
+            "timestamp": time.monotonic(),
+            "camera_id": "test",
+            "label": "person",
+            "confidence": 0.9,
+            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            "frame_index": 0,
+            "track_id": track_id,
+        }
+
+    def test_a_subject_under_the_floor_is_never_asked_about(self):
+        worker, backend = self._worker(min_subject_px=24)
+        # ~13x10 px on a 640x480 frame.
+        batch = [self._payload(0.5, 0.5, 0.52, 0.52)]
+
+        worker._process_batch(batch, MagicMock())
+
+        assert backend.query.call_count == 0
+        assert worker.stats.instances_too_small == 1
+
+    def test_a_legible_subject_is_still_judged(self):
+        worker, backend = self._worker(min_subject_px=24)
+        batch = [self._payload(0.1, 0.1, 0.2, 0.6)]
+
+        worker._process_batch(batch, MagicMock())
+
+        assert backend.query.call_count == 1
+        assert worker.stats.instances_too_small == 0
+
+    def test_a_tall_narrow_subject_is_judged(self):
+        """The floor tests the longer side — a person is tall and narrow."""
+        worker, backend = self._worker(min_subject_px=24)
+        # 6 px wide, 96 px tall: legible, despite being under the floor in x.
+        batch = [self._payload(0.5, 0.3, 0.509375, 0.5)]
+
+        worker._process_batch(batch, MagicMock())
+
+        assert backend.query.call_count == 1
+
+    def test_a_skipped_subject_is_not_remembered(self):
+        """They must still be asked about once they come closer."""
+        worker, backend = self._worker(min_subject_px=24)
+        worker._process_batch([self._payload(0.5, 0.5, 0.52, 0.52, track_id=7)], MagicMock())
+        assert backend.query.call_count == 0
+
+        # Same subject, now close enough to read.
+        worker._process_batch([self._payload(0.1, 0.1, 0.2, 0.6, track_id=7)], MagicMock())
+
+        assert backend.query.call_count == 1
+
+    def test_zero_disables_the_floor(self):
+        worker, backend = self._worker(min_subject_px=0)
+        batch = [self._payload(0.5, 0.5, 0.505, 0.505)]
+
+        worker._process_batch(batch, MagicMock())
+
+        assert backend.query.call_count == 1
+
+
+class TestBatchedDispatch:
+    """vlm_batch_size > 1 answers several subjects in one dispatch.
+
+    The capability is real — the pinned Moondream revision ships
+    ``batch_answer`` — but it is off by default, because Stage 2 is ~99%
+    prefill and prefill is compute-bound, so batching amortizes a weight read
+    it was never waiting on while multiplying the KV cache by the batch size.
+    These tests pin the mechanics; bench/benchmark_vlm.py decides the default.
+    """
+
+    def _worker(self, backend=None, **kwargs):
+        buffer = MagicMock()
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        buffer.read_at_index.return_value = (frame, time.monotonic())
+
+        if backend is None:
+            backend = mock_backend()
+            backend.query.return_value = "Yes"
+
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        return worker, backend
+
+    def _payload(self, track_id, timestamp=None, x=0.1):
+        return {
+            "timestamp": timestamp if timestamp is not None else time.monotonic(),
+            "camera_id": "test",
+            "label": "person",
+            "confidence": 0.9,
+            "bbox": {"x1": x, "y1": 0.1, "x2": x + 0.08, "y2": 0.5},
+            "frame_index": 0,
+            "track_id": track_id,
+        }
+
+    def test_one_dispatch_covers_the_whole_frame(self):
+        worker, backend = self._worker(batch_size=4)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 5)], MagicMock())
+
+        assert backend.query_batch.call_count == 1
+        images, questions = backend.query_batch.call_args[0]
+        assert len(images) == 4
+        assert len(questions) == 4
+
+    def test_every_subject_still_gets_its_own_verdict(self):
+        """Batching may not cost per-subject attribution."""
+        worker, backend = self._worker(batch_size=4)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        publisher = MagicMock()
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 5)], publisher)
+
+        published = [c[0][1] for c in publisher.publish.call_args_list]
+        assert len(published) == 4
+        track_ids = {r["query"]["detection"]["track_id"] for r in published}
+        assert track_ids == {1, 2, 3, 4}
+
+    def test_the_batch_is_capped_by_batch_size(self):
+        worker, backend = self._worker(batch_size=2, max_instances_per_batch=8)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 7)], MagicMock())
+
+        assert backend.query_batch.call_count == 3
+        for call in backend.query_batch.call_args_list:
+            assert len(call[0][0]) == 2
+
+    def test_the_instance_cap_still_bounds_the_work(self):
+        """batch_size may not smuggle work past max_instances_per_batch."""
+        worker, backend = self._worker(batch_size=4, max_instances_per_batch=3)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 9)], MagicMock())
+
+        assert worker.stats.instances_judged == 3
+        assert worker.stats.instances_shed == 5
+
+    def test_questions_are_grouped_by_prompt(self):
+        """Same-prompt groups pad by zero, so they must not be mixed."""
+        worker, backend = self._worker(batch_size=4)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        worker.add_rule("person", "Is this person bending over?", rule_id=2)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 4)], MagicMock())
+
+        assert backend.query_batch.call_count == 2
+        for call in backend.query_batch.call_args_list:
+            questions = call[0][1]
+            assert len(set(questions)) == 1
+
+    def test_batch_size_one_uses_the_sequential_path(self):
+        """The default must be the code path that was already measured."""
+        worker, backend = self._worker(batch_size=1)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 4)], MagicMock())
+
+        assert backend.query_batch.call_count == 0
+        assert backend.encode.call_count == 3
+        assert backend.query.call_count == 3
+
+    def test_the_right_answer_reaches_the_right_person(self):
+        """The claim batching has to earn: attribution survives the dispatch.
+
+        Each subject is painted a distinct brightness, and the double reads
+        that brightness back out of the crop it is handed. So an answer that
+        lands on the wrong track is visible as a wrong verdict, which a
+        constant-answer double could never show.
+        """
+        # Four well-separated subjects, each filled with its own value, so the
+        # crop's max identifies which subject it holds.
+        #
+        # The fills sit above _LETTERBOX_GREY: crops are letterboxed into a
+        # square canvas before dispatch, and a subject painted darker than the
+        # padding would be identified as the padding instead. That is a
+        # property of this fixture's trick for reading a subject back out of an
+        # image, not of the attribution being tested.
+        fills = (150, 180, 210, 240)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        boxes = []
+        for i in range(4):
+            x1 = 0.05 + 0.2 * i
+            boxes.append((x1, x1 + 0.1))
+            px1, px2 = int(x1 * 640), int((x1 + 0.1) * 640)
+            frame[48:240, px1:px2] = fills[i]
+
+        # Alternating truth, so a shifted mapping cannot pass by luck.
+        expected = {1: True, 2: False, 3: True, 4: False}
+
+        def identify(image):
+            return fills.index(int(np.asarray(image).max())) + 1  # 1-based id
+
+        def run(batch_size):
+            buffer = MagicMock()
+            buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+            buffer.read_at_index.return_value = (frame, time.monotonic())
+
+            backend = mock_backend()
+            backend.query.side_effect = lambda image, q: (
+                "Yes" if expected[identify(image)] else "No"
+            )
+
+            worker = VLMWorker(buffer=buffer, backend=backend, batch_size=batch_size)
+            worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+
+            publisher = MagicMock()
+            ts = time.monotonic()
+            worker._process_batch(
+                [
+                    {
+                        "timestamp": ts,
+                        "camera_id": "test",
+                        "label": "person",
+                        "confidence": 0.9,
+                        "bbox": {"x1": x1, "y1": 0.1, "x2": x2, "y2": 0.5},
+                        "frame_index": 0,
+                        "track_id": i + 1,
+                    }
+                    for i, (x1, x2) in enumerate(boxes)
+                ],
+                publisher,
+            )
+            return {
+                c[0][1]["query"]["detection"]["track_id"]: c[0][1]["verdict"]
+                for c in publisher.publish.call_args_list
+            }
+
+        assert run(1) == expected
+        assert run(4) == expected
+
+    def test_a_batched_timeout_counts_every_subject(self):
+        """A hung batch loses N subjects, and the count must say so."""
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+
+        backend = mock_backend()
+        backend.query_batch.side_effect = FutureTimeoutError()
+        worker, _ = self._worker(backend=backend, batch_size=4)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 5)], MagicMock())
+
+        assert worker.stats.triggers_timed_out == 4
+        backend.request_stop.assert_called_once()
+
+    def test_a_short_answer_list_is_discarded_not_misattributed(self):
+        """Better no verdict than one filed against the wrong person."""
+        backend = mock_backend()
+        backend.query_batch.side_effect = lambda images, questions: ["Yes"]
+        worker, _ = self._worker(backend=backend, batch_size=4)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        publisher = MagicMock()
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(i, ts, x=0.1 * i) for i in range(1, 5)], publisher)
+
+        assert publisher.publish.call_count == 0
+        assert worker.stats.triggers_failed == 4
+
+    def test_one_snapshot_per_subject_across_prompt_groups(self):
+        """Grouping by prompt splits a subject's rules — evidence stays single."""
+        worker, backend = self._worker(batch_size=4, snapshot_dir=None)
+        worker.add_rule("person", "Is this person wearing a vest?", rule_id=1)
+        worker.add_rule("person", "Is this person bending over?", rule_id=2)
+        publisher = MagicMock()
+        ts = time.monotonic()
+
+        worker._process_batch([self._payload(1, ts)], publisher)
+
+        # Two rules, one subject: both verdicts published, snapshot resolved
+        # once (None here, since snapshots are disabled) rather than per group.
+        assert publisher.publish.call_count == 2
+        assert worker.stats.instances_judged == 1
+
+
+class TestSequentialQueryBatch:
+    """A backend with no batch entry point must still satisfy the protocol."""
+
+    def test_it_answers_each_pair_with_query(self):
+        from app.pipelines.vlm_backends import sequential_query_batch
+
+        backend = MagicMock()
+        backend.query.side_effect = lambda image, q: f"{image}:{q}"
+
+        out = sequential_query_batch(backend, ["a", "b"], ["q1", "q2"])
+
+        assert out == ["a:q1", "b:q2"]
+        assert backend.query.call_count == 2
+
+    def test_mismatched_lengths_raise(self):
+        from app.pipelines.vlm_backends import sequential_query_batch
+
+        backend = MagicMock()
+        with pytest.raises(ValueError):
+            sequential_query_batch(backend, ["a", "b"], ["q1"])
+
+
 class TestFocusedCrop:
     """The subject must be unambiguous when neighbours share the crop."""
 
@@ -1309,3 +1736,646 @@ class TestBatchPreemption:
 
         worker._judge_prepared(prepared, MagicMock(), subscriber)
         assert subscriber.drain.call_count == 2
+
+
+# ── Verdict Probing ──────────────────────────────────────────────
+
+
+def yes_probe(p: float = 0.9) -> BinaryProbe:
+    return BinaryProbe(verdict=True, p_yes=p, p_no=1 - p, raw="Yes")
+
+
+class ProbeStub:
+    """A probe-capable backend double — deliberately a real class.
+
+    Not a ``MagicMock``. The worker detects the capability with ``isinstance``
+    against a runtime-checkable Protocol, and since Python 3.12 that check uses
+    :func:`inspect.getattr_static`, which does **not** see attributes a mock
+    conjures on attribute access. A mock double is therefore reported as
+    probe-incapable no matter how it is specced, and every test here would pass
+    for the wrong reason — by exercising the fallback path it was written to
+    prove was skipped.
+
+    The real backends are ordinary classes, so production detection is
+    unaffected; this is purely about what a test double can express.
+    """
+
+    def __init__(self, probe=None, probe_error=None, answer="Yes"):
+        self.model_name = "fake-probe"
+        self.device = "cpu"
+        self.is_loaded = True
+        self._probe = probe if probe is not None else yes_probe()
+        self._probe_error = probe_error
+        self._answer = answer
+        self.probe_calls = 0
+        self.answer_calls = 0
+        self.stop_calls = 0
+
+    def load(self) -> None: ...
+
+    def encode(self, image):
+        return image
+
+    def query(self, image, question) -> str:
+        return self._answer
+
+    def answer(self, handle, question) -> str:
+        self.answer_calls += 1
+        return self._answer
+
+    def query_batch(self, images, questions) -> list[str]:
+        return [self.answer(i, q) for i, q in zip(images, questions, strict=True)]
+
+    def probe_binary(self, handle, question) -> BinaryProbe:
+        self.probe_calls += 1
+        if self._probe_error is not None:
+            raise self._probe_error
+        return self._probe
+
+    def probe_binary_batch(self, handles, questions) -> list[BinaryProbe]:
+        return [
+            self.probe_binary(h, q) for h, q in zip(handles, questions, strict=True)
+        ]
+
+    def request_stop(self) -> None:
+        self.stop_calls += 1
+
+    def cleanup(self) -> None: ...
+
+    def unload(self) -> None: ...
+
+
+class TestYesNoTokenResolution:
+    """The token ids a probe reads are the probe. Wrong ids, wrong verdicts."""
+
+    def test_a_real_tokenizer_yields_disjoint_sets(self):
+        """Against Moondream's actual tokenizer, not a stand-in."""
+        pytest.importorskip("transformers")
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(
+            "vikhyatk/moondream2",
+            revision="2024-08-26",
+            cache_dir="models/moondream2",
+        )
+        yes, no = resolve_yes_no_ids(tok)
+
+        assert yes and no, "Neither side may be empty"
+        assert not (set(yes) & set(no)), "A token cannot mean both"
+        # Every spelling resolves separately on a BPE vocabulary, which is the
+        # reason the mass is summed over variants rather than read off one id.
+        assert len(yes) > 1 and len(no) > 1
+
+    def test_an_indistinguishable_tokenizer_is_refused(self):
+        """A tokenizer mapping both words to one id cannot answer anything."""
+        tok = MagicMock()
+        tok.encode.return_value = [7]
+
+        with pytest.raises(ProbeUnsupportedError):
+            resolve_yes_no_ids(tok)
+
+    def test_an_empty_encoding_is_refused(self):
+        """Silently returning no ids would make every verdict a coin flip."""
+        tok = MagicMock()
+        tok.encode.return_value = []
+
+        with pytest.raises(ProbeUnsupportedError):
+            resolve_yes_no_ids(tok)
+
+
+class TestDecideProbe:
+    """Turning two masses into a verdict."""
+
+    def test_the_pair_is_renormalized(self):
+        """Absolute mass reflects verbosity; the ratio carries the answer."""
+        probe = decide_probe(0.02, 0.01, 0.5)
+        assert probe.p_yes == pytest.approx(2 / 3)
+        assert probe.p_no == pytest.approx(1 / 3)
+        assert probe.verdict is True
+
+    def test_the_threshold_is_applied_to_the_ratio(self):
+        assert decide_probe(0.7, 0.3, 0.5).verdict is True
+        assert decide_probe(0.7, 0.3, 0.9).verdict is False
+
+    def test_raw_text_mirrors_the_verdict(self):
+        """Downstream reads raw_response; it must not contradict the bool."""
+        assert decide_probe(0.9, 0.1, 0.5).raw == "Yes"
+        assert decide_probe(0.1, 0.9, 0.5).raw == "No"
+
+    def test_no_mass_at_all_is_refused(self):
+        with pytest.raises(ProbeUnsupportedError):
+            decide_probe(0.0, 0.0, 0.5)
+
+
+class TestOpenAICompatProbe:
+    """The edge path: llama.cpp implements logprobs, Ollama does not."""
+
+    def _backend(self, payload) -> OpenAICompatBackend:
+        backend = OpenAICompatBackend(model="test-model")
+        client = MagicMock()
+        client.post.return_value = MagicMock(
+            json=MagicMock(return_value=payload),
+            raise_for_status=MagicMock(),
+        )
+        backend._client = client
+        backend._loaded = True
+        return backend
+
+    @staticmethod
+    def _logprobs(pairs) -> dict:
+        import math as _math
+
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {
+                                "top_logprobs": [
+                                    {"token": t, "logprob": _math.log(p)}
+                                    for t, p in pairs
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    def test_a_llama_cpp_response_yields_a_verdict(self):
+        backend = self._backend(self._logprobs([("Yes", 0.8), ("No", 0.1)]))
+        probe = backend.probe_binary(MagicMock(), "Is this person bending?")
+
+        assert probe.verdict is True
+        assert probe.p_yes == pytest.approx(8 / 9)
+
+    def test_only_one_token_is_requested(self):
+        """The whole point: the server must not decode a sentence."""
+        backend = self._backend(self._logprobs([("Yes", 0.9), ("No", 0.1)]))
+        backend.probe_binary(MagicMock(), "q")
+
+        sent = backend._client.post.call_args.kwargs["json"]
+        assert sent["max_tokens"] == 1
+        assert sent["logprobs"] is True
+        assert sent["temperature"] == 0.0
+
+    def test_a_server_without_logprobs_is_unsupported(self):
+        """Ollama's shape — a normal completion, no logprobs field."""
+        backend = self._backend({"choices": [{"message": {"content": "Yes"}}]})
+
+        with pytest.raises(ProbeUnsupportedError):
+            backend.probe_binary(MagicMock(), "q")
+
+    def test_neither_word_among_the_candidates_is_unsupported(self):
+        backend = self._backend(
+            self._logprobs([("Maybe", 0.5), ("Perhaps", 0.3)])
+        )
+
+        with pytest.raises(ProbeUnsupportedError):
+            backend.probe_binary(MagicMock(), "q")
+
+    def test_negation_words_are_not_counted_as_no(self):
+        """'not' and 'none' start with 'no' but are not the model saying No.
+
+        Prefix matching here would quietly fold them into the No mass and tilt
+        every verdict toward no-alert — the exact bias probing is meant to
+        remove.
+        """
+        backend = self._backend(
+            self._logprobs([("Yes", 0.3), ("not", 0.4), ("none", 0.2), ("No", 0.1)])
+        )
+        probe = backend.probe_binary(MagicMock(), "q")
+
+        # Only the real "No" counts: 0.3 vs 0.1.
+        assert probe.p_yes == pytest.approx(0.75)
+        assert probe.verdict is True
+
+    def test_case_and_punctuation_are_tolerated(self):
+        backend = self._backend(self._logprobs([(" YES", 0.6), ("no.", 0.2)]))
+        probe = backend.probe_binary(MagicMock(), "q")
+
+        assert probe.p_yes == pytest.approx(0.75)
+
+    def test_probing_before_load_raises(self):
+        backend = OpenAICompatBackend()
+        with pytest.raises(RuntimeError, match="not loaded"):
+            backend.probe_binary(MagicMock(), "q")
+
+
+class TestWorkerProbing:
+    """How the worker chooses between probing and generate-and-parse."""
+
+    def _worker(self, backend, **kwargs) -> VLMWorker:
+        worker = VLMWorker(buffer=MagicMock(), backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person bending over?", rule_id=1)
+        return worker
+
+    def test_the_real_backends_advertise_their_capability(self):
+        """Production detection, as opposed to what a double can express."""
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import BinaryProbeBackend, build_backend
+
+        probeable = {
+            name: isinstance(build_backend(Settings(vlm_backend=name)), BinaryProbeBackend)
+            for name in ("moondream", "transformers", "openai_compat")
+        }
+        # Moondream's remote-code wrapper exposes no logits, so it cannot be
+        # probed and must fall back rather than fail.
+        assert probeable == {
+            "moondream": False,
+            "transformers": True,
+            "openai_compat": True,
+        }
+
+    def test_a_probe_capable_backend_is_probed(self):
+        backend = ProbeStub()
+        worker = self._worker(backend)
+
+        answer = worker._decide(MagicMock(), "Is this person bending over?")
+
+        assert answer.verdict is True
+        assert answer.confidence == pytest.approx(0.9)
+        assert backend.probe_calls == 1
+        assert backend.answer_calls == 0, "Must not also generate"
+
+    def test_a_backend_that_cannot_probe_is_never_asked(self):
+        """The Moondream case: no probe methods, so no wasted attempt."""
+        backend = mock_backend()
+        backend.query.return_value = "Yes"
+        worker = self._worker(backend)
+
+        answer = worker._decide(MagicMock(), "q")
+
+        assert answer.verdict is True
+        assert answer.confidence is None
+        assert backend.answer.call_count == 1
+
+    def test_probe_off_forces_generate_and_parse(self):
+        backend = ProbeStub(answer="No")
+        worker = self._worker(backend, probe="off")
+
+        answer = worker._decide(MagicMock(), "q")
+
+        assert backend.probe_calls == 0
+        assert answer.verdict is False
+        assert answer.confidence is None
+
+    def test_an_unsupported_probe_latches_off(self):
+        """One failed attempt, then never again for the rest of the session.
+
+        Without the latch a server lacking logprobs pays a doomed request
+        before every single generate, doubling its request count forever.
+        """
+        backend = ProbeStub(probe_error=ProbeUnsupportedError("no logprobs"))
+        worker = self._worker(backend)
+
+        first = worker._decide(MagicMock(), "q")
+        for _ in range(5):
+            worker._decide(MagicMock(), "q")
+
+        assert first.verdict is True, "The transition query still gets answered"
+        assert backend.probe_calls == 1, "Latched after a single refusal"
+        assert backend.answer_calls == 6
+
+    def test_a_failed_probe_still_answers_the_query(self):
+        """Falling back must not drop the verdict that triggered it."""
+        backend = ProbeStub(probe_error=ProbeUnsupportedError("nope"), answer="No")
+        worker = self._worker(backend)
+
+        assert worker._decide(MagicMock(), "q").verdict is False
+
+    def test_batched_and_single_use_the_same_decision_rule(self):
+        """A verdict must not depend on how many rode with it."""
+        backend = ProbeStub(probe=yes_probe(0.8))
+        worker = self._worker(backend)
+
+        single = worker._decide(MagicMock(), "q")
+        batched = worker._decide_batch([MagicMock(), MagicMock()], ["q", "q"])
+
+        assert [b.verdict for b in batched] == [single.verdict] * 2
+        assert [b.confidence for b in batched] == [single.confidence] * 2
+
+    def test_the_probe_count_is_reported(self):
+        backend = ProbeStub()
+        worker = self._worker(backend)
+
+        worker._decide(MagicMock(), "q")
+        worker._decide(MagicMock(), "q")
+
+        assert worker._verdicts_probed == 2
+
+    def test_a_probed_verdict_publishes_its_confidence(self):
+        """The number an operator uses to spot a close call."""
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        buffer = MagicMock()
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        buffer.read_at_index.return_value = (frame, time.monotonic())
+
+        worker = VLMWorker(
+            buffer=buffer, backend=ProbeStub(probe=yes_probe(0.77)), snapshot_dir=None
+        )
+        worker.add_rule("person", "Is this person bending over?", rule_id=1)
+
+        publisher = MagicMock()
+        worker._process_batch(
+            [
+                {
+                    "timestamp": time.monotonic(),
+                    "camera_id": "test",
+                    "label": "person",
+                    "confidence": 0.9,
+                    "bbox": {"x1": 0.3, "y1": 0.1, "x2": 0.5, "y2": 0.8},
+                    "frame_index": 0,
+                    "track_id": 1,
+                }
+            ],
+            publisher,
+        )
+
+        published = publisher.publish.call_args[0][1]
+        assert published["verdict"] is True
+        assert published["confidence"] == pytest.approx(0.77)
+        assert published["raw_response"] == "Yes"
+
+    def test_a_parsed_verdict_reports_no_confidence(self):
+        """A parsed 'Yes' carries no strength, and must not pretend to."""
+        backend = mock_backend()
+        backend.query.return_value = "Yes"
+        worker = self._worker(backend)
+
+        assert worker._decide(MagicMock(), "q").confidence is None
+
+
+class TestLetterboxSquare:
+    """Square padding, so the model never sees a stretched person."""
+
+    def test_the_output_is_always_square(self):
+        for shape in [(300, 100, 3), (100, 300, 3), (250, 250, 3), (7, 900, 3)]:
+            out = letterbox_square(np.zeros(shape, dtype=np.uint8), 378)
+            assert out.shape == (378, 378, 3), f"failed for {shape}"
+
+    def test_the_token_cost_stops_varying_with_the_subject(self):
+        """The latency claim: every crop arrives at identical dimensions."""
+        shapes = {
+            letterbox_square(np.zeros(s, dtype=np.uint8), 378).shape
+            for s in [(320, 107, 3), (360, 118, 3), (200, 200, 3)]
+        }
+        assert len(shapes) == 1
+
+    def test_proportions_survive(self):
+        """A 1:3 person stays 1:3 instead of being stretched to 1:1."""
+        src = np.full((300, 100, 3), 200, dtype=np.uint8)
+        out = letterbox_square(src, 378)
+
+        subject = out != _LETTERBOX_GREY
+        rows = np.any(subject, axis=(1, 2))
+        cols = np.any(subject, axis=(0, 2))
+        height = int(rows.sum())
+        width = int(cols.sum())
+
+        assert height == pytest.approx(378, abs=2)
+        assert width / height == pytest.approx(1 / 3, rel=0.02)
+
+    def test_the_bars_are_neutral_grey(self):
+        """Black bars read as unlit scene; grey reads as absence."""
+        out = letterbox_square(np.full((300, 100, 3), 200, dtype=np.uint8), 378)
+        assert out[0, 0, 0] == _LETTERBOX_GREY
+
+    def test_the_subject_is_centred(self):
+        out = letterbox_square(np.full((300, 100, 3), 200, dtype=np.uint8), 378)
+        cols = np.any(out != _LETTERBOX_GREY, axis=(0, 2))
+        left = int(np.argmax(cols))
+        right = len(cols) - int(np.argmax(cols[::-1]))
+        assert abs(left - (378 - right)) <= 2
+
+    def test_a_square_input_is_left_unpadded(self):
+        out = letterbox_square(np.full((200, 200, 3), 200, dtype=np.uint8), 378)
+        assert not np.any(out == _LETTERBOX_GREY)
+
+    def test_the_source_is_never_modified(self):
+        """Other subjects in the same batch still need this frame."""
+        src = np.full((300, 100, 3), 200, dtype=np.uint8)
+        letterbox_square(src, 378)
+        assert np.all(src == 200)
+
+    def test_the_result_is_a_fresh_array(self):
+        src = np.full((378, 378, 3), 200, dtype=np.uint8)
+        out = letterbox_square(src, 378)
+        out[0, 0, 0] = 1
+        assert src[0, 0, 0] == 200
+
+    def test_a_small_crop_is_scaled_up_to_the_canvas(self):
+        """Constant size is the point, so an undersized crop still fills it."""
+        out = letterbox_square(np.full((64, 64, 3), 200, dtype=np.uint8), 378)
+        assert out.shape == (378, 378, 3)
+        assert not np.any(out == _LETTERBOX_GREY)
+
+
+class TestCropPipelineWiring:
+    """How the worker assembles cropping, dimming and letterboxing."""
+
+    def _crops(self, **kwargs) -> np.ndarray:
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+        buffer = MagicMock()
+        buffer.read_by_timestamp.return_value = (frame, time.monotonic(), 0)
+        buffer.read_at_index.return_value = (frame, time.monotonic())
+
+        backend = mock_backend()
+        backend.query.return_value = "Yes"
+        worker = VLMWorker(buffer=buffer, backend=backend, **kwargs)
+        worker.add_rule("person", "Is this person bending over?", rule_id=1)
+
+        prepared = worker._prepare(
+            [
+                {
+                    "timestamp": time.monotonic(),
+                    "camera_id": "test",
+                    "label": "person",
+                    "confidence": 0.9,
+                    "bbox": {"x1": 0.3, "y1": 0.1, "x2": 0.4, "y2": 0.8},
+                    "frame_index": 0,
+                    "track_id": 1,
+                }
+            ]
+        )
+        return prepared[0][2]
+
+    def test_letterboxing_is_on_by_default(self):
+        assert self._crops().shape == (378, 378, 3)
+
+    def test_zero_falls_back_to_max_edge_downscaling(self):
+        """The opt-out keeps the previous geometry exactly."""
+        crop = self._crops(square_edge=0)
+        assert crop.shape[0] != crop.shape[1]
+        assert max(crop.shape[:2]) <= 511
+
+    def test_dimming_is_off_by_default(self):
+        """A uniform frame stays uniform apart from the letterbox bars."""
+        crop = self._crops()
+        assert set(np.unique(crop)) <= {200, _LETTERBOX_GREY}
+
+    def test_dimming_can_still_be_restored(self):
+        """The mechanism survives the default flip — the failure it fixed is real."""
+        crop = self._crops(focus_dim=0.4, square_edge=0, crop_padding=0.5)
+        assert crop.min() < 200
+
+
+class TestTransformersProbe:
+    """The single forward pass itself: slicing, padding, and attribution."""
+
+    VOCAB = 64
+    YES_ID = 11
+    NO_ID = 22
+
+    def _backend(self, rows):
+        """A loaded backend whose model returns controlled final-position logits.
+
+        ``rows`` is one ``(yes_logit, no_logit)`` pair per batch row.
+        """
+        torch = pytest.importorskip("torch")
+        from types import SimpleNamespace
+
+        from app.pipelines.vlm_backends import TransformersVLMBackend
+
+        class FakeInputs(dict):
+            def to(self, device):
+                return self
+
+        class FakeProcessor:
+            def __init__(self):
+                self.tokenizer = SimpleNamespace(padding_side="right")
+                self.sides_during_call = []
+                self.prompts = None
+
+            def apply_chat_template(self, messages, add_generation_prompt=False):
+                text = messages[0]["content"][1]["text"]
+                return f"<user><image>{text}<assistant>"
+
+            def __call__(self, text, images, return_tensors, padding=False):
+                self.prompts = list(text)
+                self.sides_during_call.append(self.tokenizer.padding_side)
+                return FakeInputs(
+                    input_ids=torch.zeros((len(text), 5), dtype=torch.long)
+                )
+
+        def fake_model(**inputs):
+            n = inputs["input_ids"].shape[0]
+            # Everything else is deeply improbable, so the Yes/No pair carries
+            # essentially all the mass and the renormalized ratio is readable.
+            logits = torch.full((n, 5, self.VOCAB), -30.0)
+            for i, (yes, no) in enumerate(rows):
+                logits[i, -1, self.YES_ID] = yes
+                logits[i, -1, self.NO_ID] = no
+            return SimpleNamespace(logits=logits)
+
+        backend = TransformersVLMBackend(device="cpu")
+        backend._processor = FakeProcessor()
+        backend._model = fake_model
+        backend._loaded = True
+        backend._yes_ids = [self.YES_ID]
+        backend._no_ids = [self.NO_ID]
+        return backend
+
+    def test_a_confident_yes_is_read_off_the_logits(self):
+        backend = self._backend([(6.0, 0.0)])
+        probe = backend.probe_binary(MagicMock(), "Is this person bending?")
+
+        assert probe.verdict is True
+        assert probe.raw == "Yes"
+        assert probe.p_yes > 0.99
+
+    def test_a_confident_no_is_read_off_the_logits(self):
+        probe = self._backend([(0.0, 6.0)]).probe_binary(MagicMock(), "q")
+
+        assert probe.verdict is False
+        assert probe.raw == "No"
+        assert probe.p_no > 0.99
+
+    def test_the_confidence_is_calibrated_not_binary(self):
+        """Equal logits mean the model genuinely has no idea."""
+        probe = self._backend([(1.0, 1.0)]).probe_binary(MagicMock(), "q")
+        assert probe.p_yes == pytest.approx(0.5, abs=0.01)
+
+    def test_the_threshold_gates_the_verdict(self):
+        backend = self._backend([(1.0, 0.0)])
+        backend._probe_threshold = 0.9
+        # Roughly 0.73 yes — a lean, not a decision.
+        assert backend.probe_binary(MagicMock(), "q").verdict is False
+
+    def test_each_row_gets_its_own_answer(self):
+        """Batched attribution: the claim a batch has to earn."""
+        backend = self._backend([(6.0, 0.0), (0.0, 6.0), (6.0, 0.0)])
+        probes = backend.probe_binary_batch(
+            [MagicMock(), MagicMock(), MagicMock()], ["a", "b", "c"]
+        )
+
+        assert [p.verdict for p in probes] == [True, False, True]
+
+    def test_padding_is_forced_left_then_restored(self):
+        """Right padding would read a pad token instead of the answer slot."""
+        backend = self._backend([(6.0, 0.0), (0.0, 6.0)])
+        backend.probe_binary_batch([MagicMock(), MagicMock()], ["a", "b"])
+
+        assert backend._processor.sides_during_call == ["left"]
+        assert backend._processor.tokenizer.padding_side == "right"
+
+    def test_the_probe_prompt_matches_the_generate_prompt(self):
+        """Drift here would invalidate any probe-vs-generate comparison."""
+        backend = self._backend([(6.0, 0.0)])
+        backend.probe_binary(MagicMock(), "Is this person bending?")
+
+        assert backend._processor.prompts == [
+            backend._chat_prompt("Is this person bending?")
+        ]
+
+    def test_an_empty_batch_is_allowed(self):
+        assert self._backend([]).probe_binary_batch([], []) == []
+
+    def test_mismatched_lengths_raise(self):
+        backend = self._backend([(1.0, 0.0)])
+        with pytest.raises(ValueError):
+            backend.probe_binary_batch([MagicMock()], ["a", "b"])
+
+    def test_probing_before_load_raises(self):
+        from app.pipelines.vlm_backends import TransformersVLMBackend
+
+        with pytest.raises(RuntimeError, match="not loaded"):
+            TransformersVLMBackend(device="cpu").probe_binary(MagicMock(), "q")
+
+    def test_a_tokenizer_without_yes_no_ids_is_unsupported(self):
+        """Degrades to the parser rather than deciding on an empty id set."""
+        backend = self._backend([(6.0, 0.0)])
+        backend._yes_ids = []
+
+        with pytest.raises(ProbeUnsupportedError):
+            backend.probe_binary(MagicMock(), "q")
+
+
+class TestProbeCapabilityReporting:
+    """The fallback must not be silent — nothing else ever announces it."""
+
+    def _log(self, backend, caplog, **kwargs):
+        worker = VLMWorker(buffer=MagicMock(), backend=backend, **kwargs)
+        with caplog.at_level("INFO", logger="app.pipelines.vlm_worker"):
+            worker._report_probe_capability()
+        return caplog.text
+
+    def test_a_probe_capable_backend_says_so(self, caplog):
+        assert "probing enabled" in self._log(ProbeStub(), caplog).lower()
+
+    def test_an_incapable_backend_is_announced_not_hidden(self, caplog):
+        """A backend that cannot probe is never asked, so it never refuses."""
+        text = self._log(mock_backend(), caplog)
+        assert "generate-and-parse" in text
+        assert "no alert" in text, "The parser's default belongs in the warning"
+
+    def test_explicitly_requesting_probing_warns_when_impossible(self, caplog):
+        self._log(mock_backend(), caplog, probe="on")
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_auto_does_not_warn_about_an_expected_fallback(self, caplog):
+        self._log(mock_backend(), caplog, probe="auto")
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_disabling_probing_is_also_reported(self, caplog):
+        assert "disabled" in self._log(ProbeStub(), caplog, probe="off").lower()

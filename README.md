@@ -109,8 +109,98 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_VLM_VERDICT_TTL_S` | `300` | Seconds a subject's verdict is reused before re-judging |
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20` | Floor between re-judgements of one subject |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Subjects judged per drain cycle |
-| `EYEQ_VLM_FOCUS_DIM` | `0.4` | Dimming outside the subject's box, so neighbours can't flip a verdict |
+| `EYEQ_VLM_FOCUS_DIM` | `1.0` | Dimming outside the subject's box. Off by default; `0.4` restores it |
+| `EYEQ_VLM_SQUARE_EDGE` | `378` | Letterbox crops into this square so a 1:3 person isn't stretched |
+| `EYEQ_VLM_PROBE` | `auto` | Read the verdict from token probabilities instead of parsing text |
 | `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Longest side of the crop shown to the VLM. Keeps Moondream on its single-pass encoder |
+| `EYEQ_VLM_MIN_SUBJECT_PX` | `96` | Skip a subject smaller than this on its longer side — too few pixels to answer about |
+| `EYEQ_VLM_BATCH_SIZE` | `1` | Crops answered per forward pass. Raising it is measured, not assumed — see below |
+
+### Why batching is off by default
+
+`EYEQ_VLM_BATCH_SIZE` exists so the question can be *measured*, and it ships at
+`1` because on the hardware this appliance targets the measurement does not
+favour raising it.
+
+Stage 2's shape is unusual. A crop enters the model as **729 image tokens** and
+leaves as a **one-word answer** — so a query is roughly 99% prefill and 1%
+decode. That ratio is what decides whether batching helps:
+
+- **Decode** is memory-bound. It reads the entire weight matrix to produce one
+  token per sequence, so a batch of four reads those weights once instead of
+  four times. This is where batching normally pays, and Stage 2 barely does any.
+- **Prefill** is compute-bound — hundreds of FLOPs per byte of weights fetched,
+  well past the roofline knee on any of these boards. The weight read is already
+  amortized across 729 tokens. Batching amortizes it further, over work that was
+  never waiting on it.
+
+So batching buys little here, and it is not free:
+
+- **KV cache scales linearly with batch size** — roughly 295 MB per sequence for
+  Moondream2 at fp32. On an 8 GB SBC already holding YOLO, the ring buffer and a
+  3.5 GB model, `4` is not obviously affordable.
+- **A timeout costs the whole group.** The worker abandons the remaining batch
+  when an inference overruns, so one wedged dispatch takes N subjects with it
+  instead of one.
+- **Latency is per batch, not per subject.** No verdict in a group exists until
+  the whole dispatch returns, so every subject waits for the slowest — which the
+  dashboard reports honestly rather than amortizing away.
+
+Measure before changing it, on the board you intend to deploy:
+
+```bash
+uv run python bench/make_fixtures.py --video cctv_demo.mp4 --count 8
+uv run python bench/benchmark_vlm.py --backend torch --batch-sizes 1,2,4
+```
+
+The sweep runs identical (crop, prompt) pairs at every size and reports wall
+time, peak RSS, and **verdict agreement against size 1**. Raise the setting only
+when a speedup above 1.0 arrives with full agreement and an RSS delta the board
+can absorb. Anything else is a slower, hungrier appliance that also answers
+differently.
+
+### Why verdicts are probed, not parsed
+
+A Stage 2 query needs exactly **one bit** back. Generating that bit as text runs
+the model autoregressively and then guesses the bit back out of the words —
+and the guess has a failure mode measured on this repo's own fixtures.
+
+Asked *"is this person bending over or crouching?"*, Moondream answers
+`"Crouching"`. That is plainly yes. `BinaryVerdictParser` does not recognise the
+word, falls through to its conservative default, and files **no alert**. It
+happened on 1 of every 3 queries in the fixture set.
+
+So where the backend allows it, the verdict is read straight off the
+distribution the prefill already computed: compare the probability mass on the
+`Yes` tokens against the `No` tokens at the first answer position. One forward
+pass, no decode, no parsing, and a calibrated `confidence` on every result.
+
+Measured on an M-series CPU, moondream2 fp32, over the real fixtures:
+
+| | |
+|---|---|
+| `encode_image` (vision) | 1109 ms |
+| answer capped at 1 token — what a probe costs | 2690 ms |
+| answer at natural stop — what `generate()` costs | 2960 ms |
+| **decode beyond the first token** | **270 ms — 9.1% of the query** |
+
+Be clear about which half of this is the win. Because prefill is ~99% of the
+query, removing decode entirely is worth **~9%**, not a step change. The reason
+to do it is the `"Crouching"` case: probing cannot produce that class of error,
+because it never has to recognise the wording.
+
+Not every backend can. `EYEQ_VLM_PROBE=auto` uses it where available and falls
+back permanently on the first backend that refuses:
+
+| Backend | Probing | Why |
+|---|---|---|
+| `transformers` | Yes | Logits are directly available |
+| `openai_compat` | Server-dependent | **llama.cpp implements `logprobs`; Ollama does not** |
+| `moondream` (default) | No | Its remote-code wrapper exposes no logits |
+
+The fallback is latched after a single refusal — re-checking would buy a doomed
+request before every generate — and the query that triggered it is still
+answered the old way, so the transition costs nothing.
 
 ### Sizing the verdict TTL
 

@@ -25,7 +25,9 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import math
 import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -81,6 +83,24 @@ class VLMBackend(Protocol):
         """Answer one question about an image already passed to :meth:`encode`."""
         ...
 
+    def query_batch(
+        self, images: list[Image.Image], questions: list[str]
+    ) -> list[str]:
+        """Answer one question per image, in as few forward passes as possible.
+
+        Positional: ``questions[i]`` is asked about ``images[i]`` and the
+        returned answer at index ``i`` belongs to that pair. Backends that
+        cannot batch delegate to :func:`sequential_query_batch` and satisfy the
+        contract at the same cost as calling :meth:`query` in a loop.
+
+        Batching is not free and is off by default — see ``vlm_batch_size``.
+        Stage 2's prompt carries 729 image tokens against a single-token
+        answer, which makes it prefill-bound and compute-bound, and batching
+        amortizes a *weight read* that prefill was never waiting on. It also
+        multiplies the KV cache by the batch size.
+        """
+        ...
+
     def request_stop(self) -> None:
         """Ask an in-flight ``query()`` to abandon generation early.
 
@@ -98,6 +118,167 @@ class VLMBackend(Protocol):
     def unload(self) -> None:
         """Release the model entirely."""
         ...
+
+
+def sequential_query_batch(
+    backend: VLMBackend, images: list[Image.Image], questions: list[str]
+) -> list[str]:
+    """Answer each pair with its own :meth:`~VLMBackend.query` call.
+
+    The honest implementation of :meth:`~VLMBackend.query_batch` for a backend
+    with no batch entry point. Kept as a free function so those backends are a
+    two-line delegation rather than a copied loop, and so the worker never has
+    to ask whether real batching is available.
+
+    Args:
+        backend: The backend to drive.
+        images: One image per question.
+        questions: One question per image.
+
+    Returns:
+        Answers, positionally matched to the inputs.
+    """
+    return [backend.query(image, q) for image, q in zip(images, questions, strict=True)]
+
+
+# ── Binary Verdict Probing (optional capability) ─────────────────
+#
+# Stage 2 only ever needs one bit back. Generating it as *text* means running
+# the language model autoregressively — a prefill over ~729 image tokens to
+# produce "Yes", then another full forward pass per token after that, all so
+# the answer can be turned back into a bool by a string parser that defaults
+# to False on anything it fails to recognise.
+#
+# Probing reads the same bit off the distribution the prefill already
+# computed: compare the probability mass on the Yes tokens against the No
+# tokens at the first answer position. One forward pass, no decode, no
+# parsing, and a calibrated confidence falls out for free.
+#
+# This is a *capability*, not part of :class:`VLMBackend` — Moondream's
+# remote-code wrapper exposes no logits, and an OpenAI-compatible server only
+# exposes them if it implements ``logprobs``. The worker checks for it and
+# falls back to generate-and-parse, so no deployment loses the ability to
+# answer, only the ability to answer cheaply.
+
+# Casing and leading-space variants of the two words. Which one a model emits
+# first depends on its chat template and its tokenizer, so the mass is summed
+# over all of them rather than betting on one spelling.
+_YES_VARIANTS = ("Yes", " Yes", "yes", " yes", "YES", " YES")
+_NO_VARIANTS = ("No", " No", "no", " no", "NO", " NO")
+
+# How many candidates to ask an HTTP server for. The winning token is almost
+# always Yes or No outright; this is headroom for a model that leads with
+# punctuation or a stray article.
+_TOP_LOGPROBS = 20
+
+
+@dataclass(frozen=True)
+class BinaryProbe:
+    """A yes/no decision read directly from the model's own probabilities.
+
+    Attributes:
+        verdict: True when the Yes mass wins against the configured threshold.
+        p_yes: Yes probability, renormalized over the yes/no pair alone.
+        p_no: ``1.0 - p_yes``.
+        raw: ``"Yes"`` or ``"No"``, so callers expecting the old text answer
+            keep working unchanged.
+    """
+
+    verdict: bool
+    p_yes: float
+    p_no: float
+    raw: str
+
+
+class ProbeUnsupportedError(RuntimeError):
+    """Raised when a backend cannot report yes/no probabilities.
+
+    Distinct from a failed inference: this says *this backend will never be
+    able to do this*, so the caller should stop asking and fall back for the
+    rest of the session rather than retrying per query.
+    """
+
+
+@runtime_checkable
+class BinaryProbeBackend(Protocol):
+    """Optional capability: decide a yes/no question without generating text."""
+
+    def probe_binary(self, handle: object, question: str) -> BinaryProbe:
+        """Probe one question about a handle from :meth:`VLMBackend.encode`."""
+        ...
+
+    def probe_binary_batch(
+        self, handles: list[object], questions: list[str]
+    ) -> list[BinaryProbe]:
+        """Probe one question per handle, positionally matched."""
+        ...
+
+
+def resolve_yes_no_ids(tokenizer) -> tuple[list[int], list[int]]:
+    """First-token ids for the Yes and No spellings, as two disjoint lists.
+
+    Only the *first* token of each variant is taken. A multi-token spelling
+    still commits to the answer at its first token, which is the only position
+    a single forward pass can see, and it is discriminative there.
+
+    Raises:
+        ProbeUnsupportedError: If either side resolves to nothing, or the two are
+            indistinguishable. Both mean a probe on this tokenizer would be
+            reading noise, and silently returning an empty id set would make
+            every verdict a coin flip.
+    """
+    def first_ids(variants: tuple[str, ...]) -> set[int]:
+        ids = set()
+        for text in variants:
+            encoded = tokenizer.encode(text, add_special_tokens=False)
+            if encoded:
+                ids.add(int(encoded[0]))
+        return ids
+
+    yes = first_ids(_YES_VARIANTS)
+    no = first_ids(_NO_VARIANTS)
+
+    # A token that spells both cannot separate them, so it informs neither.
+    ambiguous = yes & no
+    yes -= ambiguous
+    no -= ambiguous
+
+    if not yes or not no:
+        raise ProbeUnsupportedError(
+            "Tokenizer yields no distinguishable Yes/No first tokens "
+            f"(yes={sorted(yes)}, no={sorted(no)}, dropped={sorted(ambiguous)})."
+        )
+
+    return sorted(yes), sorted(no)
+
+
+def decide_probe(p_yes: float, p_no: float, threshold: float) -> BinaryProbe:
+    """Turn raw Yes/No mass into a verdict, renormalized over the pair.
+
+    Renormalizing matters: the absolute mass on Yes depends on how much the
+    model wanted to say anything else at all ("The", "I", "Sure"), which is a
+    property of its verbosity, not of its answer. The ratio between the two is
+    the part that carries the verdict, and it is what the threshold applies to.
+
+    Raises:
+        ProbeUnsupportedError: If neither token drew any mass, so there is no
+            answer in the distribution to read.
+    """
+    total = p_yes + p_no
+    if total <= 0.0:
+        raise ProbeUnsupportedError(
+            "Neither 'Yes' nor 'No' drew any probability mass at the answer "
+            "position; this prompt cannot be probed."
+        )
+
+    norm_yes = p_yes / total
+    verdict = norm_yes >= threshold
+    return BinaryProbe(
+        verdict=verdict,
+        p_yes=norm_yes,
+        p_no=1.0 - norm_yes,
+        raw="Yes" if verdict else "No",
+    )
 
 
 # ── In-Process Moondream2 ────────────────────────────────────────
@@ -128,11 +309,13 @@ class MoondreamBackend:
         model_id: str = "vikhyatk/moondream2",
         revision: str = "2024-08-26",
         cache_dir: str = "models/moondream2",
+        max_new_tokens: int = 24,
     ) -> None:
         self._device = device
         self._model_id = model_id
         self._revision = revision
         self._cache_dir = cache_dir
+        self._max_new_tokens = max_new_tokens
         self._model = None
         self._tokenizer = None
         self._loaded = False
@@ -247,6 +430,52 @@ class MoondreamBackend:
 
         return self._model.answer_question(handle, question, self._tokenizer)
 
+    def query_batch(
+        self, images: list[Image.Image], questions: list[str]
+    ) -> list[str]:
+        """Answer every pair in one vision pass and one ``generate()``.
+
+        The pinned revision already ships this as ``batch_answer``: it runs the
+        vision tower over the whole list at once — ``VisionEncoder.forward``
+        branches on ``isinstance(images, list)`` — then left-pads the per-image
+        prompt embeddings and decodes the batch in a single call. Each crop
+        keeps its own full-resolution embedding, so a batched verdict is not a
+        lower-resolution one; row index maps back to subject.
+
+        ``max_new_tokens`` is passed deliberately. ``batch_answer`` defaults to
+        512 and a batched ``generate()`` runs until *every* row hits EOS, so one
+        model that ignores "answer Yes or No" and rambles would hold the whole
+        batch to its own token budget. :class:`BinaryVerdictParser` reads only
+        the leading word.
+
+        Raises:
+            RuntimeError: If the model is not loaded.
+        """
+        if not self._loaded or self._model is None:
+            raise RuntimeError("VLM model is not loaded. Call load() first.")
+
+        if len(images) != len(questions):
+            raise ValueError(
+                f"query_batch needs one question per image, got "
+                f"{len(images)} image(s) and {len(questions)} question(s)."
+            )
+
+        if not images:
+            return []
+
+        # A one-element batch would still pay batch_answer's padding and
+        # stacking, for a batch that cannot benefit from either.
+        if len(images) == 1:
+            return [self.query(images[0], questions[0])]
+
+        answers = self._model.batch_answer(
+            images=[image.convert("RGB") for image in images],
+            prompts=list(questions),
+            tokenizer=self._tokenizer,
+            max_new_tokens=self._max_new_tokens,
+        )
+        return [answer.strip() for answer in answers]
+
     def request_stop(self) -> None:
         """No-op — ``answer_question()`` exposes no stopping hook.
 
@@ -355,15 +584,20 @@ class TransformersVLMBackend:
         device: str = "cpu",
         max_new_tokens: int = 128,
         cache_dir: str = "models/vlm",
+        probe_threshold: float = 0.5,
     ) -> None:
         self._model_id = model_id
         self._device = device
         self._max_new_tokens = max_new_tokens
         self._cache_dir = cache_dir
+        self._probe_threshold = probe_threshold
         self._model = None
         self._processor = None
         self._loaded = False
         self._stop_event = threading.Event()
+        # Resolved once at load, against the tokenizer that was actually used.
+        self._yes_ids: list[int] = []
+        self._no_ids: list[int] = []
 
     @property
     def is_loaded(self) -> bool:
@@ -407,6 +641,20 @@ class TransformersVLMBackend:
         ).to(device)
         self._model.eval()
 
+        # Resolved here rather than lazily so an unprobeable tokenizer is
+        # reported at load, next to the rest of the model's setup, and not on
+        # the first verdict of a live deployment. It is not fatal: an empty id
+        # set turns probing off for this backend and the worker falls back to
+        # generate-and-parse, which is exactly what it did before probing
+        # existed. Refusing to load would be a far worse trade.
+        try:
+            self._yes_ids, self._no_ids = resolve_yes_no_ids(
+                self._processor.tokenizer
+            )
+        except ProbeUnsupportedError as exc:
+            self._yes_ids, self._no_ids = [], []
+            logger.warning(f"Binary probing unavailable for {self._model_id}: {exc}")
+
         self._device = device
         self._loaded = True
 
@@ -430,6 +678,27 @@ class TransformersVLMBackend:
         self._from_pretrained("cpu")
         logger.info("VLM loaded on CPU (fallback).")
 
+    def _chat_prompt(self, question: str) -> str:
+        """Render one image+text user turn through the model's chat template.
+
+        Shared by the generate and probe paths so the two cannot drift. A probe
+        run against a different prompt than ``generate()`` would not be
+        comparable to it, and the agreement check that justifies the swap would
+        be measuring the prompt rather than the decision rule.
+        """
+        return self._processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+
     def query(self, image: Image.Image, question: str) -> str:
         """Ask a question about an image using the model's chat template.
 
@@ -448,18 +717,7 @@ class TransformersVLMBackend:
 
         import torch
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": question},
-                ],
-            }
-        ]
-        prompt = self._processor.apply_chat_template(
-            messages, add_generation_prompt=True
-        )
+        prompt = self._chat_prompt(question)
         inputs = self._processor(
             text=[prompt], images=[image.convert("RGB")], return_tensors="pt"
         ).to(self._device)
@@ -483,6 +741,148 @@ class TransformersVLMBackend:
         return self._processor.batch_decode(
             completion, skip_special_tokens=True
         )[0].strip()
+
+    def query_batch(
+        self, images: list[Image.Image], questions: list[str]
+    ) -> list[str]:
+        """Answer every pair in one ``generate()`` over a padded batch.
+
+        Padding is forced to the **left** so every row's completion begins at
+        the same column, which is what lets the single ``prompt_len`` slice
+        below be correct for all of them. Right padding would put each row's
+        answer at a different offset and silently return prompt fragments.
+
+        Raises:
+            RuntimeError: If the model is not loaded.
+        """
+        if not self._loaded or self._model is None:
+            raise RuntimeError("VLM model is not loaded. Call load() first.")
+
+        if len(images) != len(questions):
+            raise ValueError(
+                f"query_batch needs one question per image, got "
+                f"{len(images)} image(s) and {len(questions)} question(s)."
+            )
+
+        if not images:
+            return []
+
+        import torch
+
+        prompts = [self._chat_prompt(question) for question in questions]
+
+        previous_side = self._processor.tokenizer.padding_side
+        self._processor.tokenizer.padding_side = "left"
+        try:
+            inputs = self._processor(
+                text=prompts,
+                images=[image.convert("RGB") for image in images],
+                return_tensors="pt",
+                padding=True,
+            ).to(self._device)
+        finally:
+            self._processor.tokenizer.padding_side = previous_side
+
+        self._stop_event.clear()
+
+        with torch.inference_mode():
+            generated = self._model.generate(
+                **inputs,
+                max_new_tokens=self._max_new_tokens,
+                do_sample=False,
+                stopping_criteria=_stop_on_event_criteria(self._stop_event),
+            )
+
+        prompt_len = inputs["input_ids"].shape[1]
+        completions = generated[:, prompt_len:]
+
+        return [
+            text.strip()
+            for text in self._processor.batch_decode(
+                completions, skip_special_tokens=True
+            )
+        ]
+
+    def probe_binary(self, handle: object, question: str) -> BinaryProbe:
+        """Decide one yes/no question in a single forward pass.
+
+        Routed through :meth:`probe_binary_batch` so a batch of one and a batch
+        of many run the identical code. A system whose decision rule changes
+        with ``vlm_batch_size`` would be almost impossible to reason about.
+        """
+        return self.probe_binary_batch([handle], [question])[0]
+
+    def probe_binary_batch(
+        self, handles: list[object], questions: list[str]
+    ) -> list[BinaryProbe]:
+        """Probe every pair in one forward pass over a padded batch.
+
+        This is the whole optimisation. ``generate()`` runs the prefill to
+        produce its first token and then keeps going, one full forward pass per
+        additional token, until the model emits EOS or hits ``max_new_tokens``.
+        The verdict was already decided at the first of those positions — every
+        pass after it produces punctuation and justification that a string
+        parser then throws away. Here the prefill runs once and the logits it
+        already computed are read directly.
+
+        Padding is forced **left**, as in :meth:`query_batch`: it is what makes
+        position ``-1`` the true final prompt token for every row rather than
+        whichever pad happened to land there.
+
+        Raises:
+            RuntimeError: If the model is not loaded.
+            ProbeUnsupportedError: If the tokenizer yielded no usable Yes/No ids, or
+                neither word drew any probability mass.
+        """
+        if not self._loaded or self._model is None:
+            raise RuntimeError("VLM model is not loaded. Call load() first.")
+
+        if not self._yes_ids or not self._no_ids:
+            raise ProbeUnsupportedError(
+                f"No distinguishable Yes/No token ids for {self._model_id}."
+            )
+
+        if len(handles) != len(questions):
+            raise ValueError(
+                f"probe_binary_batch needs one question per image, got "
+                f"{len(handles)} image(s) and {len(questions)} question(s)."
+            )
+
+        if not handles:
+            return []
+
+        import torch
+
+        prompts = [self._chat_prompt(question) for question in questions]
+
+        previous_side = self._processor.tokenizer.padding_side
+        self._processor.tokenizer.padding_side = "left"
+        try:
+            inputs = self._processor(
+                text=prompts,
+                images=[image.convert("RGB") for image in handles],  # type: ignore[union-attr]
+                return_tensors="pt",
+                padding=True,
+            ).to(self._device)
+        finally:
+            self._processor.tokenizer.padding_side = previous_side
+
+        with torch.inference_mode():
+            # No stopping criteria and no generation config: there is exactly
+            # one pass, so there is no token boundary at which to interrupt.
+            logits = self._model(**inputs).logits[:, -1, :]
+
+        # Softmax in fp32 regardless of the model's dtype. On an fp16
+        # accelerator the tail of the distribution underflows to zero, and the
+        # Yes/No mass is frequently in that tail.
+        probs = torch.softmax(logits.float(), dim=-1)
+        yes_mass = probs[:, self._yes_ids].sum(dim=-1).tolist()
+        no_mass = probs[:, self._no_ids].sum(dim=-1).tolist()
+
+        return [
+            decide_probe(float(y), float(n), self._probe_threshold)
+            for y, n in zip(yes_mass, no_mass, strict=True)
+        ]
 
     def encode(self, image: Image.Image) -> object:
         """Pass the image through — this backend has no shareable half.
@@ -561,12 +961,14 @@ class OpenAICompatBackend:
         api_key: str = "EMPTY",
         max_tokens: int = 128,
         timeout_s: float = 30.0,
+        probe_threshold: float = 0.5,
     ) -> None:
         self._api_base = api_base.rstrip("/")
         self._model = model
         self._api_key = api_key or "EMPTY"
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
+        self._probe_threshold = probe_threshold
         self._client = None
         self._loaded = False
 
@@ -634,35 +1036,133 @@ class OpenAICompatBackend:
         if not self._loaded or self._client is None:
             raise RuntimeError("VLM backend is not loaded. Call load() first.")
 
-        payload = {
-            "model": self._model,
-            "max_tokens": self._max_tokens,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": question},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": self._encode_image(image)},
-                        },
-                    ],
-                }
-            ],
-        }
-
-        resp = self._client.post(
-            f"{self._api_base}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {self._api_key}"},
+        data = self._post(
+            {
+                "model": self._model,
+                "max_tokens": self._max_tokens,
+                # Pinned so the same crop and rule cannot answer differently
+                # between runs. The transformers path fixes this with
+                # do_sample=False; without this the HTTP path was the only
+                # non-reproducible verdict in the appliance.
+                "temperature": 0.0,
+                "messages": self._messages(image, question),
+            }
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         try:
             return data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected VLM server response shape: {data}") from exc
+
+    def _messages(self, image: Image.Image, question: str) -> list[dict]:
+        """The one user turn, image inlined as a data URI."""
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._encode_image(image)},
+                    },
+                ],
+            }
+        ]
+
+    def _post(self, payload: dict) -> dict:
+        """POST a chat completion and return the decoded body."""
+        resp = self._client.post(  # type: ignore[union-attr]
+            f"{self._api_base}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {self._api_key}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def probe_binary(self, handle: object, question: str) -> BinaryProbe:
+        """Decide a yes/no question from the server's own token probabilities.
+
+        Asks for a single token with ``logprobs``, then reads the Yes and No
+        mass out of the returned candidates. The server still runs the same
+        prefill, but it stops there instead of decoding a sentence, and the
+        verdict comes back calibrated rather than as prose to be parsed.
+
+        Support is not universal, and that is the whole reason this raises a
+        distinct error: **llama.cpp's server implements ``logprobs``, Ollama
+        does not.** The caller is expected to latch on the first
+        :class:`ProbeUnsupportedError` and stop asking for the rest of the session
+        — retrying per query would pay for a useless request every time.
+
+        Raises:
+            RuntimeError: If the backend was never loaded.
+            ProbeUnsupportedError: If the server returns no usable token
+                probabilities, or neither word appears among the candidates.
+        """
+        if not self._loaded or self._client is None:
+            raise RuntimeError("VLM backend is not loaded. Call load() first.")
+
+        data = self._post(
+            {
+                "model": self._model,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "logprobs": True,
+                "top_logprobs": _TOP_LOGPROBS,
+                "messages": self._messages(image=handle, question=question),  # type: ignore[arg-type]
+            }
+        )
+
+        try:
+            candidates = data["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProbeUnsupportedError(
+                f"Server at {self._api_base} returned no per-token logprobs; "
+                "it cannot be probed (Ollama, for example, does not implement "
+                "them). Falling back to generate-and-parse."
+            ) from exc
+
+        p_yes = 0.0
+        p_no = 0.0
+        for entry in candidates:
+            # Exact match after trimming whitespace and trailing punctuation.
+            # Prefix matching would fold "not", "none" and "nothing" into the
+            # No mass, which is a different claim than the model saying "No".
+            word = str(entry.get("token", "")).strip().strip(".,!?;:\"'").lower()
+            if word not in ("yes", "no"):
+                continue
+            try:
+                prob = math.exp(float(entry["logprob"]))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if word == "yes":
+                p_yes += prob
+            else:
+                p_no += prob
+
+        if p_yes <= 0.0 and p_no <= 0.0:
+            raise ProbeUnsupportedError(
+                f"Neither 'Yes' nor 'No' appeared in the top {_TOP_LOGPROBS} "
+                f"candidates from {self._model}; this model cannot be probed "
+                "for a binary verdict."
+            )
+
+        return decide_probe(p_yes, p_no, self._probe_threshold)
+
+    def probe_binary_batch(
+        self, handles: list[object], questions: list[str]
+    ) -> list[BinaryProbe]:
+        """Probe each pair with its own request, for the reasons in
+        :meth:`query_batch` — the server owns its own scheduling.
+        """
+        if len(handles) != len(questions):
+            raise ValueError(
+                f"probe_binary_batch needs one question per image, got "
+                f"{len(handles)} image(s) and {len(questions)} question(s)."
+            )
+        return [
+            self.probe_binary(handle, question)
+            for handle, question in zip(handles, questions, strict=True)
+        ]
 
     def encode(self, image: Image.Image) -> object:
         """Pass the image through — this backend has no shareable half.
@@ -676,6 +1176,20 @@ class OpenAICompatBackend:
     def answer(self, handle: object, question: str) -> str:
         """Answer against the handle from :meth:`encode`, which is the image."""
         return self.query(handle, question)  # type: ignore[arg-type]
+
+    def query_batch(
+        self, images: list[Image.Image], questions: list[str]
+    ) -> list[str]:
+        """Answer each pair with its own request.
+
+        Deliberately not batched. The server owns its own batching and
+        scheduling, and this client is a synchronous ``httpx.Client`` driven
+        from a single-worker executor, so issuing N requests concurrently from
+        here would fight the scheduler rather than help it. Putting N images in
+        one request is trivial on the wire but leaves no per-subject channel to
+        read the answers back out of.
+        """
+        return sequential_query_batch(self, images, questions)
 
     def request_stop(self) -> None:
         """No-op — the request is bounded by the HTTP timeout instead.
@@ -724,6 +1238,7 @@ def build_backend(settings: Settings) -> VLMBackend:
             api_key=settings.vlm_api_key,
             max_tokens=settings.vlm_max_tokens,
             timeout_s=settings.vlm_timeout_s,
+            probe_threshold=settings.vlm_probe_threshold,
         )
 
     if settings.vlm_backend == "transformers":
@@ -731,10 +1246,12 @@ def build_backend(settings: Settings) -> VLMBackend:
             model_id=settings.vlm_model,
             device=settings.vlm_inference_device,
             max_new_tokens=settings.vlm_max_tokens,
+            probe_threshold=settings.vlm_probe_threshold,
         )
 
     return MoondreamBackend(
         device=settings.vlm_inference_device,
         model_id=settings.vlm_model,
         revision=settings.vlm_revision,
+        max_new_tokens=settings.vlm_max_tokens,
     )

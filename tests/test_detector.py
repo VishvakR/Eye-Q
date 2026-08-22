@@ -16,7 +16,11 @@ import numpy as np
 import pytest
 
 from app.core.roi import RegionOfInterest
-from app.pipelines.detector import CooldownGate, YOLOWatchdog
+from app.pipelines.detector import (
+    _COOLDOWN_PRUNE_AT,
+    CooldownGate,
+    YOLOWatchdog,
+)
 from app.schemas.events import BoundingBox
 
 # ═══════════════════════════════════════════════════════════════════
@@ -255,6 +259,25 @@ class TestCooldownGate:
         gate = CooldownGate(cooldown_seconds=5.0)
         assert gate.should_trigger("person") is True
         assert gate.should_trigger("car") is True
+
+    def test_first_trigger_passes_on_a_freshly_booted_machine(self, monkeypatch):
+        """The first trigger must not wait for the machine's uptime.
+
+        ``time.monotonic()`` counts from boot on Linux and macOS, so a gate
+        that stood in ``0.0`` for "never triggered" compared a real clock
+        against a boot-relative one and suppressed everything until uptime
+        exceeded ``cooldown_seconds``. An appliance that starts on power-up
+        is in exactly this state, and a long cooldown — the setting an
+        operator reaches for when inference is expensive — makes the blind
+        window long too.
+        """
+        monkeypatch.setattr(
+            "app.pipelines.detector.time.monotonic", lambda: 3.0
+        )
+        gate = CooldownGate(cooldown_seconds=999.0)
+
+        assert gate.should_trigger("person#1") is True
+        assert gate.should_trigger("person#1") is False
 
     def test_immediate_retrigger_blocked(self):
         """Immediate re-trigger of the same label should be blocked."""
@@ -729,7 +752,10 @@ class TestCooldownPruning:
         for i in range(20000):
             gate.should_trigger(f"person#{i}")
 
-        assert gate.tracked_keys <= 4096
+        # Both halves matter. The upper bound is the leak guard; the lower one
+        # is what stops this passing against a gate that suppressed every key
+        # and therefore stored none.
+        assert 4096 >= gate.tracked_keys > _COOLDOWN_PRUNE_AT // 2
 
     def test_is_known_reports_membership(self):
         gate = CooldownGate(cooldown_seconds=60.0)

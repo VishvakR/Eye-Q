@@ -291,6 +291,11 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
             min_rejudge_s=settings.vlm_min_rejudge_s,
             max_instances_per_batch=settings.vlm_max_instances_per_batch,
             max_crop_edge=settings.vlm_max_crop_edge,
+            min_subject_px=settings.vlm_min_subject_px,
+            batch_size=settings.vlm_batch_size,
+            square_edge=settings.vlm_square_edge,
+            probe=settings.vlm_probe,
+            probe_threshold=settings.vlm_probe_threshold,
         )
         vlm_worker.start()
         app.state.vlm_worker = vlm_worker
@@ -765,6 +770,9 @@ def create_app() -> FastAPI:
                 "instances_judged": vlm_stats.instances_judged if vlm_stats else 0,
                 "instances_memoised": vlm_stats.instances_memoised if vlm_stats else 0,
                 "instances_shed": vlm_stats.instances_shed if vlm_stats else 0,
+                "instances_too_small": (
+                    vlm_stats.instances_too_small if vlm_stats else 0
+                ),
                 "avg_inference_ms": vlm_stats.avg_inference_ms if vlm_stats else 0,
                 # Capture-to-verdict, the number an operator actually waits
                 # through. Compare against avg_inference_ms: when the two are

@@ -49,7 +49,13 @@ from PIL import Image
 from app.core.buffer import RollingFrameBuffer
 from app.core.ipc import EventPublisher, EventSubscriber
 from app.core.roi import RegionOfInterest
-from app.pipelines.vlm_backends import MoondreamBackend, VLMBackend
+from app.pipelines.vlm_backends import (
+    BinaryProbe,
+    BinaryProbeBackend,
+    MoondreamBackend,
+    ProbeUnsupportedError,
+    VLMBackend,
+)
 from app.pipelines.vlm_judge import BinaryVerdictParser
 from app.schemas.events import BoundingBox, DetectionEvent, VLMQuery, VLMResult
 
@@ -71,6 +77,16 @@ _MEMO_PRUNE_AT = 1024
 # say — purely a guard against an unbounded backlog materialising as crops.
 _BATCH_HARD_CAP = 64
 
+# Floor on either side of a crop handed to the VLM. Below roughly this the
+# model has nothing to read; the old behaviour of substituting the whole frame
+# made such a detection the most expensive query in the system instead.
+_MIN_CROP_PX = 64
+
+# Fill for the bars added by :func:`letterbox_square`. Mid-grey, the same value
+# YOLO's own letterbox uses: black bars read as unlit scene and the model will
+# describe them, while neutral grey reads as nothing at all.
+_LETTERBOX_GREY = 114
+
 
 def _percentile(samples, pct: float) -> float:
     """Nearest-rank percentile of ``samples``, or 0.0 when empty.
@@ -89,6 +105,51 @@ def _percentile(samples, pct: float) -> float:
 # ── Frame Cropping ───────────────────────────────────────────────
 
 
+def _widen(lo: int, hi: int, minimum: int, limit: int) -> tuple[int, int]:
+    """Grow a span to ``minimum`` around its own centre, staying inside ``limit``.
+
+    Used by :func:`crop_bounds` so a detection too small to crop is enlarged
+    where it actually is, rather than replaced by the whole frame.
+
+    Args:
+        lo: Low edge of the span, in pixels.
+        hi: High edge of the span, in pixels.
+        minimum: Smallest acceptable span.
+        limit: Frame extent along this axis.
+
+    Returns:
+        The widened ``(lo, hi)``, clamped to ``[0, limit]``. When the frame
+        itself is narrower than ``minimum`` the whole extent is returned.
+    """
+    if hi - lo >= minimum:
+        return lo, hi
+    if limit <= minimum:
+        return 0, limit
+
+    centre = (lo + hi) // 2
+    lo = centre - minimum // 2
+    hi = lo + minimum
+
+    if lo < 0:
+        return 0, minimum
+    if hi > limit:
+        return limit - minimum, limit
+    return lo, hi
+
+
+def subject_pixel_size(
+    frame_shape: tuple[int, ...], bbox: BoundingBox
+) -> tuple[int, int]:
+    """The subject's own box in pixels, before any padding.
+
+    Separate from :func:`crop_bounds` because the question it answers is not
+    "where do I cut" but "is there anything here worth asking about" — and the
+    padded crop is the wrong thing to measure for that.
+    """
+    h, w = frame_shape[:2]
+    return int((bbox.x2 - bbox.x1) * w), int((bbox.y2 - bbox.y1) * h)
+
+
 def crop_bounds(
     frame_shape: tuple[int, ...],
     bbox: BoundingBox,
@@ -100,9 +161,23 @@ def crop_bounds(
     exact same geometry — the two must never disagree about where the crop
     starts, or the subject would be dimmed instead of highlighted.
 
-    Both degenerate cases fall back to the whole frame: a bbox covering most of
-    the frame has no meaningful context left to add, and a crop under 32x32 is
-    too small for the VLM to read.
+    Both degenerate cases used to fall back to the entire frame, and both were
+    the wrong way round once Stage 2's cost was measured. The prompt carries
+    729 image tokens against a single-token answer, so a whole-frame crop is
+    the *most* expensive inference the appliance can run:
+
+        - A subject filling most of the frame produced a padded box that was
+          already almost the whole frame, so returning the frame gained nothing
+          and cost :func:`crop_detection_focused` its geometry — the subject
+          stopped being dimmed apart from its surroundings exactly when the
+          scene was busiest.
+        - A box too small to crop became the frame, which spent the largest
+          inference in the system on the subject least able to support an
+          answer.
+
+    Now the padded box is always honoured and simply grown to
+    ``_MIN_CROP_PX`` around its own centre when it is undersized.
+    :func:`downscale_for_vlm` caps the other end.
 
     Args:
         frame_shape: ``frame.shape`` of the source frame.
@@ -113,10 +188,6 @@ def crop_bounds(
         Pixel bounds, clamped to the frame.
     """
     h, w = frame_shape[:2]
-
-    # If bbox covers >80% of the frame, use the full frame
-    if bbox.area > 0.8:
-        return 0, 0, w, h
 
     # Denormalize to pixel coordinates
     x1 = int(bbox.x1 * w)
@@ -134,9 +205,9 @@ def crop_bounds(
     x2 = min(w, x2 + pad_w)
     y2 = min(h, y2 + pad_h)
 
-    # Ensure minimum crop size (at least 32×32)
-    if (x2 - x1) < 32 or (y2 - y1) < 32:
-        return 0, 0, w, h
+    # Enlarge an undersized crop in place instead of discarding its geometry.
+    x1, x2 = _widen(x1, x2, _MIN_CROP_PX, w)
+    y1, y2 = _widen(y1, y2, _MIN_CROP_PX, h)
 
     return x1, y1, x2, y2
 
@@ -203,8 +274,8 @@ def crop_detection_focused(
     crop_h, crop_w = crop.shape[:2]
 
     # The subject's box in coordinates local to the crop. Clamped because
-    # crop_bounds falls back to the whole frame for very large or very small
-    # boxes, in which case the subject may sit anywhere inside it.
+    # crop_bounds widens an undersized box around its centre, after which the
+    # subject may sit anywhere inside the returned bounds.
     bx1 = max(0, min(crop_w, int(bbox.x1 * w) - x1))
     by1 = max(0, min(crop_h, int(bbox.y1 * h) - y1))
     bx2 = max(0, min(crop_w, int(bbox.x2 * w) - x1))
@@ -231,9 +302,9 @@ def downscale_for_vlm(image: np.ndarray, max_edge: int) -> np.ndarray:
     3.16 s at 792 px, for the same one-word answer.
 
     Crops normally land well under the threshold, so this usually does nothing.
-    It bites when :func:`crop_bounds` falls back to the **entire frame** — for a
-    subject filling more than 80% of it, or a box too small to crop — at which
-    point a yes/no question costs triple.
+    Superseded by :func:`letterbox_square` when ``square_edge`` is set, which
+    fixes the long side outright and so cannot reach the cliff at all; this
+    remains the path for ``square_edge=0``.
 
     Args:
         image: The crop, in BGR.
@@ -261,7 +332,104 @@ def downscale_for_vlm(image: np.ndarray, max_edge: int) -> np.ndarray:
     )
 
 
+def letterbox_square(
+    image: np.ndarray, edge: int, pad_value: int = _LETTERBOX_GREY
+) -> np.ndarray:
+    """Fit a crop into a square canvas without changing its proportions.
+
+    Every subject this appliance asks about is a standing person, so the crops
+    are tall and narrow — the demo footage produces roughly 1:3. A VLM that
+    resizes its input to a square receives that person stretched to three times
+    their width, which is not a shape anything in its training data had.
+    Scaling the long side to ``edge`` and padding the short one leaves the
+    person the shape they actually are.
+
+    The second effect is the one that shows up in the latency numbers: every
+    crop now arrives at exactly the same dimensions, so the image-token count
+    is **constant**. Prefill is ~99% of a Stage 2 query, and it stops varying
+    with how tall the subject happened to be.
+
+    Padding with mid-grey rather than black is deliberate — black bars read as
+    part of the scene, as unlit floor or a dark doorway, and invite the model
+    to describe them. Neutral grey reads as absence.
+
+    Args:
+        image: The crop, in BGR.
+        edge: Side of the output square in pixels. Must be positive; callers
+            treat 0 as "disabled" and skip this entirely.
+        pad_value: Fill for the bars.
+
+    Returns:
+        A new ``(edge, edge, 3)`` array. Never the input, and never a view of
+        it — the source frame is reused by other subjects in the same batch.
+    """
+    h, w = image.shape[:2]
+    longest = max(h, w)
+
+    scale = edge / longest
+    new_w = max(1, min(edge, round(w * scale)))
+    new_h = max(1, min(edge, round(h * scale)))
+
+    # INTER_AREA averages when shrinking, which is the common case here;
+    # INTER_LINEAR is the better choice on the rare upscale of a distant
+    # subject, where averaging has nothing to average.
+    resized = cv2.resize(
+        image,
+        (new_w, new_h),
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+    )
+
+    canvas = np.full((edge, edge, image.shape[2]), pad_value, dtype=image.dtype)
+    top = (edge - new_h) // 2
+    left = (edge - new_w) // 2
+    canvas[top : top + new_h, left : left + new_w] = resized
+    return canvas
+
+
 # ── Worker Statistics ────────────────────────────────────────────
+
+
+@dataclass
+class _Subject:
+    """One cropped subject, plus the evidence JPEG shared by all its rules.
+
+    Exists because batching breaks the assumption that a subject's questions
+    are answered together: grouping by prompt can put two rules about the same
+    person in different dispatches, and the snapshot must still be written
+    once. Holding that state on the subject rather than in a loop variable
+    makes it independent of how the questions are scheduled.
+    """
+
+    event: DetectionEvent
+    cropped: np.ndarray
+    image: Image.Image
+    snapshot_path: str | None = None
+    snapshot_written: bool = False
+
+
+@dataclass(frozen=True)
+class _Answer:
+    """One decided verdict, however it was obtained.
+
+    The two paths that produce a verdict — probing the model's probabilities
+    and generating text to parse — converge here, so everything downstream
+    records a verdict identically and cannot tell which one ran. Without this
+    the recording tail would need to know about both.
+
+    Attributes:
+        verdict: The decision.
+        raw: Text to publish. The model's own words on the generate path, and
+            the winning word on the probe path, so consumers of
+            ``VLMResult.raw_response`` keep working either way.
+        confidence: Yes-probability, when a probe produced it. ``None`` on the
+            parsed path — the parser cannot know how strongly a word was
+            meant, and inventing a number there would be worse than admitting
+            it is unknown.
+    """
+
+    verdict: bool
+    raw: str
+    confidence: float | None = None
 
 
 @dataclass
@@ -282,6 +450,7 @@ class VLMWorkerStats:
     instances_judged: int
     instances_memoised: int
     instances_shed: int
+    instances_too_small: int
     avg_inference_ms: float
     last_inference_ms: float
     # Capture-to-verdict, which is what an operator actually waits through.
@@ -332,8 +501,21 @@ class VLMWorker:
         min_rejudge_s: Floor between re-judgements of one subject.
         max_instances_per_batch: Cap on subjects inferred per drained batch.
         max_crop_edge: Longest side a crop may have when handed to the VLM.
+        min_subject_px: Skip a subject whose own box is smaller than this on
+            its longer side — too little pixel evidence to answer about.
+        batch_size: Crops answered in one VLM forward pass. 1 dispatches
+            singly, which is the default and the measured-safe choice.
             See :func:`downscale_for_vlm` for why 512 is a cliff and not a
             preference.
+        square_edge: Side of the square canvas each crop is letterboxed into,
+            via :func:`letterbox_square`. 0 disables it and falls back to
+            ``max_crop_edge`` downscaling.
+        probe: ``"auto"``, ``"on"`` or ``"off"``. Whether to read verdicts
+            from the model's token probabilities instead of generating an
+            answer and parsing it. Falls back permanently on any backend that
+            cannot support it.
+        probe_threshold: Yes-probability at or above which a probed verdict
+            counts as a violation.
     """
 
     def __init__(
@@ -350,12 +532,17 @@ class VLMWorker:
         inference_timeout_s: float = 30.0,
         snapshot_dir: str | None = "data/snapshots",
         default_prompt: str | None = None,
-        focus_dim: float = 0.4,
+        focus_dim: float = 1.0,
         verdict_ttl_s: float = 300.0,
         rejudge_iou: float = 0.5,
         min_rejudge_s: float = 20.0,
         max_instances_per_batch: int = 8,
         max_crop_edge: int = 511,
+        min_subject_px: int = 96,
+        batch_size: int = 1,
+        square_edge: int = 378,
+        probe: str = "auto",
+        probe_threshold: float = 0.5,
     ) -> None:
         self._buffer = buffer
         self._zmq_endpoint = zmq_endpoint
@@ -371,6 +558,17 @@ class VLMWorker:
         self._min_rejudge_s = min_rejudge_s
         self._max_instances_per_batch = max_instances_per_batch
         self._max_crop_edge = max_crop_edge
+        self._min_subject_px = min_subject_px
+        self._batch_size = max(1, batch_size)
+        self._square_edge = square_edge
+        self._probe_mode = probe
+        self._probe_threshold = probe_threshold
+
+        # Tri-state: None means "not tried yet", False means a backend told us
+        # it cannot probe and we must stop asking. Latching matters — without
+        # it, a server without logprobs would pay for a doomed probe request
+        # before every single generate, doubling its request count forever.
+        self._probe_supported: bool | None = None
 
         # Verdict memo: (track_id, rule_id) -> (verdict, judged_at, judged_bbox).
         # This is the appliance's load control. Judging every tracked subject on
@@ -418,9 +616,14 @@ class VLMWorker:
         self._triggers_timed_out = 0
         self._verdicts_positive = 0
         self._verdicts_negative = 0
+        # How many verdicts came from a probe rather than a parsed sentence.
+        # Compared against triggers_processed it says whether the fast path is
+        # actually in force, which a config file alone cannot tell you.
+        self._verdicts_probed = 0
         self._instances_judged = 0
         self._instances_memoised = 0
         self._instances_shed = 0
+        self._instances_too_small = 0
         self._inference_times: deque[float] = deque(maxlen=100)
         self._queued_times: deque[float] = deque(maxlen=100)
         self._latencies: deque[float] = deque(maxlen=100)
@@ -601,6 +804,27 @@ class VLMWorker:
         }
         self._judged_tracks = {track_id for track_id, _rule_id in self._memo}
 
+    def _too_small(self, frame_shape: tuple[int, ...], event: DetectionEvent) -> bool:
+        """Whether a subject carries too few pixels to be worth a query.
+
+        Measured on the subject's own box rather than the padded crop: padding
+        adds context, not evidence, and a distant figure surrounded by more
+        floor is no more answerable for it.
+
+        The test is on the *longer* side deliberately. A person is tall and
+        narrow, so requiring both sides to clear the floor would drop subjects
+        that are perfectly legible.
+
+        Takes the frame it will actually be cropped from rather than the
+        buffer's declared shape, so the decision and the crop can never be
+        measuring different pixels.
+        """
+        if self._min_subject_px <= 0:
+            return False
+
+        box_w, box_h = subject_pixel_size(frame_shape, event.bbox)
+        return max(box_w, box_h) < self._min_subject_px
+
     def _is_new_subject(self, track_id: int) -> bool:
         """Whether this subject has never been judged.
 
@@ -693,6 +917,7 @@ class VLMWorker:
             instances_judged=self._instances_judged,
             instances_memoised=self._instances_memoised,
             instances_shed=self._instances_shed,
+            instances_too_small=self._instances_too_small,
             avg_inference_ms=avg_ms,
             last_inference_ms=self._last_inference_ms,
             avg_queued_ms=avg_queued,
@@ -714,6 +939,8 @@ class VLMWorker:
         except Exception as exc:
             logger.error(f"VLMWorker: failed to load model: {exc}")
             return
+
+        self._report_probe_capability()
 
         subscriber = EventSubscriber(self._zmq_endpoint, topic="detection")
         publisher = EventPublisher(self._result_endpoint)
@@ -848,6 +1075,149 @@ class VLMWorker:
         """
         future = self._executor.submit(self._vlm.answer, handle, prompt)
         return future.result(timeout=self._inference_timeout_s)
+
+    def _infer_batch(
+        self, images: list[Image.Image], prompts: list[str]
+    ) -> list[str]:
+        """Answer a whole group in one dispatch, under a scaled timeout.
+
+        The budget grows with the batch because a flat per-query timeout
+        applied to a batch of four would fire on work that is progressing
+        normally. It grows sub-linearly because the point of batching is that
+        N rows cost less than N separate calls — if they did not, the timeout
+        would be the least of the problems.
+
+        Raises:
+            concurrent.futures.TimeoutError: If the batch exceeds its budget.
+        """
+        budget = self._inference_timeout_s * (1 + 0.5 * (len(images) - 1))
+        future = self._executor.submit(self._vlm.query_batch, images, prompts)
+        return future.result(timeout=budget)
+
+    # ── Verdict Acquisition ──────────────────────────────────────
+
+    def _report_probe_capability(self) -> None:
+        """Say once, at startup, which verdict path this backend will take.
+
+        Without this the fallback is invisible: a backend that cannot probe is
+        never *asked*, so it never refuses, so nothing is ever logged — and an
+        operator who set ``EYEQ_VLM_PROBE=on`` would watch it silently not
+        happen. Announcing it at load is the only point where the answer is
+        both known and worth one line.
+        """
+        if self._probe_mode == "off":
+            logger.info("Verdict probing disabled; using generate-and-parse.")
+            return
+
+        if isinstance(self._vlm, BinaryProbeBackend):
+            logger.info(
+                f"Verdict probing enabled on {self._vlm.model_name} "
+                f"(threshold {self._probe_threshold:.2f})."
+            )
+            return
+
+        message = (
+            f"{self._vlm.model_name} exposes no token probabilities; using "
+            f"generate-and-parse. Note this path defaults to 'no alert' on any "
+            f"answer it cannot recognise."
+        )
+        if self._probe_mode == "on":
+            logger.warning(message)
+        else:
+            logger.info(message)
+
+    def _probing_enabled(self) -> bool:
+        """Whether the next query should try the probe path."""
+        if self._probe_mode == "off" or self._probe_supported is False:
+            return False
+        return isinstance(self._vlm, BinaryProbeBackend)
+
+    def _disable_probing(self, reason: object) -> None:
+        """Stop probing for the rest of this session.
+
+        Called once, on the first backend refusal. The backend cannot start
+        supporting logprobs halfway through a run, so re-checking would only
+        buy a wasted round trip per verdict.
+        """
+        if self._probe_supported is False:
+            return
+
+        self._probe_supported = False
+        message = (
+            f"Verdict probing unavailable on {self._vlm.model_name}; using "
+            f"generate-and-parse for the rest of this session. ({reason})"
+        )
+        # 'on' is an explicit request for probing, so failing it is worth a
+        # warning. Under 'auto' the fallback is expected on two of the three
+        # backends and is merely informational.
+        if self._probe_mode == "on":
+            logger.warning(message)
+        else:
+            logger.info(message)
+
+    def _probe(self, handle: object, prompt: str) -> BinaryProbe:
+        """Probe one verdict under the same hard timeout as an answer."""
+        future = self._executor.submit(self._vlm.probe_binary, handle, prompt)  # type: ignore[attr-defined]
+        return future.result(timeout=self._inference_timeout_s)
+
+    def _probe_batch(
+        self, images: list[Image.Image], prompts: list[str]
+    ) -> list[BinaryProbe]:
+        """Probe a whole group under the scaled batch budget."""
+        budget = self._inference_timeout_s * (1 + 0.5 * (len(images) - 1))
+        future = self._executor.submit(
+            self._vlm.probe_binary_batch, images, prompts  # type: ignore[attr-defined]
+        )
+        return future.result(timeout=budget)
+
+    def _decide(self, handle: object, prompt: str) -> _Answer:
+        """Get one verdict, by whichever route this backend supports.
+
+        Probing asks the model for the single bit Stage 2 actually needs and
+        reads it off the distribution the prefill already produced. Generating
+        asks for prose and then guesses the bit back out of it — and the guess
+        has a failure mode measured on this project's own fixtures: Moondream
+        answers "Crouching" to "is this person bending over or crouching?",
+        which is plainly yes, and the parser's conservative default files it as
+        no-alert. A probe cannot produce that class of error, because it never
+        has to recognise the wording.
+
+        Raises:
+            concurrent.futures.TimeoutError: If inference exceeds the timeout.
+        """
+        if self._probing_enabled():
+            try:
+                probe = self._probe(handle, prompt)
+                self._verdicts_probed += 1
+                return _Answer(probe.verdict, probe.raw, probe.p_yes)
+            except ProbeUnsupportedError as exc:
+                # Fall through and answer this query the old way rather than
+                # dropping it — the transition itself should cost nothing.
+                self._disable_probing(exc)
+
+        raw = self._answer(handle, prompt)
+        return _Answer(self._verdict_parser.parse(raw), raw)
+
+    def _decide_batch(
+        self, images: list[Image.Image], prompts: list[str]
+    ) -> list[_Answer]:
+        """Get a whole group's verdicts, probed or parsed.
+
+        Mirrors :meth:`_decide` exactly, so batch size never changes which
+        decision rule is in force — only how many questions ride together.
+        """
+        if self._probing_enabled():
+            try:
+                probes = self._probe_batch(images, prompts)
+                self._verdicts_probed += len(probes)
+                return [_Answer(p.verdict, p.raw, p.p_yes) for p in probes]
+            except ProbeUnsupportedError as exc:
+                self._disable_probing(exc)
+
+        return [
+            _Answer(self._verdict_parser.parse(raw), raw)
+            for raw in self._infer_batch(images, prompts)
+        ]
 
     def _save_snapshot(self, image_bgr: np.ndarray) -> str | None:
         """Write an evidence JPEG for an alert.
@@ -994,11 +1364,29 @@ class VLMWorker:
                 continue
 
             for event, rules in pending:
-                cropped = downscale_for_vlm(
-                    crop_detection_focused(
-                        frame, event.bbox, self._crop_padding, self._focus_dim
-                    ),
-                    self._max_crop_edge,
+                # Nothing legible to answer about. Skipped rather than judged,
+                # and deliberately not remembered — the same person will be
+                # worth asking about once they are closer, and a memoised
+                # verdict here would suppress that question.
+                if self._too_small(frame.shape, event):
+                    self._instances_too_small += 1
+                    logger.debug(
+                        f"Skipping [{event.label}#{event.track_id}]: subject "
+                        f"under {self._min_subject_px} px."
+                    )
+                    continue
+
+                focused = crop_detection_focused(
+                    frame, event.bbox, self._crop_padding, self._focus_dim
+                )
+                # Letterboxing subsumes the max-edge cap: it already scales the
+                # long side to a fixed value, so nothing can reach the tiling
+                # cliff downscale_for_vlm exists to dodge. The old path stays
+                # for square_edge=0, which is how a deployment opts out.
+                cropped = (
+                    letterbox_square(focused, self._square_edge)
+                    if self._square_edge > 0
+                    else downscale_for_vlm(focused, self._max_crop_edge)
                 )
                 prepared.append(
                     (event, rules, cropped, self._is_new_subject(event.track_id))
@@ -1040,11 +1428,22 @@ class VLMWorker:
             # not against the queue as it looked when the batch began.
             prepared.sort(key=lambda item: (not item[3], -item[0].timestamp))
 
-            event, rules, cropped, _is_new = prepared.pop(0)
-            judged += 1
+            # One subject at a time unless batching is switched on. Taking
+            # the chunk after the sort keeps the priority rule intact: a chunk
+            # is the front of the queue, never an arbitrary slice of it.
+            take = min(self._batch_size, self._max_instances_per_batch - judged)
+            chunk = prepared[:take]
+            del prepared[:take]
+            judged += len(chunk)
 
             try:
-                if not self._judge_instance(event, rules, cropped, publisher):
+                if len(chunk) == 1:
+                    event, rules, cropped, _is_new = chunk[0]
+                    ok = self._judge_instance(event, rules, cropped, publisher)
+                else:
+                    ok = self._judge_chunk(chunk, publisher)
+
+                if not ok:
                     # A hung inference. The executor has a single worker and
                     # Moondream cannot be interrupted, so everything behind it
                     # would queue on a thread that is never coming back.
@@ -1091,14 +1490,19 @@ class VLMWorker:
     ) -> bool:
         """Ask every pending rule about one subject and publish the verdicts.
 
+        The unbatched path, and the default one. Encodes the crop once and
+        answers each rule against that embedding, which is strictly cheaper
+        than a batch of one and keeps the vision tower's output shared across
+        the subject's rules.
+
         Returns:
             False if an inference timed out and the batch should be abandoned.
         """
-        pil_image = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
-
-        # One evidence JPEG per subject, shared by every rule asked about them.
-        snapshot_path: str | None = None
-        snapshot_written = False
+        subject = _Subject(
+            event=event,
+            cropped=cropped,
+            image=Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)),
+        )
 
         self._instances_judged += 1
 
@@ -1109,7 +1513,7 @@ class VLMWorker:
         # image here and lose nothing.
         subject_start = time.monotonic()
         try:
-            handle = self._encode(pil_image)
+            handle = self._encode(subject.image)
         except FutureTimeoutError:
             self._triggers_timed_out += 1
             self._vlm.request_stop()
@@ -1131,7 +1535,6 @@ class VLMWorker:
         for rule in rules:
             prompt = rule["prompt"]
             rule_id = rule["rule_id"]
-            rule_name = rule.get("rule_name", "")
 
             logger.info(
                 f"VLM query: [{event.label}#{event.track_id}] "
@@ -1147,7 +1550,7 @@ class VLMWorker:
             work_start = subject_start if unbilled_encode_ms else start_time
             queued_ms = max(0.0, (work_start - event.timestamp) * 1000.0)
             try:
-                raw_response = self._answer(handle, prompt + VERDICT_SUFFIX)
+                answer = self._decide(handle, prompt + VERDICT_SUFFIX)
             except FutureTimeoutError:
                 self._triggers_timed_out += 1
                 # Ask the backend to abandon generation. Without this the
@@ -1168,57 +1571,211 @@ class VLMWorker:
             inference_ms = (time.monotonic() - start_time) * 1000.0 + unbilled_encode_ms
             unbilled_encode_ms = 0.0
 
-            latency_ms = queued_ms + inference_ms
-
-            self._last_inference_ms = inference_ms
-            self._inference_times.append(inference_ms)
-            self._queued_times.append(queued_ms)
-            self._latencies.append(latency_ms)
-
-            # Parse verdict
-            verdict = self._verdict_parser.parse(raw_response)
-            self._triggers_processed += 1
-
-            if verdict:
-                self._verdicts_positive += 1
-            else:
-                self._verdicts_negative += 1
-
-            self._remember_verdict(event, rule_id, verdict)
-
-            if not snapshot_written:
-                snapshot_path = self._save_snapshot(cropped)
-                snapshot_written = True
-
-            result = VLMResult(
-                query=VLMQuery(
-                    detection=event,
-                    rule_id=rule_id,
-                    rule_name=rule_name,
-                    prompt=prompt,
-                ),
-                verdict=verdict,
-                raw_response=raw_response,
-                inference_time_ms=inference_ms,
-                queued_ms=queued_ms,
-                latency_ms=latency_ms,
-                model_name=self._vlm.model_name,
-                snapshot_path=snapshot_path,
+            self._record_verdict(
+                subject, rule, answer, queued_ms, inference_ms, publisher
             )
-
-            verdict_str = "🔴 YES (VIOLATION)" if verdict else "🟢 NO (clear)"
-            logger.info(
-                f"VLM result: {verdict_str} | "
-                f"inference={inference_ms:.0f}ms | "
-                f"queued={queued_ms:.0f}ms | "
-                f"latency={latency_ms:.0f}ms | "
-                f"response='{raw_response[:100]}'"
-            )
-
-            # Hand off to the control plane (persist + broadcast + webhook)
-            publisher.publish("vlm_result", result.model_dump())
 
         return True
+
+    def _judge_chunk(
+        self,
+        chunk: list[tuple[DetectionEvent, list[dict], np.ndarray, bool]],
+        publisher: EventPublisher,
+    ) -> bool:
+        """Judge several subjects in one dispatch per distinct prompt.
+
+        Only reached when ``vlm_batch_size`` is above 1. Questions are grouped
+        by prompt text before dispatch, for a reason specific to how batching
+        is implemented: the backend left-pads every row to the longest prompt
+        in the batch, so a same-prompt group pads by zero and its inputs are
+        identical to what the sequential path would have built. Mixed prompts
+        still work, they simply spend compute on padding.
+
+        The trade this path accepts is the encode hoisting in
+        :meth:`_judge_instance`: a subject matched by two rules appears in two
+        prompt groups and has its crop encoded twice. With one rule per label,
+        which is the norm, nothing is lost.
+
+        Returns:
+            False if an inference timed out and the batch should be abandoned.
+        """
+        subjects = [
+            _Subject(
+                event=event,
+                cropped=cropped,
+                image=Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)),
+            )
+            for event, _rules, cropped, _is_new in chunk
+        ]
+        self._instances_judged += len(subjects)
+
+        groups: dict[str, list[tuple[_Subject, dict]]] = {}
+        for subject, (_event, rules, _cropped, _is_new) in zip(
+            subjects, chunk, strict=True
+        ):
+            for rule in rules:
+                groups.setdefault(rule["prompt"], []).append((subject, rule))
+
+        for prompt, units in groups.items():
+            logger.info(
+                f"VLM batch: {len(units)} subject(s) "
+                f"[{', '.join(f'{s.event.label}#{s.event.track_id}' for s, _ in units)}] "
+                f"'{prompt[:80]}'"
+            )
+
+            start_time = time.monotonic()
+            # One clock for the whole group. Every unit in it waited the same
+            # amount of time for the dispatch to begin.
+            queued = [
+                max(0.0, (start_time - subject.event.timestamp) * 1000.0)
+                for subject, _rule in units
+            ]
+
+            try:
+                answers = self._decide_batch(
+                    [subject.image for subject, _rule in units],
+                    [prompt + VERDICT_SUFFIX] * len(units),
+                )
+            except FutureTimeoutError:
+                # A batched timeout costs every subject in the group, not one.
+                # This is the reason vlm_batch_size defaults to 1 and the
+                # timeout budget scales with the batch.
+                self._triggers_timed_out += len(units)
+                self._vlm.request_stop()
+                logger.error(
+                    f"VLM batch of {len(units)} exceeded its budget; "
+                    f"abandoning the rest of the batch."
+                )
+                return False
+            except Exception as exc:
+                self._triggers_failed += len(units)
+                logger.error(f"VLM batch inference failed: {exc}")
+                continue
+
+            batch_ms = (time.monotonic() - start_time) * 1000.0
+            # Shared evenly so avg_inference_ms stays comparable to the
+            # sequential baseline. The batch is the honest unit of cost; per
+            # subject it is an average and nothing finer is knowable.
+            per_unit_ms = batch_ms / len(units)
+
+            if len(answers) != len(units):
+                self._triggers_failed += len(units)
+                logger.error(
+                    f"VLM batch returned {len(answers)} answer(s) for "
+                    f"{len(units)} question(s); discarding the group rather "
+                    f"than risk misattributing a verdict."
+                )
+                continue
+
+            for (subject, rule), answer, queued_ms in zip(
+                units, answers, queued, strict=True
+            ):
+                self._record_verdict(
+                    subject,
+                    rule,
+                    answer,
+                    queued_ms,
+                    per_unit_ms,
+                    publisher,
+                    # Not queued + per_unit: nothing in this group existed
+                    # until the whole dispatch returned.
+                    latency_ms=queued_ms + batch_ms,
+                )
+
+        return True
+
+    def _record_verdict(
+        self,
+        subject: _Subject,
+        rule: dict,
+        answer: _Answer,
+        queued_ms: float,
+        inference_ms: float,
+        publisher: EventPublisher,
+        latency_ms: float | None = None,
+    ) -> None:
+        """Remember one decided verdict and publish it.
+
+        The tail shared by the sequential and batched paths, and now by the
+        probed and parsed ones. All four must record a verdict identically —
+        the claim of every alternative path is that it changes only how the
+        answer was obtained, so the decision itself is made before this is
+        called and this does not know which route produced it.
+
+        Args:
+            subject: The cropped subject and its shared evidence JPEG.
+            rule: The rule this answer belongs to.
+            answer: The decided verdict, its text, and its confidence if known.
+            queued_ms: Frame timestamp to the start of the work.
+            inference_ms: Model time *charged* to this verdict. For a batch
+                this is the batch's cost divided by its size, which is the
+                only per-subject figure that means anything.
+            publisher: Where the verdict goes.
+            latency_ms: Capture to verdict, when it is not simply the sum of
+                the two above. A batched verdict is not available until the
+                whole batch finishes, so every subject in it waits the full
+                batch — amortizing that would understate the wait an operator
+                actually sits through by up to the batch size.
+        """
+        event = subject.event
+        if latency_ms is None:
+            latency_ms = queued_ms + inference_ms
+
+        self._last_inference_ms = inference_ms
+        self._inference_times.append(inference_ms)
+        self._queued_times.append(queued_ms)
+        self._latencies.append(latency_ms)
+
+        verdict = answer.verdict
+        raw_response = answer.raw
+        self._triggers_processed += 1
+
+        if verdict:
+            self._verdicts_positive += 1
+        else:
+            self._verdicts_negative += 1
+
+        self._remember_verdict(event, rule["rule_id"], verdict)
+
+        # One evidence JPEG per subject, shared by every rule asked about them.
+        if not subject.snapshot_written:
+            subject.snapshot_path = self._save_snapshot(subject.cropped)
+            subject.snapshot_written = True
+
+        result = VLMResult(
+            query=VLMQuery(
+                detection=event,
+                rule_id=rule["rule_id"],
+                rule_name=rule.get("rule_name", ""),
+                prompt=rule["prompt"],
+            ),
+            verdict=verdict,
+            raw_response=raw_response,
+            confidence=answer.confidence,
+            inference_time_ms=inference_ms,
+            queued_ms=queued_ms,
+            latency_ms=latency_ms,
+            model_name=self._vlm.model_name,
+            snapshot_path=subject.snapshot_path,
+        )
+
+        verdict_str = "🔴 YES (VIOLATION)" if verdict else "🟢 NO (clear)"
+        confidence_str = (
+            f" | p(yes)={answer.confidence:.2f}"
+            if answer.confidence is not None
+            else ""
+        )
+        logger.info(
+            f"VLM result: {verdict_str} | "
+            f"[{event.label}#{event.track_id}] | "
+            f"inference={inference_ms:.0f}ms | "
+            f"queued={queued_ms:.0f}ms | "
+            f"latency={latency_ms:.0f}ms{confidence_str} | "
+            f"response='{raw_response[:100]}'"
+        )
+
+        # Hand off to the control plane (persist + broadcast + webhook)
+        publisher.publish("vlm_result", result.model_dump())
 
     def __repr__(self) -> str:
         status = "running" if self.is_running else "stopped"
