@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Eye-Q — Technical Architecture Reference</title>
+<style>
+  @page { size: A4; margin: 15mm 16mm 13mm 16mm; }
+
+  :root {
+    --ink:    #17181c;
+    --body:   #26282e;
+    --muted:  #6a707a;
+    --rule:   #d4d6da;
+    --hair:   #e6e7ea;
+    --accent: #c2410c;
+    --wash:   #f6f6f7;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  body {
+    margin: 0;
+    font-family: Charter, "Bitstream Charter", Georgia, "Times New Roman", serif;
+    font-size: 8.8pt;
+    line-height: 1.40;
+    color: var(--body);
+    background: #fff;
+  }
+
+  .sheet { break-after: page; }
+  .sheet:last-child { break-after: auto; }
+
+  /* ── Typography ───────────────────────────────────────────── */
+
+  h1, h2, h3, .eyebrow, th, figcaption, .tag {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+
+  .eyebrow {
+    font-size: 7.6pt; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; margin: 0 0 4mm;
+  }
+
+  h1 {
+    font-size: 27pt; line-height: 1.02; letter-spacing: -0.022em;
+    color: var(--ink); font-weight: 700; margin: 0 0 3mm;
+  }
+
+  .standfirst {
+    font-size: 11pt; line-height: 1.34; color: var(--ink);
+    margin: 0 0 4mm; max-width: 150mm; font-weight: 400;
+  }
+
+  .meta {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 7.8pt; color: var(--muted);
+    border-top: 0.5pt solid var(--rule); border-bottom: 0.5pt solid var(--rule);
+    padding: 1.8mm 0; margin: 0 0 5mm;
+  }
+
+  h2 {
+    font-size: 13pt; letter-spacing: -0.012em; color: var(--ink);
+    font-weight: 700; margin: 0 0 2.5mm;
+    padding-bottom: 1.6mm; border-bottom: 1pt solid var(--ink);
+  }
+  h2 .num { color: var(--accent); margin-right: 2.2mm; }
+
+  h3 {
+    font-size: 9.2pt; color: var(--ink); font-weight: 700;
+    margin: 3mm 0 1.2mm; letter-spacing: 0.002em;
+  }
+
+  p { margin: 0 0 2.2mm; }
+  p.lead { font-size: 10pt; color: var(--ink); }
+  .abstract p { text-align: justify; hyphens: auto; }
+
+  code, .mono {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 8.1pt; color: var(--ink);
+  }
+  em.term { font-style: italic; color: var(--ink); }
+  strong { color: var(--ink); font-weight: 700; }
+
+  /* ── Figures ──────────────────────────────────────────────── */
+
+  figure { margin: 0 0 2.5mm; break-inside: avoid; }
+  figure svg { width: 100%; height: auto; display: block; margin: 0 auto; }
+  figure.tight svg { width: 95%; }
+  figcaption {
+    font-size: 7.9pt; line-height: 1.4; color: var(--muted);
+    border-top: 0.5pt solid var(--rule); margin-top: 1.8mm; padding-top: 1.5mm;
+  }
+  figcaption b { color: var(--ink); font-weight: 600; }
+
+  /* ── Tables ───────────────────────────────────────────────── */
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 0 0 2.5mm;
+    font-size: 7.9pt; line-height: 1.30; break-inside: avoid;
+  }
+  th {
+    text-align: left; font-size: 7.2pt; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+    border-bottom: 0.9pt solid var(--ink); padding: 0 2.5mm 1.2mm 0;
+  }
+  td { padding: 1.2mm 2.5mm 1.2mm 0; border-bottom: 0.4pt solid var(--hair);
+       vertical-align: top; }
+  td:last-child, th:last-child { padding-right: 0; }
+  tr:last-child td { border-bottom: none; }
+  td .mono, td code { font-size: 7.6pt; color: var(--muted); }
+  .k { color: var(--ink); font-weight: 600; white-space: nowrap; }
+
+  /* ── Blocks ───────────────────────────────────────────────── */
+
+  .glance { background: var(--wash); padding: 3mm 4mm 1.5mm; margin: 0 0 4mm; }
+  .glance table { margin: 0; font-size: 8.4pt; }
+  .glance td:first-child { width: 34mm; }
+
+  .note {
+    border-left: 1.6pt solid var(--accent); padding: 0.5mm 0 0.5mm 4mm;
+    margin: 0 0 3.5mm; font-size: 8.6pt; color: var(--muted);
+  }
+  .note b { color: var(--ink); }
+
+  .cols2 { column-count: 2; column-gap: 8mm; }
+  .cols2 p { margin-bottom: 2.2mm; }
+
+  .colophon {
+    margin-top: 2.5mm; padding-top: 2.5mm; border-top: 0.5pt solid var(--rule);
+    font-size: 7.5pt; line-height: 1.38; color: var(--muted);
+  }
+  .colophon b { color: var(--ink); }
+
+  .footline {
+    font-size: 7.2pt; color: var(--muted); letter-spacing: 0.05em;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    border-top: 0.5pt solid var(--rule); padding-top: 1.5mm; margin-top: 2mm;
+    display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════ PAGE 1 — ABSTRACT ══════════════════ -->
+<section class="sheet">
+
+  <p class="eyebrow">Technical Architecture Reference</p>
+  <h1>Eye-Q</h1>
+  <p class="standfirst">An open-vocabulary vision–language retrofit appliance that turns
+  conventional IP cameras into cameras you can ask questions of, in plain English, with no
+  model training and no cloud.</p>
+
+  <p class="meta">Revision e57a6dd &nbsp;·&nbsp; branch feat/per-subject-tracking-and-vlm-load-control
+  &nbsp;·&nbsp; 21 August 2026 &nbsp;·&nbsp; 8,793 LOC application / 3,790 LOC tests</p>
+
+  <div class="abstract">
+  <h2><span class="num">§0</span>Abstract</h2>
+
+  <p class="lead">Conventional IP cameras detect motion; they cannot answer questions. Retrofitting
+  semantic alerting onto them normally means training a bespoke detector for every condition — a
+  hard-hat model, a spill model, a blocked-exit model — putting each new question behind its own
+  labelling cycle. Eye-Q removes that cycle: an operator types the condition as a sentence,
+  <em class="term">“Is this person bending over?”</em>, and a vision–language model answers it per
+  subject, per frame, with no training and nothing leaving the device.</p>
+
+  <p>The problem this creates is arithmetic. A VLM able to answer an arbitrary question about an
+  image costs <em class="term">seconds</em> per query on edge CPUs, while a camera delivers thirty
+  frames a second. Eye-Q resolves the mismatch with a two-stage cascade that arbitrages three orders
+  of magnitude of latency: YOLOv8n runs continuously at 2–4 ms per frame and does nothing but decide
+  when reasoning is worth paying for; Moondream2 wakes only for the subjects that survive that gate.
+  Between them sits a zero-copy shared-memory ring whose readers are lock-free and stale-tolerant,
+  so the slow stage can lag seconds behind live without the fast stage ever blocking.</p>
+
+  <p>The substance lies after the gate. Stage 1 assigns every detection a stable identity, so a
+  frame of five workers yields five judgements rather than one — which multiplies inference demand
+  by the size of the crowd and must therefore be paid for. Stage 2 pays with four ordered layers of
+  load control — coalescing superseded triggers, memoising each subject’s verdict, prioritising
+  subjects never yet seen, truncating the batch — all governed by one formula an operator can reason
+  about: <code>duty = subjects × inference_s ÷ ttl</code>. Correctness measures carry equal weight:
+  each crop is dimmed outside the subject’s own box so a neighbour cannot flip its verdict, and
+  every crop is taken <em class="term">before</em> the first slow inference, so inference latency can
+  never outlive the buffer it depends on.</p>
+  </div>
+
+  <div class="glance">
+  <table>
+    <tr><td class="k">Purpose</td><td>Plain-English alert rules over existing RTSP / USB / file sources; no per-condition training</td></tr>
+    <tr><td class="k">Topology</td><td>One Python 3.13 process — four daemon threads plus an asyncio control plane</td></tr>
+    <tr><td class="k">Two stages</td><td>YOLOv8n at ~2–4 ms/frame gates Moondream2 1.86 B at ~5.6 s/query (measured, Apple-Silicon CPU)</td></tr>
+    <tr><td class="k">Transport</td><td>ZeroMQ PUB/SUB, two endpoints — <code>:5557</code> detections, <code>:5558</code> verdicts</td></tr>
+    <tr><td class="k">Frame store</td><td>POSIX shared-memory ring — 150 slots, 414.7 MB at 1280×720, lock-free readers</td></tr>
+    <tr><td class="k">Control plane</td><td>FastAPI + uvicorn, 17 routes, MJPEG preview, WebSocket broadcast; SQLite in WAL mode</td></tr>
+    <tr><td class="k">Cloud dependency</td><td>None — all three VLM backends execute locally</td></tr>
+    <tr><td class="k">Test suite</td><td>268 collected; 265 pass, 3 deselected as slow (23.1 s)</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+  <b>Scope and method.</b> Written against a complete read of the source at <code>e57a6dd</code>,
+  with every file reference re-verified against the working tree. The seven diagram subjects
+  originally scoped are consolidated into four figures to fit this format — deployment topology is
+  carried by the process boundary in Figure 1, module and data-flow views fold into Figure 2, and
+  the component inventory is given as tables. Claims the source could not substantiate are omitted;
+  see the colophon on page 4.
+  </div>
+
+  <div class="footline"><span>Eye-Q — Technical Architecture Reference</span><span>Page 1 of 4</span></div>
+</section>
+
+<!-- ══════════════════ PAGE 2 — ARCHITECTURE ══════════════════ -->
+<section class="sheet">
+
+  <h2><span class="num">§1</span>System architecture</h2>
+
+  <figure class="tight">
+    {{FIG_1}}
+    <figcaption><b>Figure 1 — System architecture.</b> One OS process. Capture writes into a
+    shared-memory ring; Stage 1 reads the newest frame and decides only whether reasoning is
+    warranted; Stage 2 wakes on that decision and fetches the pixels back by timestamp. The gate is
+    drawn twice because <i>what to wake</i> and <i>what to ask</i> are separate concerns.</figcaption>
+  </figure>
+
+  <h3>1.1 &nbsp;One process, four unequal threads</h3>
+  <p>Everything runs in one process because of the ring buffer: a shared-memory frame store removes
+  copies only if consumers reach it without serialising, and keeping both stages as threads in the
+  owning process makes that free. The segments are nonetheless <em class="term">named</em> POSIX
+  objects, so the multi-process seam exists when wanted. The threads are deliberately unequal —
+  capture writes into a ring that overwrites rather than fills, Stage 1 is paced independently of
+  capture because otherwise it starves the stage it exists to feed, and Stage 2 is kept entirely off
+  the frame path.</p>
+
+  <table>
+    <tr><th style="width:28mm">Thread</th><th style="width:44mm">Owns</th><th style="width:28mm">Cadence</th><th>Under failure</th></tr>
+    <tr><td class="k">uvicorn loop</td><td>Routes, <code>AlertSink</code>, WebSocket fan-out</td><td>request-driven</td><td>A malformed verdict is logged; the sink survives. JPEG encoding runs off-thread.</td></tr>
+    <tr><td class="k">VideoCapture</td><td><code>cv2.VideoCapture</code>, ring writes</td><td><code>target_fps</code> or the file’s own FPS</td><td>Backoff 1 → 30 s over five attempts; files loop seamlessly.</td></tr>
+    <tr><td class="k">YOLOWatchdog</td><td>Model, tracker, cooldown gate, overlay ring</td><td><code>watchdog_fps</code>, apart from capture</td><td>Warm-up failure falls back to CPU; repeated frames skipped by timestamp.</td></tr>
+    <tr><td class="k">VLMWorker</td><td>Backend, verdict memo, both its ZMQ sockets</td><td>trigger-driven, 1 s idle poll</td><td>A blown timeout abandons the batch — one executor worker, so a hang blocks it.</td></tr>
+    <tr><td class="k">VLMInfer pool</td><td>One in-flight inference</td><td>serial by design</td><td><code>future.result(timeout)</code> bounds the query and fails fast.</td></tr>
+  </table>
+
+  <h3>1.2 &nbsp;Two transport planes, single ownership</h3>
+  <p>Detections travel on <code>:5557</code>, verdicts return on <code>:5558</code>. The split is
+  not tidiness — ZeroMQ sockets are not thread-safe, so each publisher owns its socket in the thread
+  that created it, and Stage 2 builds both of its own inside its worker loop. Sends are non-blocking
+  behind a high-water mark: a slow consumer drops messages rather than stalling a producer. Ownership
+  is likewise singular — the FastAPI lifespan builds every component in dependency order and tears it
+  down in reverse, the fix for a defect where split ownership let the lifespan overwrite
+  already-wired components and silently sever rule delivery to the VLM.</p>
+
+  <div class="footline"><span>§1 &nbsp;System architecture</span><span>Page 2 of 4</span></div>
+</section>
+
+<!-- ══════════════════ PAGE 3 — WORKFLOW & AI ══════════════════ -->
+<section class="sheet">
+
+  <h2><span class="num">§2</span>End-to-end workflow and data flow</h2>
+
+  <figure class="tight">
+    {{FIG_2}}
+    <figcaption><b>Figure 2 — From frame to alert.</b> Six stages and the three places a result
+    lands. The return path is load-bearing: Stage 2 fetches the frame back out of the ring rather
+    than carrying pixels forward, so the crop must finish before the ring wraps.</figcaption>
+  </figure>
+
+  <p>Two invariants govern this path, each found by fixing the failure its absence causes.
+  <strong>Crop before inference:</strong> inference takes seconds and the ring holds seconds, so
+  fetching a frame just before each query leaves the second subject in a group with its frame already
+  overwritten — invisible in a one-subject scene, total in a crowded one.
+  <strong>Coalesce by subject, not label:</strong> keeping only the newest trigger per class discards
+  four of five workers as “superseded” when they are different people. Rules flow the other way:
+  <code>sync_rules()</code> hands Stage 1 the <em class="term">coarsest</em> filter satisfying every
+  rule.</p>
+
+  <h2 style="margin-top:5mm"><span class="num">§3</span>The AI/ML layer</h2>
+
+  <figure class="tight">
+    {{FIG_3}}
+    <figcaption><b>Figure 3 — The Stage 2 decision path.</b> The left half decides whether a
+    question is worth asking and runs before any pixels are touched; the memo there is the
+    load control. Two contracts bind the language surface: “Yes” means violation, so prompts must be
+    phrased that way round, and each rule asks a single predicate.</figcaption>
+  </figure>
+
+  <p>Stage 1 is the motion filter, not the classifier: YOLOv8n can only ever say
+  <em class="term">“person”</em> about a warehouse worker, and every question worth asking is asked
+  by Stage 2 in English. Identity must be resolved before the gate can work, and is — a greedy IoU
+  tracker matches boxes within a label across frames, chosen over ByteTrack because Ultralytics
+  resolves its <code>lap</code> dependency at import time by attempting a runtime
+  <code>pip install</code>, a hard failure offline. A swap under occlusion costs one redundant
+  inference, never a missed alert.</p>
+
+  <div class="footline"><span>§2–§3 &nbsp;Workflow and the AI/ML layer</span><span>Page 3 of 4</span></div>
+</section>
+
+<!-- ══════════════════ PAGE 4 — INNOVATION & LIMITS ══════════════════ -->
+<section class="sheet">
+
+  <h2><span class="num">§4</span>Innovation — what is genuinely hard here</h2>
+
+  <figure class="tight">
+    {{FIG_4}}
+    <figcaption><b>Figure 4 — The twelve strongest ideas in the codebase,</b> grouped by the kind of
+    win each buys and tagged with its source. Every one is running code at this revision.</figcaption>
+  </figure>
+
+  <p>Two carry disproportionate weight. <strong>Four-layer load control with a published
+  formula</strong> is what makes per-subject judging affordable rather than merely correct, and the
+  status endpoint exposes <code>instances_judged</code>, <code>instances_memoised</code> and
+  <code>instances_shed</code> so the arithmetic can be checked against reality.
+  <strong>Focused crops</strong> are the subtlest: the padding that lets a VLM answer relational
+  questions at all is the same padding that drags in the neighbours.</p>
+
+  <h2 style="margin-top:3mm"><span class="num">§5</span>Deployment and security posture</h2>
+
+  <table>
+    <tr><th style="width:30mm">Concern</th><th>Position at this revision</th></tr>
+    <tr><td class="k">Runtime</td><td><code>uv sync</code>, Python ≥ 3.13, one uvicorn process; weights fetched on first run. The device is probed MPS → CUDA → CPU <em>functionally</em> rather than by capability flag, because the flag lies, and the VLM defaults to CPU on measurement: 5.6 s against 6.1 s on MPS.</td></tr>
+    <tr><td class="k">VLM backends</td><td>Three behind one <code>Protocol</code>, one variable apart: <code>moondream</code> in-process (default), <code>transformers</code> interruptible, <code>openai_compat</code> to a local llama.cpp / Ollama server.</td></tr>
+    <tr><td class="k">Edge profile</td><td><code>.env.pi5</code> targets an 8 GB ARM board: <code>openai_compat</code>, 960×540, watchdog 4 FPS, 900 s TTL, batch 1 — ~3 GB of 8. <b>Unverified on hardware.</b></td></tr>
+    <tr><td class="k">Network posture</td><td>No egress by default; the opt-in webhook is the only outbound path. <b>No authentication</b> — CORS <code>*</code>, bind <code>0.0.0.0:8000</code>, every mutating endpoint open. Trusted-LAN only.</td></tr>
+  </table>
+
+  <h2 style="margin-top:2.5mm"><span class="num">§6</span>Limitations</h2>
+
+  <table>
+    <tr><th style="width:46mm">Gap</th><th style="width:17mm">Severity</th><th>Consequence</th></tr>
+    <tr><td class="k">No authentication or TLS</td><td>High</td><td>Anyone on the network can watch the feed, rewrite rules and read evidence.</td></tr>
+    <tr><td class="k">No data retention policy</td><td>High</td><td><code>alerts</code> rows and snapshot JPEGs grow unbounded; only in-memory state is pruned.</td></tr>
+    <tr><td class="k">Single camera; dashboard on public CDNs</td><td>Medium</td><td>One capture though the schema is multi-camera; Tailwind and fonts load remotely, so the UI is not air-gap clean.</td></tr>
+    <tr><td class="k">No motion model; fire-and-forget webhooks; no ROI editor; dead surface</td><td>Low</td><td>~2 ids per person at 6 FPS — redundant inferences, never missed alerts. No webhook retry; <code>roi_json</code> undrawable; <code>SystemStatus</code> and <code>parse_with_confidence()</code> unused.</td></tr>
+  </table>
+
+  <div class="colophon">
+  <b>Colophon and method.</b> Written against a full read of the source at <code>e57a6dd</code>, with
+  every file reference re-verified against the working tree; the test figure is the actual output of
+  <code>pytest -q -m "not slow"</code> — 265 passed, 3 deselected, 23.1 s. Figures are hand-authored
+  vector SVG, generated by <code>docs/diagrams/build.py</code> and inlined.
+  <b>Claims omitted:</b> the README states Stage 1 “filters 99%+ of frames” and that VLM utilisation
+  drops “from 100% to &lt;1%”; neither is measured anywhere in the repository, so neither appears here
+  — §4’s duty-cycle arithmetic is what the code implements, and where the README rounds the ring to
+  “~405 MB” this uses the computed 414.7 MB. Two drifts noted: <code>demo_cctv.py</code> carries an
+  uncommitted change contradicting its own docstring’s filename, and the pytest cache still lists a
+  removed test file — hence 268 collected, not 311.
+  </div>
+
+  <div class="footline"><span>§4–§6 &nbsp;Innovation, deployment, limitations</span><span>Page 4 of 4</span></div>
+</section>
+
+</body>
+</html>

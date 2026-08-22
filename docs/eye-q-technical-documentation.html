@@ -1,0 +1,791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Eye-Q — Technical Architecture Reference</title>
+<style>
+  @page { size: A4; margin: 15mm 16mm 13mm 16mm; }
+
+  :root {
+    --ink:    #17181c;
+    --body:   #26282e;
+    --muted:  #6a707a;
+    --rule:   #d4d6da;
+    --hair:   #e6e7ea;
+    --accent: #c2410c;
+    --wash:   #f6f6f7;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  body {
+    margin: 0;
+    font-family: Charter, "Bitstream Charter", Georgia, "Times New Roman", serif;
+    font-size: 8.8pt;
+    line-height: 1.40;
+    color: var(--body);
+    background: #fff;
+  }
+
+  .sheet { break-after: page; }
+  .sheet:last-child { break-after: auto; }
+
+  /* ── Typography ───────────────────────────────────────────── */
+
+  h1, h2, h3, .eyebrow, th, figcaption, .tag {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+
+  .eyebrow {
+    font-size: 7.6pt; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; margin: 0 0 4mm;
+  }
+
+  h1 {
+    font-size: 27pt; line-height: 1.02; letter-spacing: -0.022em;
+    color: var(--ink); font-weight: 700; margin: 0 0 3mm;
+  }
+
+  .standfirst {
+    font-size: 11pt; line-height: 1.34; color: var(--ink);
+    margin: 0 0 4mm; max-width: 150mm; font-weight: 400;
+  }
+
+  .meta {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 7.8pt; color: var(--muted);
+    border-top: 0.5pt solid var(--rule); border-bottom: 0.5pt solid var(--rule);
+    padding: 1.8mm 0; margin: 0 0 5mm;
+  }
+
+  h2 {
+    font-size: 13pt; letter-spacing: -0.012em; color: var(--ink);
+    font-weight: 700; margin: 0 0 2.5mm;
+    padding-bottom: 1.6mm; border-bottom: 1pt solid var(--ink);
+  }
+  h2 .num { color: var(--accent); margin-right: 2.2mm; }
+
+  h3 {
+    font-size: 9.2pt; color: var(--ink); font-weight: 700;
+    margin: 3mm 0 1.2mm; letter-spacing: 0.002em;
+  }
+
+  p { margin: 0 0 2.2mm; }
+  p.lead { font-size: 10pt; color: var(--ink); }
+  .abstract p { text-align: justify; hyphens: auto; }
+
+  code, .mono {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 8.1pt; color: var(--ink);
+  }
+  em.term { font-style: italic; color: var(--ink); }
+  strong { color: var(--ink); font-weight: 700; }
+
+  /* ── Figures ──────────────────────────────────────────────── */
+
+  figure { margin: 0 0 2.5mm; break-inside: avoid; }
+  figure svg { width: 100%; height: auto; display: block; margin: 0 auto; }
+  figure.tight svg { width: 95%; }
+  figcaption {
+    font-size: 7.9pt; line-height: 1.4; color: var(--muted);
+    border-top: 0.5pt solid var(--rule); margin-top: 1.8mm; padding-top: 1.5mm;
+  }
+  figcaption b { color: var(--ink); font-weight: 600; }
+
+  /* ── Tables ───────────────────────────────────────────────── */
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 0 0 2.5mm;
+    font-size: 7.9pt; line-height: 1.30; break-inside: avoid;
+  }
+  th {
+    text-align: left; font-size: 7.2pt; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+    border-bottom: 0.9pt solid var(--ink); padding: 0 2.5mm 1.2mm 0;
+  }
+  td { padding: 1.2mm 2.5mm 1.2mm 0; border-bottom: 0.4pt solid var(--hair);
+       vertical-align: top; }
+  td:last-child, th:last-child { padding-right: 0; }
+  tr:last-child td { border-bottom: none; }
+  td .mono, td code { font-size: 7.6pt; color: var(--muted); }
+  .k { color: var(--ink); font-weight: 600; white-space: nowrap; }
+
+  /* ── Blocks ───────────────────────────────────────────────── */
+
+  .glance { background: var(--wash); padding: 3mm 4mm 1.5mm; margin: 0 0 4mm; }
+  .glance table { margin: 0; font-size: 8.4pt; }
+  .glance td:first-child { width: 34mm; }
+
+  .note {
+    border-left: 1.6pt solid var(--accent); padding: 0.5mm 0 0.5mm 4mm;
+    margin: 0 0 3.5mm; font-size: 8.6pt; color: var(--muted);
+  }
+  .note b { color: var(--ink); }
+
+  .cols2 { column-count: 2; column-gap: 8mm; }
+  .cols2 p { margin-bottom: 2.2mm; }
+
+  .colophon {
+    margin-top: 2.5mm; padding-top: 2.5mm; border-top: 0.5pt solid var(--rule);
+    font-size: 7.5pt; line-height: 1.38; color: var(--muted);
+  }
+  .colophon b { color: var(--ink); }
+
+  .footline {
+    font-size: 7.2pt; color: var(--muted); letter-spacing: 0.05em;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    border-top: 0.5pt solid var(--rule); padding-top: 1.5mm; margin-top: 2mm;
+    display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════ PAGE 1 — ABSTRACT ══════════════════ -->
+<section class="sheet">
+
+  <p class="eyebrow">Technical Architecture Reference</p>
+  <h1>Eye-Q</h1>
+  <p class="standfirst">An open-vocabulary vision–language retrofit appliance that turns
+  conventional IP cameras into cameras you can ask questions of, in plain English, with no
+  model training and no cloud.</p>
+
+  <p class="meta">Revision e57a6dd &nbsp;·&nbsp; branch feat/per-subject-tracking-and-vlm-load-control
+  &nbsp;·&nbsp; 21 August 2026 &nbsp;·&nbsp; 8,793 LOC application / 3,790 LOC tests</p>
+
+  <div class="abstract">
+  <h2><span class="num">§0</span>Abstract</h2>
+
+  <p class="lead">Conventional IP cameras detect motion; they cannot answer questions. Retrofitting
+  semantic alerting onto them normally means training a bespoke detector for every condition — a
+  hard-hat model, a spill model, a blocked-exit model — putting each new question behind its own
+  labelling cycle. Eye-Q removes that cycle: an operator types the condition as a sentence,
+  <em class="term">“Is this person bending over?”</em>, and a vision–language model answers it per
+  subject, per frame, with no training and nothing leaving the device.</p>
+
+  <p>The problem this creates is arithmetic. A VLM able to answer an arbitrary question about an
+  image costs <em class="term">seconds</em> per query on edge CPUs, while a camera delivers thirty
+  frames a second. Eye-Q resolves the mismatch with a two-stage cascade that arbitrages three orders
+  of magnitude of latency: YOLOv8n runs continuously at 2–4 ms per frame and does nothing but decide
+  when reasoning is worth paying for; Moondream2 wakes only for the subjects that survive that gate.
+  Between them sits a zero-copy shared-memory ring whose readers are lock-free and stale-tolerant,
+  so the slow stage can lag seconds behind live without the fast stage ever blocking.</p>
+
+  <p>The substance lies after the gate. Stage 1 assigns every detection a stable identity, so a
+  frame of five workers yields five judgements rather than one — which multiplies inference demand
+  by the size of the crowd and must therefore be paid for. Stage 2 pays with four ordered layers of
+  load control — coalescing superseded triggers, memoising each subject’s verdict, prioritising
+  subjects never yet seen, truncating the batch — all governed by one formula an operator can reason
+  about: <code>duty = subjects × inference_s ÷ ttl</code>. Correctness measures carry equal weight:
+  each crop is dimmed outside the subject’s own box so a neighbour cannot flip its verdict, and
+  every crop is taken <em class="term">before</em> the first slow inference, so inference latency can
+  never outlive the buffer it depends on.</p>
+  </div>
+
+  <div class="glance">
+  <table>
+    <tr><td class="k">Purpose</td><td>Plain-English alert rules over existing RTSP / USB / file sources; no per-condition training</td></tr>
+    <tr><td class="k">Topology</td><td>One Python 3.13 process — four daemon threads plus an asyncio control plane</td></tr>
+    <tr><td class="k">Two stages</td><td>YOLOv8n at ~2–4 ms/frame gates Moondream2 1.86 B at ~5.6 s/query (measured, Apple-Silicon CPU)</td></tr>
+    <tr><td class="k">Transport</td><td>ZeroMQ PUB/SUB, two endpoints — <code>:5557</code> detections, <code>:5558</code> verdicts</td></tr>
+    <tr><td class="k">Frame store</td><td>POSIX shared-memory ring — 150 slots, 414.7 MB at 1280×720, lock-free readers</td></tr>
+    <tr><td class="k">Control plane</td><td>FastAPI + uvicorn, 17 routes, MJPEG preview, WebSocket broadcast; SQLite in WAL mode</td></tr>
+    <tr><td class="k">Cloud dependency</td><td>None — all three VLM backends execute locally</td></tr>
+    <tr><td class="k">Test suite</td><td>268 collected; 265 pass, 3 deselected as slow (23.1 s)</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+  <b>Scope and method.</b> Written against a complete read of the source at <code>e57a6dd</code>,
+  with every file reference re-verified against the working tree. The seven diagram subjects
+  originally scoped are consolidated into four figures to fit this format — deployment topology is
+  carried by the process boundary in Figure 1, module and data-flow views fold into Figure 2, and
+  the component inventory is given as tables. Claims the source could not substantiate are omitted;
+  see the colophon on page 4.
+  </div>
+
+  <div class="footline"><span>Eye-Q — Technical Architecture Reference</span><span>Page 1 of 4</span></div>
+</section>
+
+<!-- ══════════════════ PAGE 2 — ARCHITECTURE ══════════════════ -->
+<section class="sheet">
+
+  <h2><span class="num">§1</span>System architecture</h2>
+
+  <figure class="tight">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 600" role="img">
+<rect width="940" height="600" fill="#ffffff"/>
+<path d="M335.4,68.2C328.0,98.9 322.7,126.4 299.4,206.9" fill="none" stroke="#6b7280" stroke-width="1.00" stroke-linecap="round" stroke-dasharray="6 5"/>
+<rect x="150.0" y="6.0" width="372.0" height="63.0" rx="5.0" fill="#ffffff"/>
+<path d="M155.1,6.3C197.3,4.7 240.5,4.4 516.9,6.6M516.9,5.9C517.7,7.0 519.7,8.1 522.3,11.0M522.9,11.9C524.0,23.4 523.4,37.3 521.3,63.9M522.2,64.1C520.3,65.1 519.2,66.9 517.2,69.2M516.8,69.4C426.6,70.9 336.9,69.8 155.3,69.2M155.2,69.1C153.6,67.8 152.5,66.5 149.9,64.2M150.7,64.2C148.7,50.4 148.1,36.9 149.3,10.1M150.2,11.1C150.5,10.1 151.7,9.7 155.0,6.1" fill="none" stroke="#6b7280" stroke-width="1.10" stroke-linecap="round" stroke-dasharray="7 5"/>
+<path d="M155.4,6.3C219.4,5.1 284.9,3.9 516.8,6.1M516.8,6.2C518.2,7.0 519.1,8.8 522.1,10.8M522.3,11.8C522.3,22.8 521.7,37.6 522.3,63.6M521.8,64.2C521.6,64.1 520.8,64.7 517.0,69.1M516.5,68.5C412.9,71.4 310.5,70.5 154.5,69.1M155.0,69.2C153.2,67.2 152.2,66.1 149.9,64.1M149.9,64.3C149.3,48.9 150.0,37.0 149.2,11.3M149.8,10.9C151.0,9.9 151.6,9.7 155.2,6.0" fill="none" stroke="#6b7280" stroke-width="0.79" stroke-linecap="round" stroke-dasharray="7 5"/>
+<text x="159.0" y="25.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="159.0" dy="0.0">Frames keep arriving while the VLM thinks. The ring holds ~5 s of</tspan><tspan x="159.0" dy="16.2">history, so Stage 2 can lag seconds behind live without the</tspan><tspan x="159.0" dy="16.2">pipeline ever dropping a frame.</tspan></text>
+<rect x="26.0" y="78.0" width="650.0" height="400.0" rx="14.0" fill="#00000008"/>
+<path d="M39.5,78.3C161.8,74.9 284.6,74.9 661.5,77.4M661.8,78.5C663.9,81.8 668.4,82.4 676.1,92.0M676.4,91.6C678.4,167.7 677.1,245.8 676.6,463.6M676.5,463.8C673.7,466.0 673.1,469.4 662.6,477.2M661.5,477.8C510.1,481.9 359.1,480.3 39.9,478.4M40.2,477.9C36.5,473.7 32.7,471.6 25.9,463.9M26.5,464.3C24.6,395.2 24.0,325.3 25.5,91.5M26.5,92.5C28.6,88.5 29.0,88.8 39.9,78.8" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M40.3,78.4C132.6,75.3 223.5,74.8 662.5,77.9M662.7,77.6C664.7,79.1 667.8,82.6 676.6,92.8M675.9,92.1C678.8,166.2 677.4,238.0 675.5,463.8M676.7,464.5C672.9,468.0 670.0,471.2 661.9,477.8M661.6,478.1C534.7,480.6 407.8,481.4 40.2,478.6M40.3,477.7C37.5,477.2 35.6,474.1 26.1,463.5M26.2,463.6C24.0,375.7 23.6,285.2 25.8,91.5M26.4,91.5C27.1,91.0 28.9,89.1 40.4,78.4" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="44.0" y="100.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="44.0" dy="0.0">Eye-Q appliance — one Python process</tspan></text>
+<rect x="42.0" y="200.0" width="92.0" height="100.0" rx="8.0" fill="#ffffff"/>
+<path d="M50.4,199.2C56.8,199.8 67.0,200.5 125.4,200.5M125.8,200.1C128.2,200.8 128.3,203.4 134.0,208.1M134.0,208.8C135.6,220.3 135.6,232.0 133.7,291.5M133.6,291.8C132.5,293.0 131.1,294.4 125.8,300.1M126.0,300.9C117.6,301.8 108.5,302.2 49.0,299.4M49.9,299.7C49.1,298.2 48.3,297.2 42.2,292.0M42.1,292.4C42.1,274.8 42.0,258.6 41.8,207.3M42.0,208.1C43.5,206.3 45.5,204.4 50.4,200.5" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M50.6,200.1C62.9,200.8 74.5,199.2 125.8,200.8M126.2,200.3C127.2,201.2 129.1,202.9 134.3,208.0M134.2,208.8C133.5,224.8 133.6,246.5 134.7,292.0M133.6,292.3C133.6,292.9 132.7,294.1 125.8,300.4M126.4,300.8C116.5,301.4 107.3,301.2 50.2,300.6M50.0,299.9C48.9,298.7 47.4,297.0 41.7,291.7M41.3,291.2C41.1,269.3 40.5,249.2 41.6,207.4M41.6,208.3C44.6,205.7 46.6,202.9 49.6,199.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<rect x="64.0" y="220.0" width="34.5" height="17.2" rx="3.0" fill="#ffffff"/>
+<path d="M66.2,220.5C70.7,219.8 72.1,220.7 95.5,220.2M95.4,220.0C96.4,221.1 97.0,221.6 98.7,223.0M98.7,223.5C97.7,225.3 99.4,226.2 98.8,233.8M98.5,234.1C97.7,234.9 97.0,235.6 95.3,237.3M96.3,237.9C89.0,237.2 85.5,236.2 68.0,237.4M67.1,237.1C66.3,236.5 65.2,235.5 64.1,234.4M63.7,234.0C64.5,231.5 64.7,228.3 64.2,223.4M64.0,223.0C64.7,222.0 65.3,221.3 66.9,220.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M66.7,219.5C73.1,219.0 78.0,219.1 95.1,220.7M95.4,220.1C96.0,220.7 96.5,221.2 98.4,222.9M99.0,223.2C98.1,224.7 98.7,225.9 98.8,234.1M98.6,234.1C98.1,234.3 98.1,235.1 95.4,237.3M95.0,236.4C92.0,236.5 89.8,236.3 66.2,236.3M67.0,237.3C66.1,236.1 65.2,235.6 64.2,234.2M63.7,234.7C64.1,230.6 64.3,227.7 63.8,222.5M63.9,223.0C64.7,222.4 65.2,221.7 67.2,220.0" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<path d="M97.9,224.2C99.9,224.9 104.3,223.9 109.6,220.7" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M98.8,224.7C101.9,222.9 104.6,222.0 110.2,220.5" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M110.7,221.0C109.6,224.4 109.7,230.8 109.6,236.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M109.8,221.0C110.8,224.3 111.4,228.3 109.1,235.2" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M109.9,236.3C109.1,235.9 107.4,235.0 98.8,232.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M110.4,236.0C107.1,234.2 104.9,235.3 98.6,232.0" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M78.1,237.7C77.6,238.2 77.4,240.5 77.6,246.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M77.5,237.1C77.8,240.0 77.6,241.3 77.6,246.0" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M68.4,246.4C73.5,246.9 76.4,244.9 87.0,246.5" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M69.5,246.9C71.4,246.9 77.3,246.4 86.8,245.7" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<text x="88.0" y="282.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="88.0" dy="0.0">Camera</tspan></text>
+<text x="88.0" y="294.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="88.0" dy="0.0">RTSP · file · USB</tspan></text>
+<text x="276.0" y="198.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="276.0" dy="0.0">Ring buffer — POSIX shared memory</tspan></text>
+<rect x="152.0" y="210.0" width="35.5" height="48.0" rx="4.0" fill="#ffffff"/>
+<path d="M156.0,210.1C164.5,210.2 173.6,211.3 182.8,209.7M183.6,209.8C183.8,210.7 184.1,211.2 187.6,214.1M188.3,213.9C188.0,220.9 189.1,230.4 187.1,254.1M187.3,254.0C186.3,254.6 185.5,256.2 183.6,257.8M183.8,258.8C180.6,257.3 174.8,257.1 154.9,258.1M156.2,258.2C155.7,257.3 154.8,256.9 151.9,253.8M151.5,253.2C152.4,248.0 152.3,243.4 152.9,214.5M152.1,214.0C153.0,213.1 153.8,212.5 156.1,210.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M155.3,210.6C160.8,208.5 162.2,208.4 183.2,210.6M183.4,209.9C183.7,210.7 184.2,210.4 187.4,213.9M188.0,213.8C188.1,223.5 187.3,232.4 186.8,254.3M187.6,254.2C186.5,254.5 186.0,256.0 183.3,257.8M184.2,257.5C176.2,258.0 169.9,257.1 156.4,258.7M156.0,258.2C154.7,257.2 153.8,255.7 151.8,253.9M151.6,253.1C150.2,242.3 150.3,232.3 152.8,214.2M151.9,214.2C153.0,212.7 154.2,212.0 155.8,209.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="169.8" y="238.5" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="169.8" dy="0.0">F1</tspan></text>
+<rect x="194.5" y="210.0" width="35.5" height="48.0" rx="4.0" fill="#ffffff"/>
+<path d="M199.4,210.4C202.5,208.2 209.0,209.6 226.2,210.1M226.0,210.1C226.6,210.6 228.2,211.7 229.8,214.1M229.7,214.5C231.9,222.5 229.5,229.0 229.9,254.4M229.9,254.0C229.5,254.6 228.4,255.6 225.8,257.8M226.3,258.4C224.1,258.8 219.6,258.3 198.1,257.7M198.5,257.9C198.0,257.5 197.3,257.1 194.6,254.0M194.8,254.3C195.4,243.7 195.5,232.9 194.9,213.3M194.4,214.1C194.7,213.6 195.5,212.9 198.3,210.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M198.1,210.3C204.9,209.7 213.6,209.3 225.9,209.9M226.0,210.0C226.4,210.8 227.8,211.8 229.9,214.2M230.3,213.3C229.2,223.3 231.7,231.6 229.1,254.8M230.1,253.8C229.7,255.1 228.9,255.1 226.0,257.8M225.8,258.1C222.1,257.3 216.3,258.7 199.5,257.1M198.5,257.9C197.8,257.2 197.3,257.0 194.5,254.0M193.7,253.2C195.5,243.5 195.2,234.8 193.9,214.4M194.5,214.0C195.0,212.9 196.4,212.1 198.6,210.0" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="212.2" y="238.5" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="212.2" dy="0.0">F2</tspan></text>
+<rect x="237.0" y="210.0" width="35.5" height="48.0" rx="4.0" fill="#ffffff"/>
+<path d="M241.1,210.0C246.4,211.2 256.3,211.3 268.1,210.9M268.5,210.1C269.6,211.2 270.7,212.0 272.5,214.0M271.9,214.7C272.5,222.9 271.1,233.4 273.5,253.2M272.4,253.9C272.0,254.2 271.1,254.9 268.3,257.9M269.2,258.1C261.8,257.7 252.8,256.6 241.9,257.9M240.9,257.9C240.7,257.1 239.9,257.0 236.8,254.0M237.9,253.7C237.5,242.3 235.3,232.5 236.8,213.6M236.9,214.1C238.3,213.0 239.2,211.9 241.0,209.8" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M241.0,210.8C249.7,208.1 253.8,210.6 268.6,211.0M268.4,210.2C269.4,210.9 269.8,211.3 272.5,214.0M272.9,213.1C274.6,223.8 274.2,236.7 273.4,255.0M272.4,254.1C272.0,254.4 271.8,254.8 268.4,258.1M268.4,258.2C265.2,258.5 260.4,256.7 240.9,257.1M241.1,258.1C240.1,257.7 240.0,257.3 237.0,254.0M237.3,254.7C236.7,246.1 237.7,242.2 237.8,213.8M236.9,214.2C238.2,212.9 239.0,212.2 241.1,209.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="254.8" y="238.5" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="254.8" dy="0.0">F3</tspan></text>
+<rect x="279.5" y="210.0" width="35.5" height="48.0" rx="4.0" fill="#ffffff"/>
+<path d="M282.7,210.2C289.6,211.2 295.3,211.0 309.9,210.8M310.9,209.9C312.0,210.2 311.8,210.8 314.8,214.0M314.7,214.4C316.8,222.0 316.8,232.2 315.4,253.4M314.8,254.1C314.2,254.9 313.4,255.9 311.1,258.1M311.2,257.9C306.8,258.9 302.0,259.5 282.9,258.2M283.5,258.1C282.5,256.6 281.2,256.2 279.6,254.1M279.5,254.2C280.6,246.7 280.4,238.5 279.5,213.7M279.4,213.9C280.5,213.3 281.2,212.2 283.5,210.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M283.2,209.7C288.7,210.9 297.5,208.4 311.7,210.4M311.1,210.0C312.2,210.7 312.9,212.5 315.1,214.1M314.5,214.7C314.4,218.5 314.7,222.9 315.5,253.5M314.8,253.9C314.3,255.3 312.7,255.8 311.0,258.0M310.3,258.2C302.5,257.2 295.3,259.9 284.5,258.7M283.7,258.1C283.1,257.6 281.8,256.3 279.7,253.9M278.9,253.9C279.8,243.4 280.4,235.5 280.1,214.8M279.6,214.1C280.3,213.0 281.2,212.2 283.3,210.0" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="297.2" y="238.5" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="297.2" dy="0.0">F4</tspan></text>
+<rect x="322.0" y="210.0" width="35.5" height="48.0" rx="4.0" fill="#ffffff"/>
+<path d="M326.4,209.6C329.9,209.4 330.3,208.7 353.6,209.7M353.5,210.2C354.9,211.4 355.6,212.1 357.4,214.2M357.9,214.4C357.2,219.4 357.3,224.4 358.6,253.1M357.3,254.1C356.6,254.7 355.4,255.8 353.6,258.2M354.3,258.2C346.9,256.6 338.9,258.7 325.4,257.9M326.1,258.0C325.2,257.1 323.6,255.7 322.2,253.8M322.2,254.7C320.0,244.8 320.7,238.9 322.9,213.3M322.1,213.9C323.4,212.9 324.4,211.7 326.0,210.2" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M326.3,209.7C331.1,209.1 332.0,210.8 353.8,210.8M353.5,209.9C353.9,210.8 355.0,211.1 357.5,213.8M356.7,214.3C356.3,226.9 358.2,237.1 357.5,253.0M357.4,254.0C356.8,254.4 356.5,255.2 353.4,257.8M354.3,258.3C346.1,256.5 342.0,258.9 326.3,257.0M325.8,258.1C325.2,257.3 324.0,255.6 321.9,254.2M321.7,253.9C321.8,245.1 320.4,234.3 323.0,213.3M322.1,213.8C322.8,213.1 323.3,212.8 326.1,209.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="339.8" y="238.5" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="339.8" dy="0.0">⋯</tspan></text>
+<rect x="364.5" y="210.0" width="35.5" height="48.0" rx="4.0" fill="#ffffff"/>
+<path d="M368.7,209.9C378.1,211.3 385.6,209.4 395.6,209.9M395.9,210.0C396.8,210.8 398.4,212.3 400.1,214.2M399.5,214.0C398.6,220.7 398.9,228.7 400.7,253.3M400.0,254.2C398.8,255.3 398.0,256.2 396.0,258.2M395.4,258.0C391.5,258.0 390.1,258.9 368.4,258.1M368.4,258.1C368.4,257.7 367.5,257.3 364.6,253.9M365.2,254.4C366.0,242.2 363.5,230.1 364.6,214.4M364.7,214.0C365.6,213.0 367.0,211.4 368.3,209.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M369.3,209.7C371.4,210.0 377.8,208.4 396.7,209.4M396.1,209.8C397.4,210.7 397.9,212.2 399.9,214.0M400.7,214.2C399.3,226.5 401.3,237.1 400.4,253.3M400.1,254.1C399.2,255.1 398.2,256.0 396.0,257.8M395.4,258.1C392.4,257.3 391.0,257.6 367.5,258.9M368.4,258.1C367.5,257.4 366.9,256.3 364.3,253.9M364.5,254.9C362.7,242.1 364.6,233.1 364.3,214.6M364.5,213.8C366.0,212.8 366.8,211.4 368.3,209.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="382.2" y="238.5" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="382.2" dy="0.0">Fn</tspan></text>
+<text x="276.0" y="278.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="276.0" dy="0.0">150 slots · 414.7 MB @ 720p</tspan></text>
+<text x="276.0" y="292.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="276.0" dy="0.0">one writer, lock-free readers</tspan></text>
+<rect x="428.0" y="106.0" width="228.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M435.7,105.6C482.9,103.0 528.8,102.8 647.7,106.6M648.1,106.0C649.9,107.3 651.7,108.9 656.5,113.5M655.7,113.4C655.2,121.4 656.5,130.7 655.7,151.9M655.7,151.8C654.1,153.2 652.7,154.4 647.6,160.3M648.8,160.6C599.6,163.5 551.8,162.7 435.4,160.4M435.8,159.6C434.4,158.4 433.1,157.3 428.3,151.6M428.2,152.6C427.5,146.8 426.8,137.2 428.9,114.9M428.0,114.2C430.3,112.4 433.1,108.7 435.8,105.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M435.4,106.1C487.8,105.8 540.9,104.5 647.4,106.6M648.4,105.7C650.9,107.7 652.1,109.6 656.0,114.3M655.4,113.1C658.0,119.1 655.6,128.5 656.2,151.5M655.9,152.3C654.5,153.9 654.2,154.0 648.0,160.0M648.0,160.3C621.9,160.1 595.3,162.2 435.7,160.1M435.8,160.1C434.6,158.8 433.1,157.4 427.8,151.8M427.5,152.0C429.4,148.4 428.5,144.9 428.8,114.1M427.8,113.8C429.7,111.9 430.2,111.0 436.4,106.5" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="542.0" y="129.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="542.0" dy="0.0">YOLOv8n watchdog</tspan></text>
+<text x="542.0" y="146.1" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.9" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">always on · ~2–4 ms/frame</tspan></text>
+<rect x="428.0" y="190.0" width="228.0" height="50.0" rx="8.0" fill="#ffffff"/>
+<path d="M435.9,189.7C457.7,186.5 479.3,187.0 647.8,190.6M648.2,190.3C649.9,191.7 653.0,194.3 655.8,197.7M656.6,197.9C658.0,207.1 657.5,212.0 656.3,232.8M656.1,232.3C654.6,233.0 652.5,235.3 648.1,239.9M647.3,240.8C607.7,240.2 567.7,242.1 435.5,240.3M435.8,240.4C433.4,238.7 431.2,236.4 428.2,231.8M428.6,232.0C428.3,224.7 427.5,218.1 428.7,197.3M428.4,197.9C429.4,196.4 432.0,195.2 436.2,189.7" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M436.5,189.7C489.1,189.6 541.3,188.7 647.8,190.0M648.3,189.9C649.2,191.1 651.1,192.2 656.4,197.9M656.3,197.9C656.6,205.1 657.1,212.1 656.4,232.9M656.2,231.8C655.4,233.1 652.9,235.2 647.6,240.3M647.5,239.3C621.2,242.2 595.5,242.1 435.5,240.8M436.2,240.3C434.7,238.8 432.5,236.2 427.6,231.8M427.7,232.9C426.9,221.4 429.4,213.8 428.3,197.1M428.2,197.7C430.2,195.6 431.1,193.9 436.4,189.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="542.0" y="211.7" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="542.0" dy="0.0">Trigger gate</tspan></text>
+<text x="542.0" y="227.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">scope → ROI → per-subject cooldown</tspan></text>
+<rect x="428.0" y="272.0" width="228.0" height="58.0" rx="8.0" fill="#ffffff"/>
+<path d="M436.1,272.5C494.8,271.4 552.6,269.2 647.3,272.2M647.8,272.2C648.8,272.9 650.1,274.6 656.2,279.8M656.2,279.9C657.4,285.2 654.6,293.2 656.4,322.8M655.9,322.3C653.3,324.9 652.4,325.9 647.9,330.1M648.3,330.2C585.9,333.4 526.5,330.9 436.2,330.8M435.7,330.3C434.0,328.2 431.7,325.6 428.4,322.2M427.8,322.5C428.3,310.5 428.0,298.1 428.5,280.8M427.7,279.7C429.7,278.8 431.2,277.3 435.9,272.2" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M436.2,272.4C464.1,269.8 489.3,271.3 648.6,272.7M648.0,272.3C650.7,274.1 652.7,277.1 655.9,279.7M656.1,279.4C656.9,288.6 655.7,293.2 656.8,321.1M656.0,321.7C654.4,323.4 653.8,324.1 647.7,329.9M647.8,330.0C596.0,331.9 542.7,331.7 435.5,329.8M436.2,330.4C435.9,328.6 435.1,328.6 428.0,321.9M428.5,322.8C427.6,316.7 428.6,309.6 428.3,280.5M428.1,280.1C430.1,277.5 432.3,275.5 436.2,272.5" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="542.0" y="297.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="542.0" dy="0.0">VLM worker</tspan></text>
+<text x="542.0" y="314.1" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.9" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">wake-on-event · Moondream2 1.86 B</tspan></text>
+<rect x="428.0" y="368.0" width="228.0" height="50.0" rx="8.0" fill="#ffffff"/>
+<path d="M436.0,368.1C497.4,366.4 560.8,365.1 648.0,367.8M648.2,367.9C650.0,369.2 651.4,371.9 655.6,376.1M655.6,376.6C656.1,381.8 657.5,385.0 655.9,410.0M655.8,410.4C655.6,410.9 654.5,411.3 648.1,417.9M647.4,417.7C608.5,421.4 571.3,419.9 436.4,417.6M436.2,417.8C434.8,416.1 432.9,413.9 428.1,410.3M428.4,409.7C427.2,403.0 427.9,394.2 428.2,375.6M428.2,376.1C429.7,374.1 433.5,370.6 435.7,368.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M436.5,367.8C467.5,367.3 496.1,367.1 647.0,367.5M648.0,367.9C650.4,370.6 651.5,371.6 656.0,376.3M656.3,375.3C656.4,379.3 657.0,387.5 656.4,409.3M656.2,410.2C654.9,412.2 652.6,413.9 648.4,417.9M648.5,417.8C610.3,419.5 572.4,420.7 435.9,418.6M435.9,418.0C434.3,416.0 432.1,414.6 428.0,410.2M427.6,409.7C427.5,402.3 426.3,395.1 427.1,374.9M428.3,376.1C428.7,375.3 431.0,373.5 436.1,367.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="542.0" y="389.7" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="542.0" dy="0.0">AlertSink</tspan></text>
+<text x="542.0" y="405.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">persist · broadcast · webhook</tspan></text>
+<path d="M136.1,248.2C138.4,246.9 138.7,247.3 148.4,247.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M135.5,247.5C139.6,248.0 141.9,248.9 147.5,247.8" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M148.2,248.2C145.2,250.0 143.1,250.1 140.1,253.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M148.1,247.6C145.6,247.1 145.3,246.4 140.5,243.7" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M390.5,209.5C390.8,197.6 388.9,185.2 390.0,133.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M390.1,210.4C390.9,186.9 390.8,168.5 389.0,132.8" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M390.6,133.3C395.6,133.1 399.9,132.3 427.4,133.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M390.8,132.4C398.6,133.9 408.2,134.0 429.1,133.0" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M428.0,133.0C425.3,134.3 424.7,135.1 420.8,138.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M427.9,132.8C426.1,132.7 425.1,131.9 420.3,128.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M541.1,159.7C542.3,164.1 543.3,165.2 542.9,189.2" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M542.8,160.8C543.7,167.7 543.8,174.1 541.6,188.5" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M541.9,188.1C541.5,186.4 540.2,186.0 537.6,180.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M541.8,187.6C543.4,186.7 543.5,185.7 546.7,179.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M541.5,239.0C542.2,245.3 543.2,254.3 541.7,271.0" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M542.6,239.5C540.7,247.8 541.1,257.3 541.0,270.5" fill="none" stroke="#c2410c" stroke-width="1.19" stroke-linecap="round"/>
+<path d="M541.9,269.7C541.8,269.1 540.0,267.9 537.5,262.4" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M542.3,269.8C542.1,268.1 543.0,267.1 546.6,262.1" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M542.3,330.9C541.7,339.1 543.4,352.2 541.3,365.5" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M541.5,329.3C542.2,334.7 543.6,340.1 542.4,366.9" fill="none" stroke="#c2410c" stroke-width="1.19" stroke-linecap="round"/>
+<path d="M541.7,366.3C540.2,365.0 539.2,362.6 536.9,358.0" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M541.6,366.1C542.5,363.5 544.7,362.3 546.9,358.1" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<text x="534.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#c2410c" text-anchor="end"><tspan x="534.0" dy="0.0">ZMQ :5557 · "detection"</tspan></text>
+<text x="534.0" y="352.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#c2410c" text-anchor="end"><tspan x="534.0" dy="0.0">ZMQ :5558 · "vlm_result"</tspan></text>
+<path d="M399.8,258.8C398.5,264.5 402.2,267.2 401.0,300.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M400.1,258.5C400.7,262.3 399.3,267.2 400.7,300.6" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M401.0,301.3C406.0,300.9 409.2,300.4 425.1,301.7" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M400.5,300.4C406.3,302.1 410.8,302.1 424.2,300.8" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M424.1,301.4C422.3,301.5 421.7,303.4 415.8,306.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M423.6,300.9C422.1,299.8 420.1,300.0 416.5,295.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<text x="396.0" y="316.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="end"><tspan x="396.0" dy="0.0">read_by_timestamp()</tspan></text>
+<path d="M541.4,418.7C542.7,427.9 543.5,438.7 543.1,494.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M542.4,418.7C542.4,429.4 543.1,443.2 541.8,495.0" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M411.6,493.3C477.0,493.3 546.0,491.9 696.3,495.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M411.9,494.1C474.5,490.9 534.6,491.1 696.9,493.1" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M411.7,493.7C411.6,500.2 412.0,507.9 412.2,516.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M412.4,494.7C412.4,497.6 413.9,502.5 411.1,516.2" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M411.9,516.3C410.4,514.4 409.5,511.6 407.6,507.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M411.7,516.1C412.3,513.5 414.1,512.5 416.7,507.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="356.0" y="516.0" width="112.0" height="48.0" rx="8.0" fill="#ffffff"/>
+<path d="M363.9,516.1C390.0,516.9 419.9,514.5 460.7,516.9M460.2,515.9C460.3,517.4 461.8,518.3 467.8,524.3M467.5,524.8C470.0,529.9 468.6,534.7 467.0,555.8M468.0,555.6C465.9,557.3 464.8,559.3 459.9,564.0M460.6,564.0C447.7,564.5 437.7,565.4 363.9,564.0M364.1,564.2C362.1,563.0 360.8,560.6 356.0,555.7M356.9,555.3C357.2,547.9 354.3,538.9 355.9,524.1M355.6,524.2C358.1,522.3 358.9,520.9 363.8,516.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M364.5,515.9C392.2,516.9 419.4,516.3 460.7,515.5M459.9,516.3C462.7,517.5 464.1,520.5 468.1,523.8M468.7,523.4C466.9,532.1 469.5,541.2 468.9,555.5M467.9,555.8C466.9,557.4 466.0,558.2 459.6,563.8M459.8,564.0C441.5,566.1 420.6,563.0 363.7,565.0M363.7,563.6C362.7,563.0 361.3,561.5 355.6,555.9M356.0,556.2C355.0,550.7 356.9,547.8 356.9,523.5M355.7,524.3C357.4,522.4 357.9,520.9 364.4,515.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="412.0" y="536.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="412.0" dy="0.0">SQLite</tspan></text>
+<text x="412.0" y="552.2" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.1" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="412.0" dy="0.0">alerts · rules</tspan></text>
+<path d="M553.6,494.6C553.1,500.4 553.0,501.9 553.7,515.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M554.1,494.8C554.3,500.5 555.7,506.8 554.8,515.4" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M553.8,516.0C554.0,515.4 553.0,514.6 548.9,507.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M554.1,516.4C555.3,514.3 555.5,512.8 558.6,508.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="490.0" y="516.0" width="128.0" height="48.0" rx="8.0" fill="#ffffff"/>
+<path d="M498.5,515.5C523.1,515.6 548.5,515.1 610.8,516.1M609.8,516.4C611.4,517.7 612.7,519.8 618.4,523.9M618.8,524.9C618.7,534.1 617.0,540.2 617.6,556.8M617.8,556.3C615.7,557.9 614.8,559.7 609.8,563.8M610.6,564.7C591.1,565.3 573.5,565.0 498.7,564.8M498.3,563.8C495.3,562.3 494.3,559.9 490.3,555.8M489.1,555.8C490.5,550.0 489.4,541.4 489.0,524.1M490.1,523.6C491.1,522.3 493.3,519.6 497.6,515.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M498.7,516.3C522.7,514.9 546.3,516.7 610.2,515.2M610.3,516.3C611.5,516.8 612.5,517.7 618.0,524.0M618.3,524.6C619.8,534.2 619.6,540.5 617.9,556.7M618.4,556.1C616.3,557.9 615.0,560.2 609.9,564.4M610.8,563.7C596.5,566.6 585.6,566.5 498.7,564.6M497.9,564.3C496.2,562.6 495.1,562.0 489.6,556.2M489.9,555.2C489.1,550.2 488.3,544.3 491.0,523.8M489.7,524.2C490.8,522.2 492.5,520.3 497.9,515.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="554.0" y="536.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="554.0" dy="0.0">Dashboard</tspan></text>
+<text x="554.0" y="552.2" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.1" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="554.0" dy="0.0">WebSocket + MJPEG</tspan></text>
+<path d="M695.0,494.0C695.5,498.7 694.8,501.4 697.1,517.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M696.5,493.1C698.0,497.9 694.6,505.1 695.9,517.2" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M695.9,515.7C695.5,514.3 693.4,512.7 691.7,507.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M695.7,515.7C696.8,513.4 698.8,512.0 700.5,508.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="640.0" y="516.0" width="112.0" height="48.0" rx="8.0" fill="#ffffff"/>
+<path d="M647.6,515.4C661.7,515.3 673.9,514.1 743.0,516.1M743.8,516.1C745.9,518.4 747.4,520.1 752.0,524.3M752.8,523.6C753.6,528.4 752.2,532.8 751.3,555.1M751.8,555.8C750.6,557.8 748.0,559.7 744.2,563.6M744.6,563.3C726.2,563.5 711.1,563.7 648.9,563.9M647.6,563.8C645.3,561.4 643.1,559.4 639.7,556.0M639.9,555.3C638.3,553.7 641.5,548.8 639.2,524.5M639.9,523.8C641.2,522.6 641.3,522.1 648.1,516.5" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M647.8,515.4C660.5,516.2 670.9,514.1 744.4,515.9M743.9,516.2C745.4,517.5 746.5,519.0 752.3,523.7M751.2,523.6C750.6,528.8 752.9,532.3 752.6,556.8M752.2,556.2C750.2,558.0 748.5,559.9 743.8,563.7M743.1,564.8C729.4,565.3 717.1,564.5 648.3,564.0M648.1,563.6C645.6,562.0 643.7,560.1 640.4,555.7M640.7,555.1C640.0,550.3 641.4,546.9 639.5,523.3M640.1,523.8C641.9,522.0 643.6,520.9 648.3,515.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="696.0" y="536.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="696.0" dy="0.0">Webhook</tspan></text>
+<text x="696.0" y="552.2" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.1" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="696.0" dy="0.0">violations only</tspan></text>
+<path d="M694.8,133.5C691.5,134.6 686.1,133.6 656.2,132.5" fill="none" stroke="#6b7280" stroke-width="1.00" stroke-linecap="round" stroke-dasharray="6 5"/>
+<rect x="694.0" y="92.0" width="236.0" height="59.4" rx="5.0" fill="#ffffff"/>
+<path d="M698.7,91.2C724.3,90.8 747.1,89.5 925.8,92.5M924.9,92.0C926.1,92.7 926.9,93.7 929.8,97.0M930.1,96.6C930.2,102.6 929.0,107.5 929.1,147.3M929.9,146.5C928.8,147.7 927.8,148.0 925.0,151.6M925.0,152.2C894.6,152.2 864.5,152.6 698.5,151.3M699.0,151.4C697.9,149.8 696.6,148.7 694.0,146.4M694.2,145.6C694.5,136.2 694.9,125.9 694.8,97.7M694.2,96.9C694.8,95.6 696.2,95.5 699.2,91.8" fill="none" stroke="#6b7280" stroke-width="1.10" stroke-linecap="round" stroke-dasharray="7 5"/>
+<path d="M699.4,92.6C743.5,89.4 785.8,91.2 924.7,92.1M924.9,92.0C926.3,93.5 927.9,94.3 929.8,97.1M929.2,96.6C930.0,107.7 928.9,113.7 929.8,145.7M930.2,146.6C928.9,147.1 928.9,147.4 925.1,151.3M924.8,150.9C862.8,152.3 804.3,151.6 698.6,151.5M698.9,151.2C697.9,150.6 696.8,149.3 693.8,146.2M693.5,145.6C693.2,138.8 693.7,129.0 693.3,97.3M694.1,96.8C695.0,96.4 695.7,94.7 699.2,91.8" fill="none" stroke="#6b7280" stroke-width="0.79" stroke-linecap="round" stroke-dasharray="7 5"/>
+<text x="703.0" y="110.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="703.0" dy="0.0">Stage 1 — the cheap, always-on filter.</tspan><tspan x="703.0" dy="15.0">Paced independently of capture, so it</tspan><tspan x="703.0" dy="15.0">cannot starve Stage 2 for CPU.</tspan></text>
+<path d="M695.0,215.1C688.5,216.3 684.3,214.0 655.4,215.3" fill="none" stroke="#6b7280" stroke-width="1.00" stroke-linecap="round" stroke-dasharray="6 5"/>
+<rect x="694.0" y="178.0" width="236.0" height="59.4" rx="5.0" fill="#ffffff"/>
+<path d="M699.2,177.6C766.0,175.2 835.7,177.8 925.3,177.2M925.1,177.9C926.8,179.3 928.2,181.0 929.8,182.9M930.1,183.0C929.0,197.1 930.7,209.1 929.9,233.2M930.0,232.5C928.4,233.3 927.7,235.3 925.3,237.4M924.4,238.1C896.7,238.6 867.7,238.3 699.2,236.5M699.0,237.4C697.9,236.0 696.5,235.2 694.2,232.6M693.5,232.4C693.5,217.7 692.5,204.3 694.9,183.7M693.9,182.9C695.2,181.2 696.9,180.4 699.3,177.9" fill="none" stroke="#6b7280" stroke-width="1.10" stroke-linecap="round" stroke-dasharray="7 5"/>
+<path d="M699.8,177.5C734.9,176.6 772.2,177.8 924.3,178.6M925.2,177.9C926.3,178.8 927.3,180.5 929.9,183.1M930.9,183.1C929.3,194.7 931.5,208.4 930.1,233.2M930.1,232.3C929.6,233.5 928.8,233.7 924.9,237.3M924.9,237.1C902.3,239.3 876.3,240.6 699.1,237.2M699.2,237.5C697.8,236.7 697.2,235.6 693.8,232.4M694.8,232.9C691.9,218.9 693.4,207.7 694.5,183.9M693.8,182.8C694.5,182.2 695.6,181.3 699.1,177.9" fill="none" stroke="#6b7280" stroke-width="0.79" stroke-linecap="round" stroke-dasharray="7 5"/>
+<text x="703.0" y="196.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="703.0" dy="0.0">The sketch's single "event engine" is</tspan><tspan x="703.0" dy="15.0">really two: what to WAKE lives here,</tspan><tspan x="703.0" dy="15.0">what to ASK lives in Stage 2.</tspan></text>
+<path d="M694.6,301.6C682.5,299.9 671.1,302.5 656.2,302.2" fill="none" stroke="#6b7280" stroke-width="1.00" stroke-linecap="round" stroke-dasharray="6 5"/>
+<rect x="694.0" y="264.0" width="236.0" height="59.4" rx="5.0" fill="#ffffff"/>
+<path d="M698.5,263.6C748.0,261.9 800.6,263.8 926.0,264.1M925.2,263.9C926.0,264.6 926.9,265.3 930.0,269.1M929.8,268.8C929.8,279.1 931.0,285.5 930.1,318.5M930.0,318.2C928.9,318.8 928.4,319.9 925.1,323.7M924.7,324.3C886.2,324.2 846.5,324.7 698.5,322.4M698.8,323.5C697.3,322.0 696.6,320.7 694.1,318.5M694.6,317.6C693.8,306.9 695.0,292.3 695.0,268.3M693.9,269.1C695.3,267.9 697.3,266.4 698.9,263.9" fill="none" stroke="#6b7280" stroke-width="1.10" stroke-linecap="round" stroke-dasharray="7 5"/>
+<path d="M698.9,263.6C758.1,261.8 817.7,261.7 925.9,263.6M925.0,263.8C926.2,264.7 927.2,266.3 930.3,269.2M930.6,269.8C928.8,277.3 929.3,288.3 929.8,317.3M929.9,318.2C929.3,319.3 927.5,320.2 925.2,323.5M924.1,322.8C887.7,324.9 853.6,326.5 699.3,323.3M699.0,323.3C697.3,322.1 696.9,321.4 693.9,318.5M693.3,319.3C694.4,310.1 695.0,301.6 694.6,268.2M693.9,269.2C695.2,267.8 695.8,267.2 699.2,263.8" fill="none" stroke="#6b7280" stroke-width="0.79" stroke-linecap="round" stroke-dasharray="7 5"/>
+<text x="703.0" y="282.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="703.0" dy="0.0">Stage 2 — three orders of magnitude</tspan><tspan x="703.0" dy="15.0">slower (~5.6 s/query on CPU), so it</tspan><tspan x="703.0" dy="15.0">never sits in the frame path.</tspan></text>
+<path d="M693.2,393.7C688.3,392.2 681.9,394.4 655.8,392.6" fill="none" stroke="#6b7280" stroke-width="1.00" stroke-linecap="round" stroke-dasharray="6 5"/>
+<rect x="694.0" y="356.0" width="236.0" height="59.4" rx="5.0" fill="#ffffff"/>
+<path d="M698.8,356.7C742.0,354.1 787.5,353.6 924.8,356.8M924.8,356.0C925.3,356.5 926.0,357.1 930.1,361.1M930.2,361.0C931.4,368.7 931.1,377.1 929.1,409.9M930.0,410.2C928.1,412.1 926.9,413.5 924.7,415.1M924.4,416.2C869.2,416.0 811.4,415.7 699.7,415.3M699.1,415.3C698.1,413.8 696.8,412.7 694.0,410.2M694.0,411.1C694.3,399.6 692.8,385.9 694.7,360.2M694.0,360.9C694.9,359.7 696.6,358.5 699.3,356.2" fill="none" stroke="#6b7280" stroke-width="1.10" stroke-linecap="round" stroke-dasharray="7 5"/>
+<path d="M699.9,356.5C741.2,352.8 787.1,354.1 924.3,356.0M925.1,356.0C926.1,356.5 926.7,358.3 930.2,360.9M929.6,361.7C931.0,375.5 929.2,388.3 929.6,411.3M930.2,410.2C928.3,411.5 927.0,413.3 925.2,415.6M924.1,416.3C876.6,418.2 826.4,417.6 699.3,414.5M698.9,415.6C697.7,414.0 696.6,412.9 694.1,410.4M694.0,410.4C693.1,405.7 695.0,400.3 693.4,361.7M694.1,360.9C695.7,360.0 696.4,358.7 699.3,356.1" fill="none" stroke="#6b7280" stroke-width="0.79" stroke-linecap="round" stroke-dasharray="7 5"/>
+<text x="703.0" y="374.8" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="703.0" dy="0.0">Both verdicts are stored, not just</tspan><tspan x="703.0" dy="15.0">violations — history is only</tspan><tspan x="703.0" dy="15.0">trustworthy if clears are recorded.</tspan></text>
+<rect x="26.0" y="494.0" width="306.0" height="92.0" rx="6.0" fill="#ffffff"/>
+<path d="M32.6,493.1C111.7,492.0 189.2,491.3 325.6,494.8M325.8,493.9C327.7,495.6 329.0,497.2 331.9,499.7M331.8,500.7C332.0,522.8 332.5,546.5 332.0,579.8M332.1,580.0C330.4,581.3 328.8,583.1 325.7,586.2M325.9,586.2C272.2,589.9 220.5,587.5 32.6,585.6M32.0,585.8C30.7,585.7 31.0,584.4 25.7,579.7M25.2,580.0C26.0,565.2 26.6,550.7 26.3,499.6M26.3,500.3C27.0,499.2 28.1,497.4 32.1,493.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M32.8,494.2C97.5,491.6 161.2,493.2 327.0,493.9M326.0,494.3C327.0,494.8 327.7,495.6 331.8,500.3M332.4,500.1C334.3,513.0 333.9,527.4 331.6,579.2M332.0,580.0C330.6,581.0 329.7,582.5 326.0,586.2M325.7,585.3C251.0,587.4 178.3,590.2 33.1,585.4M32.3,586.3C30.3,584.6 28.8,582.6 26.3,579.8M26.3,579.3C26.7,570.5 24.4,560.9 25.2,500.9M26.0,500.1C28.0,497.6 30.0,495.9 32.0,493.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="40.0" y="514.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="40.0" dy="0.0">Ring buffer</tspan></text>
+<text x="122.0" y="514.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="122.0" dy="0.0">= remembers the last ~5 s</tspan></text>
+<text x="40.0" y="531.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="40.0" dy="0.0">YOLOv8n</tspan></text>
+<text x="122.0" y="531.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="122.0" dy="0.0">= watches every frame, cheaply</tspan></text>
+<text x="40.0" y="548.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="40.0" dy="0.0">Trigger gate</tspan></text>
+<text x="122.0" y="548.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="122.0" dy="0.0">= decides when reasoning is worth it</tspan></text>
+<text x="40.0" y="565.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="40.0" dy="0.0">VLM worker</tspan></text>
+<text x="122.0" y="565.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="122.0" dy="0.0">= wakes, reads the buffered frame</tspan></text>
+<text x="40.0" y="578.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="40.0" dy="0.0">orange = the trigger / verdict path</tspan></text>
+</svg>
+
+    <figcaption><b>Figure 1 — System architecture.</b> One OS process. Capture writes into a
+    shared-memory ring; Stage 1 reads the newest frame and decides only whether reasoning is
+    warranted; Stage 2 wakes on that decision and fetches the pixels back by timestamp. The gate is
+    drawn twice because <i>what to wake</i> and <i>what to ask</i> are separate concerns.</figcaption>
+  </figure>
+
+  <h3>1.1 &nbsp;One process, four unequal threads</h3>
+  <p>Everything runs in one process because of the ring buffer: a shared-memory frame store removes
+  copies only if consumers reach it without serialising, and keeping both stages as threads in the
+  owning process makes that free. The segments are nonetheless <em class="term">named</em> POSIX
+  objects, so the multi-process seam exists when wanted. The threads are deliberately unequal —
+  capture writes into a ring that overwrites rather than fills, Stage 1 is paced independently of
+  capture because otherwise it starves the stage it exists to feed, and Stage 2 is kept entirely off
+  the frame path.</p>
+
+  <table>
+    <tr><th style="width:28mm">Thread</th><th style="width:44mm">Owns</th><th style="width:28mm">Cadence</th><th>Under failure</th></tr>
+    <tr><td class="k">uvicorn loop</td><td>Routes, <code>AlertSink</code>, WebSocket fan-out</td><td>request-driven</td><td>A malformed verdict is logged; the sink survives. JPEG encoding runs off-thread.</td></tr>
+    <tr><td class="k">VideoCapture</td><td><code>cv2.VideoCapture</code>, ring writes</td><td><code>target_fps</code> or the file’s own FPS</td><td>Backoff 1 → 30 s over five attempts; files loop seamlessly.</td></tr>
+    <tr><td class="k">YOLOWatchdog</td><td>Model, tracker, cooldown gate, overlay ring</td><td><code>watchdog_fps</code>, apart from capture</td><td>Warm-up failure falls back to CPU; repeated frames skipped by timestamp.</td></tr>
+    <tr><td class="k">VLMWorker</td><td>Backend, verdict memo, both its ZMQ sockets</td><td>trigger-driven, 1 s idle poll</td><td>A blown timeout abandons the batch — one executor worker, so a hang blocks it.</td></tr>
+    <tr><td class="k">VLMInfer pool</td><td>One in-flight inference</td><td>serial by design</td><td><code>future.result(timeout)</code> bounds the query and fails fast.</td></tr>
+  </table>
+
+  <h3>1.2 &nbsp;Two transport planes, single ownership</h3>
+  <p>Detections travel on <code>:5557</code>, verdicts return on <code>:5558</code>. The split is
+  not tidiness — ZeroMQ sockets are not thread-safe, so each publisher owns its socket in the thread
+  that created it, and Stage 2 builds both of its own inside its worker loop. Sends are non-blocking
+  behind a high-water mark: a slow consumer drops messages rather than stalling a producer. Ownership
+  is likewise singular — the FastAPI lifespan builds every component in dependency order and tears it
+  down in reverse, the fix for a defect where split ownership let the lifespan overwrite
+  already-wired components and silently sever rule delivery to the VLM.</p>
+
+  <div class="footline"><span>§1 &nbsp;System architecture</span><span>Page 2 of 4</span></div>
+</section>
+
+<!-- ══════════════════ PAGE 3 — WORKFLOW & AI ══════════════════ -->
+<section class="sheet">
+
+  <h2><span class="num">§2</span>End-to-end workflow and data flow</h2>
+
+  <figure class="tight">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 408" role="img">
+<rect width="940" height="408" fill="#ffffff"/>
+<rect x="15.0" y="64.0" width="140.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M23.3,64.5C40.0,63.2 57.3,63.9 146.9,64.0M147.1,63.7C147.8,65.2 149.7,66.7 155.0,72.1M154.5,71.9C155.5,80.4 155.1,87.3 155.7,110.1M155.2,110.1C153.9,110.7 152.8,111.2 146.9,118.0M147.1,117.9C131.0,120.4 113.4,119.1 22.3,118.9M23.1,118.0C21.3,115.5 18.9,114.8 14.9,110.1M15.3,110.8C15.6,100.2 13.4,93.4 14.8,72.6M14.9,72.2C16.6,70.4 19.2,67.3 23.1,63.6" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M22.5,63.8C49.2,62.3 72.9,62.2 147.2,63.5M146.7,64.3C148.4,66.3 152.0,68.3 154.5,72.2M155.1,71.9C156.0,78.7 156.1,84.5 154.2,110.2M154.8,110.3C154.4,110.9 153.1,112.5 147.3,117.9M146.4,118.9C112.3,120.4 77.4,117.9 22.8,118.9M22.9,117.8C20.8,116.6 18.3,113.8 15.0,109.6M14.7,110.8C15.4,103.4 13.1,94.3 15.2,71.1M15.0,71.9C17.0,70.8 18.4,67.5 23.4,63.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="85.0" y="97.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="85.0" dy="0.0">1 · Capture</tspan></text>
+<text x="85.0" y="140.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="85.0" dy="0.0">grab / retrieve split.</tspan><tspan x="85.0" dy="14.0">File sources paced at</tspan><tspan x="85.0" dy="14.0">their recorded FPS.</tspan></text>
+<rect x="169.0" y="64.0" width="140.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M177.6,64.5C194.3,61.6 214.2,61.2 302.0,65.1M300.6,64.1C302.3,65.1 303.5,66.1 309.3,71.7M308.9,72.8C308.6,79.1 310.8,83.2 309.9,109.5M308.9,110.1C307.2,111.5 306.8,113.1 300.7,118.2M301.7,117.5C284.0,119.5 267.3,119.5 176.6,117.0M176.9,118.3C175.3,116.4 173.1,115.4 169.1,109.7M169.9,109.4C168.7,102.5 167.7,95.1 169.9,71.2M169.4,71.8C171.4,69.8 173.8,68.2 177.2,64.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M176.8,63.8C207.0,61.7 234.8,63.8 300.6,63.8M301.0,64.2C303.2,65.9 304.2,66.3 308.8,72.1M308.3,72.6C307.9,82.2 307.9,93.0 309.9,110.5M308.8,110.0C307.5,111.7 305.3,113.0 300.8,118.3M300.1,117.7C269.1,119.0 238.1,117.5 177.8,117.6M177.3,117.9C176.2,116.7 175.3,115.9 169.5,109.6M168.2,109.2C169.1,105.5 169.0,100.0 168.6,72.3M169.3,72.1C170.9,71.4 170.8,70.2 176.6,64.1" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="239.0" y="97.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="239.0" dy="0.0">2 · Ring write</tspan></text>
+<text x="239.0" y="140.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="239.0" dy="0.0">Copy into slot, stamp</tspan><tspan x="239.0" dy="14.0">with time.monotonic().</tspan><tspan x="239.0" dy="14.0">Writer lock only.</tspan></text>
+<path d="M153.4,90.7C157.0,91.7 158.7,91.1 166.8,90.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M152.4,90.6C155.2,90.0 157.7,89.8 166.5,91.6" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M165.7,90.8C164.4,92.1 163.6,92.1 160.4,95.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M165.7,90.7C163.8,90.1 162.1,88.6 159.7,87.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="323.0" y="64.0" width="140.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M331.2,64.4C358.9,64.5 386.4,63.3 454.5,64.9M455.4,63.8C456.4,65.5 458.8,67.6 463.4,72.4M463.5,72.2C463.5,78.2 464.2,83.9 463.0,110.9M463.1,110.0C461.7,112.5 459.2,113.5 455.0,118.3M455.9,117.7C437.3,117.5 421.2,120.8 330.6,118.3M331.0,118.4C329.5,116.5 328.0,115.6 322.8,110.3M323.1,109.9C322.9,102.2 321.5,93.0 322.7,71.2M323.2,72.3C325.1,69.6 325.6,68.0 331.2,64.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M330.2,64.0C345.9,61.8 362.2,63.9 456.1,63.4M454.9,63.9C457.8,65.6 459.0,68.4 462.8,71.8M463.3,72.7C464.8,76.8 464.6,82.2 462.7,110.7M462.8,110.4C462.6,111.0 461.0,112.7 455.2,117.7M454.9,118.2C430.7,119.5 405.5,119.1 330.8,118.0M331.2,118.3C329.9,116.5 329.3,116.4 323.3,109.9M323.9,109.7C322.4,100.6 323.1,89.2 322.5,71.7M322.8,72.0C325.3,70.4 326.7,68.9 331.5,63.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="393.0" y="97.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="393.0" dy="0.0">3 · Detect</tspan></text>
+<text x="393.0" y="140.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="393.0" dy="0.0">Three passes: decode +</tspan><tspan x="393.0" dy="14.0">confidence, whole-frame</tspan><tspan x="393.0" dy="14.0">track ids, then gate.</tspan></text>
+<path d="M306.5,91.5C309.6,90.2 312.8,92.1 320.5,90.7" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M306.8,91.6C308.9,90.6 312.6,89.9 320.5,90.9" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M320.0,91.2C319.6,92.1 317.7,91.8 314.4,94.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M320.0,91.0C319.2,90.4 317.5,89.8 314.2,87.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="477.0" y="64.0" width="140.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M484.4,63.9C501.9,61.9 521.4,64.1 608.7,65.1M609.0,64.1C609.9,64.4 611.7,66.6 616.7,72.0M617.4,72.6C618.1,78.4 617.8,88.4 617.8,110.5M616.8,110.0C615.4,111.6 613.5,113.5 609.2,118.3M609.6,118.6C593.0,119.2 579.6,118.4 486.0,118.7M485.4,118.0C483.9,116.9 482.3,115.8 476.8,110.3M477.7,109.3C475.1,104.4 477.5,97.5 476.9,71.4M476.8,72.0C478.1,70.8 479.9,69.8 484.7,64.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M485.7,63.4C520.3,62.0 552.7,62.1 608.2,63.8M609.0,64.1C609.9,64.9 612.0,66.3 616.9,71.8M616.5,72.4C617.3,78.6 617.7,86.1 617.4,110.6M617.1,110.3C615.0,111.4 613.0,113.8 608.8,118.3M608.5,118.2C584.0,117.6 562.2,119.5 485.3,118.3M485.2,118.2C483.2,116.5 482.1,115.5 476.6,109.6M477.5,109.8C476.3,106.6 478.3,100.9 476.1,71.5M476.7,72.2C479.4,70.0 481.2,67.7 485.1,64.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="547.0" y="97.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="547.0" dy="0.0">4 · Coalesce</tspan></text>
+<text x="547.0" y="140.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="547.0" dy="0.0">Drain the backlog, keep</tspan><tspan x="547.0" dy="14.0">the newest trigger per</tspan><tspan x="547.0" dy="14.0">(label, track_id).</tspan></text>
+<path d="M460.5,90.4C465.5,90.6 467.6,91.3 473.3,91.7" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M460.5,91.3C461.5,90.3 464.3,90.1 473.5,90.8" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M474.0,90.7C473.3,91.8 471.9,91.9 468.1,94.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M473.9,91.0C473.4,89.8 472.1,89.7 467.8,87.5" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="631.0" y="64.0" width="140.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M639.2,63.2C651.7,62.3 666.8,61.2 762.3,64.2M763.2,64.3C764.9,66.8 767.1,67.9 771.3,72.4M770.7,71.7C770.9,81.7 771.0,92.2 771.1,111.0M771.0,110.1C770.1,111.8 769.6,111.9 762.7,117.7M762.5,118.7C740.2,118.0 719.3,119.5 638.9,117.9M639.0,118.2C637.5,116.7 636.0,114.8 631.3,109.6M630.6,109.8C629.1,104.3 630.9,97.4 631.1,71.5M630.7,72.3C632.5,71.5 632.1,70.2 639.2,64.2" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M638.8,64.7C672.7,63.3 709.0,62.4 762.5,64.1M762.8,63.9C763.1,64.3 765.4,65.3 770.8,72.1M770.6,72.5C772.7,75.4 770.1,78.6 770.4,109.3M771.2,110.2C769.3,111.9 767.9,112.4 763.0,118.4M762.2,117.8C742.9,118.2 722.8,119.6 638.0,118.5M639.4,117.6C637.9,116.1 635.9,114.7 630.7,110.4M630.8,109.7C632.4,99.9 629.5,94.3 632.0,72.8M630.9,72.1C633.2,69.8 635.2,66.5 639.3,63.6" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="701.0" y="97.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="701.0" dy="0.0">5 · Judge</tspan></text>
+<text x="701.0" y="140.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="701.0" dy="0.0">Memo, then crop every</tspan><tspan x="701.0" dy="14.0">subject, VLM under a</tspan><tspan x="701.0" dy="14.0">hard timeout, parse.</tspan></text>
+<path d="M614.4,90.5C617.4,91.2 622.4,90.9 627.5,90.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M615.4,90.9C618.7,90.6 619.9,90.7 627.5,90.3" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M628.3,90.7C626.6,91.7 625.7,92.4 622.1,94.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M627.8,91.3C626.8,90.2 626.1,89.8 621.9,87.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="785.0" y="64.0" width="140.0" height="54.0" rx="8.0" fill="#ffffff"/>
+<path d="M792.9,64.7C806.1,62.4 822.5,64.2 917.5,64.0M916.7,63.9C917.3,65.0 919.4,65.3 924.8,72.5M925.4,72.2C926.0,77.9 927.0,82.6 924.9,110.1M925.0,109.7C923.9,110.4 922.6,112.4 917.0,118.4M917.8,118.2C879.1,117.7 845.3,118.3 794.0,117.3M793.3,117.7C792.4,117.7 790.2,116.4 784.7,110.4M784.4,110.4C783.2,101.1 784.0,91.6 784.6,73.1M785.4,72.2C786.9,69.3 789.1,68.2 792.9,64.4" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M793.9,63.5C807.2,61.5 821.6,63.8 917.2,64.5M917.1,63.7C919.0,66.4 920.1,66.9 925.3,71.7M924.3,71.4C925.1,83.1 926.6,90.6 925.2,110.6M925.3,109.9C923.4,111.9 920.8,114.5 917.3,117.9M917.7,118.8C901.8,120.6 885.8,117.4 794.0,117.3M793.0,117.8C791.3,116.2 788.4,114.6 785.3,110.5M784.5,110.3C786.0,98.2 783.2,90.4 784.1,72.0M785.1,71.7C787.6,70.1 788.7,67.5 792.6,63.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="855.0" y="97.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="855.0" dy="0.0">6 · Emit</tspan></text>
+<text x="855.0" y="140.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="855.0" dy="0.0">Persist, broadcast the</tspan><tspan x="855.0" dy="14.0">stored row, POST the</tspan><tspan x="855.0" dy="14.0">webhook on violations.</tspan></text>
+<path d="M768.5,91.4C770.9,90.2 772.3,91.8 781.4,91.3" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M769.1,91.2C772.4,92.1 775.1,90.1 782.7,90.2" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M782.1,90.7C780.7,91.9 780.4,92.3 775.8,94.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M781.9,91.0C781.1,91.1 780.1,89.5 775.8,87.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M700.1,63.9C700.8,57.2 699.1,53.1 699.7,33.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M700.9,63.6C700.4,57.1 700.6,50.0 700.8,34.3" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M699.7,34.3C623.2,36.0 546.8,36.0 238.8,34.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M700.3,34.4C628.2,35.5 558.0,35.7 239.2,34.0" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M239.6,34.7C241.2,41.9 238.5,47.9 238.2,61.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M238.2,34.4C240.4,40.2 240.2,45.0 238.6,62.3" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M239.4,62.4C237.2,60.9 236.8,58.9 234.4,54.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M238.6,62.4C241.0,59.8 242.0,57.9 243.1,54.5" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<text x="470.0" y="26.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="470.0" dy="0.0">Stage 2 fetches the frame back out of the ring by timestamp</tspan></text>
+<path d="M14.9,225.7C248.8,221.7 480.8,221.8 925.0,226.2" fill="none" stroke="#6b7280" stroke-width="0.90" stroke-linecap="round"/>
+<text x="15.0" y="248.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="15.0" dy="0.0">Where it lands</tspan></text>
+<rect x="15.0" y="260.0" width="288.0" height="110.0" rx="7.0" fill="#00000008"/>
+<path d="M21.2,259.5C56.3,259.1 92.1,258.9 295.8,260.2M296.1,259.8C297.5,261.6 298.3,261.8 302.8,267.4M303.8,267.5C303.2,279.2 304.8,291.6 303.7,363.7M303.0,362.8C302.2,364.4 299.6,366.1 296.0,369.7M296.1,370.8C228.2,373.0 160.5,373.1 22.5,370.4M21.7,370.2C20.6,368.3 18.7,366.0 15.1,362.9M15.2,363.3C13.2,334.6 14.1,305.5 15.6,267.8M14.9,267.3C15.2,266.1 16.8,264.8 22.3,259.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M21.3,259.6C50.4,256.4 77.6,259.5 296.3,260.1M296.1,259.8C297.4,260.7 298.0,261.6 303.4,266.9M302.9,267.0C304.8,290.2 302.1,317.6 303.7,363.8M303.0,363.1C301.5,364.0 300.4,364.8 296.1,370.3M296.9,369.6C250.3,370.7 202.3,373.9 22.4,370.4M21.9,370.2C20.7,369.6 20.1,368.0 15.3,363.2M15.0,363.4C13.2,345.2 13.1,329.4 14.7,267.8M15.0,266.7C16.5,265.8 17.8,263.9 22.1,260.4" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="29.0" y="280.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="29.0" dy="0.0">alerts row (SQLite)</tspan></text>
+<text x="29.0" y="300.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="29.0" dy="0.0">rule_id · camera_id · timestamp</tspan><tspan x="29.0" dy="13.5">verdict 0/1 · raw_response</tspan><tspan x="29.0" dy="13.5">inference_ms · bbox_json</tspan><tspan x="29.0" dy="13.5">frame_snapshot · track_id · label</tspan></text>
+<rect x="330.0" y="260.0" width="288.0" height="110.0" rx="7.0" fill="#00000008"/>
+<path d="M337.3,260.5C385.0,258.1 432.4,259.1 612.0,260.1M610.7,259.9C613.0,261.8 615.3,263.9 618.3,266.8M618.1,266.5C618.3,290.1 620.4,315.1 618.9,362.8M618.2,363.0C616.0,364.5 614.1,366.1 610.7,370.0M610.4,370.4C575.6,372.1 542.7,372.9 336.8,370.6M336.9,369.8C335.3,368.4 334.7,367.1 329.6,362.9M329.7,362.6C329.6,341.7 327.8,321.3 330.1,267.5M330.0,267.1C330.7,266.5 331.3,265.0 336.6,259.8" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M337.7,259.8C363.7,257.2 392.4,259.2 611.1,260.4M610.7,259.8C613.0,260.7 613.1,262.8 618.1,266.8M618.7,267.7C619.2,291.9 619.6,319.7 619.0,363.4M617.9,363.3C616.9,364.5 615.2,365.7 611.2,370.1M611.6,369.2C583.1,372.4 554.0,373.9 337.7,368.9M336.9,370.1C335.2,369.0 333.1,366.0 329.8,362.9M329.5,362.9C329.5,345.6 327.8,326.6 331.0,266.5M329.7,266.8C330.8,265.9 332.9,264.8 336.7,259.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="344.0" y="280.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="344.0" dy="0.0">WebSocket /ws/events</tspan></text>
+<text x="344.0" y="300.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="344.0" dy="0.0">The stored DB row, not the</tspan><tspan x="344.0" dy="13.5">VLMResult — so live cards and</tspan><tspan x="344.0" dy="13.5">paginated history render through</tspan><tspan x="344.0" dy="13.5">one code path.</tspan></text>
+<rect x="645.0" y="260.0" width="288.0" height="110.0" rx="7.0" fill="#00000008"/>
+<path d="M651.4,259.2C689.4,256.8 723.6,259.5 926.5,259.7M925.9,259.8C927.9,261.8 929.4,262.2 932.8,267.3M932.5,267.2C935.4,295.4 933.1,325.3 933.3,362.3M932.9,362.8C930.8,364.4 930.4,365.7 925.8,369.6M925.6,369.2C888.5,372.9 848.8,373.4 652.5,370.5M651.7,370.3C651.2,368.6 651.2,369.1 644.6,363.2M645.2,363.3C644.8,341.3 644.6,319.0 645.4,267.2M645.3,267.3C646.6,265.6 648.2,264.0 651.6,259.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M652.8,260.2C721.0,259.1 789.2,257.9 924.9,259.7M926.2,260.2C928.6,261.6 929.5,263.5 933.0,266.7M932.3,267.3C932.8,290.7 935.6,313.6 933.2,362.8M933.0,363.2C931.0,364.4 929.8,367.4 925.8,370.1M925.5,369.6C845.1,372.1 764.5,370.6 652.7,369.0M652.2,369.8C649.4,368.3 647.4,365.5 644.9,362.9M645.3,362.9C643.4,338.7 643.8,309.5 645.0,267.4M645.0,266.8C646.8,265.8 647.2,265.2 652.3,260.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="659.0" y="280.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="659.0" dy="0.0">Webhook POST</tspan></text>
+<text x="659.0" y="300.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="659.0" dy="0.0">Violations only, fire-and-forget.</tspan><tspan x="659.0" dy="13.5">A dead endpoint can never build</tspan><tspan x="659.0" dy="13.5">a retry backlog that outlives the</tspan><tspan x="659.0" dy="13.5">event it describes.</tspan></text>
+<text x="15.0" y="392.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="15.0" dy="0.0">The evidence JPEG is written once per subject and shared by every rule asked about them, then served read-only from /snapshots.</tspan></text>
+</svg>
+
+    <figcaption><b>Figure 2 — From frame to alert.</b> Six stages and the three places a result
+    lands. The return path is load-bearing: Stage 2 fetches the frame back out of the ring rather
+    than carrying pixels forward, so the crop must finish before the ring wraps.</figcaption>
+  </figure>
+
+  <p>Two invariants govern this path, each found by fixing the failure its absence causes.
+  <strong>Crop before inference:</strong> inference takes seconds and the ring holds seconds, so
+  fetching a frame just before each query leaves the second subject in a group with its frame already
+  overwritten — invisible in a one-subject scene, total in a crowded one.
+  <strong>Coalesce by subject, not label:</strong> keeping only the newest trigger per class discards
+  four of five workers as “superseded” when they are different people. Rules flow the other way:
+  <code>sync_rules()</code> hands Stage 1 the <em class="term">coarsest</em> filter satisfying every
+  rule.</p>
+
+  <h2 style="margin-top:5mm"><span class="num">§3</span>The AI/ML layer</h2>
+
+  <figure class="tight">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 428" role="img">
+<rect width="940" height="428" fill="#ffffff"/>
+<text x="20.0" y="22.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="20.0" dy="0.0">Per subject, per rule — decided before any pixels are touched</tspan></text>
+<rect x="20.0" y="38.0" width="400.0" height="42.0" rx="8.0" fill="#ffffff"/>
+<path d="M27.8,37.9C113.8,35.5 199.7,35.8 412.6,37.4M412.1,37.7C413.1,39.1 413.8,40.2 419.8,46.1M419.5,45.6C420.6,51.8 422.0,61.5 419.6,72.0M419.9,72.3C418.7,74.1 417.7,75.2 412.0,79.8M412.5,79.9C356.9,81.0 300.9,81.7 28.3,79.8M27.8,80.3C26.3,78.4 25.3,78.7 19.6,71.7M20.0,72.3C19.1,69.4 20.7,67.6 20.3,46.9M19.8,46.2C21.7,44.6 23.5,41.5 28.4,38.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M27.7,37.6C130.9,36.2 234.0,35.1 411.9,38.2M411.9,38.3C412.9,39.2 413.3,40.2 419.8,45.7M419.7,45.7C419.7,52.0 422.0,55.1 419.2,71.2M419.8,71.6C418.2,73.6 415.4,77.0 411.5,79.6M411.6,79.9C297.3,81.5 182.4,81.7 28.2,80.6M28.3,79.8C26.1,78.9 24.3,76.5 19.6,72.2M20.5,72.6C20.6,67.2 18.9,64.5 20.8,46.9M20.1,45.7C21.5,43.4 24.1,41.5 28.0,37.6" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="220.0" y="62.9" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="220.0" dy="0.0">Detection arrives:  person#7</tspan></text>
+<path d="M220.5,79.7C220.7,84.2 219.3,86.3 219.9,96.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M220.7,79.5C219.8,82.6 221.6,88.2 220.2,95.5" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M220.0,96.1C218.8,94.5 218.2,94.5 216.3,89.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M220.3,96.0C221.1,95.7 221.5,93.8 223.9,89.7" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="20.0" y="96.0" width="400.0" height="44.0" rx="8.0" fill="#ffffff"/>
+<path d="M27.7,95.5C91.2,93.3 154.6,94.6 412.4,96.3M412.0,96.4C414.2,96.6 414.7,99.4 419.5,103.7M420.1,104.8C420.6,110.2 421.6,118.0 420.7,132.0M419.9,131.7C418.3,134.8 415.5,136.7 412.0,140.0M412.3,140.5C329.0,142.1 246.7,142.4 28.2,140.3M27.9,140.0C25.6,139.1 24.3,137.1 19.6,132.0M19.6,132.3C21.1,124.4 20.5,115.9 19.2,103.7M19.8,103.8C21.8,102.5 23.9,98.9 28.0,96.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M27.5,96.0C126.0,93.6 222.9,93.8 411.7,95.6M412.1,96.1C413.7,96.9 413.7,98.2 420.2,103.6M419.5,104.8C419.1,111.4 420.2,120.0 419.4,131.8M420.1,131.7C417.7,134.3 417.1,135.1 412.3,140.4M412.3,140.0C327.8,141.5 242.9,141.3 27.7,139.5M27.7,140.1C26.8,138.7 26.0,138.0 19.7,132.0M20.0,131.8C19.8,129.8 18.4,125.8 19.7,104.5M20.2,104.4C21.9,101.1 24.6,99.1 27.5,96.2" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="220.0" y="114.7" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="220.0" dy="0.0">Match rules for this label</tspan></text>
+<text x="220.0" y="130.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="220.0" dy="0.0">label-specific first, then "*" wildcard</tspan></text>
+<path d="M219.3,140.2C221.0,143.2 221.4,143.7 219.1,156.3" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M219.4,139.6C220.8,143.8 220.5,147.8 220.2,156.6" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M220.3,155.7C219.1,153.7 218.2,152.1 216.2,150.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M219.8,156.3C220.4,155.7 221.2,154.1 223.3,149.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="20.0" y="156.0" width="400.0" height="44.0" rx="8.0" fill="#ffffff"/>
+<path d="M28.4,155.9C106.5,153.7 185.3,155.0 411.7,155.5M411.8,156.2C413.4,157.8 416.3,159.1 420.2,163.9M419.8,164.6C418.6,168.4 421.0,172.0 419.7,192.8M419.6,191.7C419.0,192.3 418.4,193.8 411.7,199.7M412.0,199.6C300.7,201.5 188.5,201.6 27.8,199.6M27.8,200.3C27.0,199.4 26.0,198.3 19.6,191.7M20.5,191.6C19.8,188.1 20.0,185.0 19.9,164.0M19.8,164.0C21.6,161.8 23.5,160.3 28.1,156.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M28.1,156.3C126.2,153.4 222.6,154.6 411.5,155.9M412.3,156.2C413.8,157.7 414.2,158.0 420.2,163.6M420.2,163.5C420.8,167.4 421.4,171.6 419.5,192.1M419.7,192.3C417.9,193.4 416.2,195.2 411.6,200.0M412.4,200.0C321.4,202.3 231.6,202.4 27.6,200.4M27.9,199.8C27.3,198.6 25.8,197.4 20.3,191.6M19.4,192.7C19.3,188.9 20.2,184.6 20.9,164.7M19.9,164.0C21.4,162.7 22.2,161.6 28.4,155.7" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="220.0" y="174.7" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="220.0" dy="0.0">Per-rule ROI test</tspan></text>
+<text x="220.0" y="190.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="220.0" dy="0.0">bbox centre inside the rule's polygon</tspan></text>
+<path d="M219.9,200.1C220.8,202.8 220.3,204.5 219.8,215.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M220.4,200.4C219.3,202.4 220.5,204.6 219.8,216.1" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M220.1,216.3C219.0,215.0 219.4,215.0 216.6,210.2" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M220.3,216.1C221.4,213.9 221.4,213.8 223.7,209.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="20.0" y="216.0" width="400.0" height="134.0" rx="8.0" fill="#00000008"/>
+<path d="M27.9,215.8C135.7,214.4 241.8,214.1 411.7,215.9M412.1,215.9C412.8,217.0 414.6,218.0 419.6,224.2M419.7,223.5C421.9,251.3 421.3,279.1 421.0,342.0M419.9,341.7C418.9,343.0 419.0,343.2 412.0,350.0M412.0,350.1C342.9,351.0 275.0,351.9 27.5,350.6M28.3,350.3C27.1,349.2 25.7,346.7 20.4,341.6M20.1,341.8C17.4,320.2 17.6,296.9 20.3,223.1M20.1,224.3C21.6,221.8 24.3,219.7 27.6,216.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M28.0,216.5C141.2,215.2 256.6,213.1 411.7,215.4M412.1,215.8C412.9,216.6 415.0,219.2 420.4,224.4M419.4,223.8C421.7,245.6 422.4,266.7 420.8,341.9M419.9,342.0C417.7,344.1 416.6,345.9 412.1,349.7M411.5,350.0C350.2,352.1 287.6,352.8 28.3,349.9M28.4,350.3C27.0,348.8 25.7,348.9 19.6,341.6M20.7,342.5C19.3,321.5 20.0,298.5 19.9,224.9M20.3,223.9C21.2,223.4 22.3,222.6 27.8,216.4" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="220.0" y="238.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="220.0" dy="0.0">Verdict memo:  (track_id, rule_id)</tspan></text>
+<text x="38.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">no entry for this subject</tspan></text>
+<text x="402.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#c2410c" text-anchor="end"><tspan x="402.0" dy="0.0">→ judge</tspan></text>
+<text x="38.0" y="284.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">age ≥ verdict_ttl_s (300 s)</tspan></text>
+<text x="402.0" y="284.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#c2410c" text-anchor="end"><tspan x="402.0" dy="0.0">→ judge</tspan></text>
+<text x="38.0" y="306.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">IoU &lt; 0.5 and age ≥ 20 s</tspan></text>
+<text x="402.0" y="306.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#c2410c" text-anchor="end"><tspan x="402.0" dy="0.0">→ judge</tspan></text>
+<text x="38.0" y="328.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">otherwise</tspan></text>
+<text x="402.0" y="328.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#6b7280" text-anchor="end"><tspan x="402.0" dy="0.0">→ reuse — no inference</tspan></text>
+<text x="220.0" y="374.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="220.0" dy="0.0">This is the load control: reusing a verdict until the subject moves</tspan></text>
+<text x="220.0" y="388.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="220.0" dy="0.0">or the TTL expires is what makes judging a whole crowd affordable.</tspan></text>
+<text x="220.0" y="406.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="11.0" font-weight="normal" fill="#c2410c" text-anchor="middle"><tspan x="220.0" dy="0.0">duty = subjects × inference_s ÷ ttl</tspan></text>
+<path d="M424.8,283.9C435.8,281.7 447.8,284.2 497.5,282.3" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M423.9,282.7C440.1,281.3 454.7,281.6 497.4,283.6" fill="none" stroke="#c2410c" stroke-width="1.19" stroke-linecap="round"/>
+<path d="M498.3,283.3C496.0,283.6 494.5,284.7 490.8,287.4" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<path d="M498.4,283.2C497.1,283.0 496.0,281.3 490.7,278.0" fill="none" stroke="#c2410c" stroke-width="1.70" stroke-linecap="round"/>
+<rect x="500.0" y="38.0" width="420.0" height="60.0" rx="8.0" fill="#ffffff"/>
+<path d="M508.3,37.9C587.6,36.4 668.5,37.0 911.6,38.1M912.3,38.1C913.7,40.1 916.0,42.4 920.2,46.3M919.4,46.2C919.5,57.7 919.9,69.5 919.2,89.1M919.9,90.2C918.9,91.0 916.8,93.3 911.9,97.8M912.0,97.5C845.1,99.8 778.1,99.4 507.5,98.1M508.3,97.7C505.7,96.4 504.0,95.2 499.6,89.8M500.3,90.5C499.3,80.9 498.3,70.0 500.1,45.3M500.1,45.9C501.8,44.0 503.2,42.9 508.2,38.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M508.5,38.2C564.4,35.5 623.2,36.6 912.0,38.0M911.9,38.3C913.6,38.5 914.8,39.9 920.3,46.3M920.4,45.2C921.4,53.7 921.9,60.2 920.5,90.8M920.2,89.9C918.8,91.6 917.0,93.3 911.6,97.6M912.2,97.8C799.1,100.8 687.7,99.5 507.9,98.3M507.9,97.9C507.3,96.8 506.6,96.7 499.6,90.3M500.3,89.9C499.1,78.4 499.1,67.7 500.8,46.0M500.2,45.6C501.7,44.4 502.4,43.2 507.8,38.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="514.0" y="59.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="514.0" dy="0.0">Priority sort</tspan></text>
+<text x="514.0" y="76.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">never-judged subjects first, so a crowd</tspan><tspan x="514.0" dy="12.5">delays re-checks and never first looks</tspan></text>
+<rect x="500.0" y="106.0" width="420.0" height="60.0" rx="8.0" fill="#ffffff"/>
+<path d="M508.2,105.6C607.8,104.8 705.7,103.4 911.9,105.4M912.1,105.9C913.8,108.8 916.2,110.0 920.4,114.3M920.4,114.0C921.9,122.0 921.9,128.8 919.8,157.0M919.8,158.1C918.8,159.6 917.3,161.5 912.2,166.5M911.6,166.0C862.0,167.2 812.2,168.6 508.3,165.7M508.2,166.2C505.8,164.6 504.3,163.1 499.6,158.4M499.2,158.5C498.1,146.4 499.5,134.7 499.2,113.0M499.9,114.4C502.8,111.8 504.0,108.6 508.4,105.6" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M507.6,106.2C587.5,103.1 668.0,103.6 912.6,105.7M912.2,105.8C914.8,107.8 916.6,110.5 920.2,114.2M920.4,113.4C919.1,126.5 919.5,136.9 921.1,158.0M920.0,158.0C919.5,158.8 918.0,160.5 912.0,165.8M912.5,165.7C815.4,167.5 718.1,167.2 508.2,166.6M507.8,165.9C506.1,165.6 505.3,163.5 499.9,158.0M499.3,157.2C500.5,152.2 500.5,141.8 500.2,114.6M499.7,114.3C502.1,112.3 503.8,109.8 507.9,106.1" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="514.0" y="127.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="514.0" dy="0.0">Truncate the batch</tspan></text>
+<text x="514.0" y="144.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">keep max_instances_per_batch; the rest</tspan><tspan x="514.0" dy="12.5">is counted as instances_shed</tspan></text>
+<path d="M709.7,97.9C709.3,99.9 709.9,101.3 709.8,105.2" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M709.7,98.2C710.2,99.1 710.0,100.3 710.0,105.3" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M709.9,104.8C709.7,104.4 709.1,103.4 707.1,99.6" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M710.0,105.2C711.1,103.4 711.8,102.2 713.2,99.8" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="500.0" y="174.0" width="420.0" height="60.0" rx="8.0" fill="#ffffff"/>
+<path d="M507.6,174.1C591.5,171.8 674.9,172.6 911.9,174.2M912.3,173.8C914.2,175.7 916.3,177.6 920.3,181.7M920.6,182.1C919.3,192.8 921.8,200.8 919.3,225.8M919.7,225.6C918.3,226.8 917.2,228.9 911.9,233.6M911.5,233.5C812.0,236.3 714.4,236.2 507.5,234.0M508.1,234.4C506.4,232.3 502.9,229.2 500.2,225.9M500.8,226.6C499.1,211.5 501.0,200.2 500.1,182.6M499.7,182.1C502.7,179.4 504.4,177.5 508.2,174.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M507.8,174.5C603.1,171.6 697.9,172.6 912.0,174.2M911.7,174.0C913.5,175.5 914.9,177.5 920.2,181.7M919.3,182.6C921.6,192.7 922.0,203.0 920.8,225.6M920.1,226.1C918.7,226.5 918.4,227.5 911.5,233.6M911.5,234.2C825.7,235.7 737.0,236.6 507.6,233.7M507.7,234.2C506.1,233.3 505.3,231.3 500.0,225.6M499.5,225.5C499.6,214.7 501.3,199.6 499.5,181.9M499.7,181.6C501.9,179.4 504.5,177.9 507.6,173.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="514.0" y="195.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="514.0" dy="0.0">Focused crop</tspan></text>
+<text x="514.0" y="212.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">pad for context, then dim everything</tspan><tspan x="514.0" dy="12.5">outside the subject's own box</tspan></text>
+<path d="M710.3,165.7C710.3,166.4 710.5,168.6 710.3,173.2" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M710.3,165.8C710.7,168.7 710.6,170.0 710.3,172.6" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M709.9,172.8C708.9,171.3 707.9,169.7 706.6,167.9" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M710.3,172.9C710.4,172.0 710.8,171.5 712.8,168.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="500.0" y="242.0" width="420.0" height="60.0" rx="8.0" fill="#ffffff"/>
+<path d="M507.7,241.5C573.7,240.3 639.7,239.8 911.7,242.2M911.8,242.1C914.2,244.6 916.7,247.0 919.9,249.9M920.1,250.8C921.6,259.2 921.7,268.9 920.1,293.0M919.8,293.9C918.0,296.3 915.8,298.5 911.6,302.1M911.5,301.9C819.3,303.8 724.2,304.0 507.7,301.8M508.1,302.0C507.1,301.4 505.7,299.3 500.3,294.3M499.3,293.9C500.4,286.2 498.7,275.1 499.9,249.3M499.8,249.9C500.7,249.4 502.5,246.8 507.9,241.7" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M508.3,241.9C556.3,241.1 602.7,239.4 912.1,242.5M911.7,241.9C913.2,243.4 914.2,243.2 920.4,250.1M919.8,249.2C919.1,263.6 921.5,275.2 920.6,293.4M920.4,294.3C919.2,295.8 917.6,296.1 911.7,302.0M911.5,302.0C851.4,303.3 790.6,304.2 508.1,301.7M508.2,302.0C507.6,301.4 506.5,300.7 499.8,294.4M499.3,293.9C499.9,286.4 498.1,280.6 500.4,249.7M500.1,249.6C502.2,248.5 503.4,245.9 508.2,241.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="514.0" y="263.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="514.0" dy="0.0">Query the backend</tspan></text>
+<text x="514.0" y="280.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">single-worker executor, hard timeout,</tspan><tspan x="514.0" dy="12.5">cleanup() after every inference</tspan></text>
+<path d="M710.1,234.2C710.1,235.8 709.5,237.4 709.9,241.4" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M709.9,234.3C710.0,235.1 710.2,235.8 709.8,241.3" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M710.0,241.1C709.6,240.1 709.0,238.3 707.1,236.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M710.3,241.2C709.7,240.0 710.8,240.3 713.4,236.1" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<rect x="500.0" y="312.0" width="420.0" height="86.0" rx="8.0" fill="#00000008"/>
+<path d="M507.7,311.8C611.9,309.8 713.7,309.1 912.5,311.8M911.9,312.1C912.6,313.2 914.5,313.9 919.8,320.0M920.0,320.4C920.1,338.6 920.2,355.0 919.7,389.3M920.4,390.2C919.6,390.5 918.3,392.1 912.1,398.3M912.0,398.2C804.5,400.1 697.8,399.3 507.6,398.3M507.9,398.2C505.4,395.5 503.0,392.9 499.8,390.3M500.0,390.0C499.2,376.8 498.8,361.1 499.2,318.9M500.3,320.3C501.5,318.1 504.3,315.7 508.1,311.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M508.1,311.7C622.9,310.4 738.3,310.1 911.4,312.0M911.6,312.1C914.0,314.2 916.5,316.2 920.5,320.2M919.5,320.1C922.0,337.3 921.2,355.6 919.9,389.4M920.2,389.8C917.2,393.0 915.5,395.1 912.0,398.2M912.1,397.7C791.6,399.3 670.1,400.4 507.4,397.5M507.9,397.6C506.3,396.7 506.1,396.5 499.8,390.2M499.7,390.9C499.7,371.3 498.2,349.1 499.2,321.0M499.7,319.9C501.6,318.5 503.6,316.7 507.9,312.4" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<path d="M710.2,301.7C709.4,304.6 709.3,304.9 709.7,310.3" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M710.0,302.1C709.3,303.0 709.5,304.4 709.6,310.2" fill="none" stroke="#1b1b1f" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M710.1,309.9C709.2,309.6 709.1,308.0 706.8,305.0" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<path d="M710.2,309.9C710.0,308.5 711.4,307.6 713.0,305.2" fill="none" stroke="#1b1b1f" stroke-width="1.50" stroke-linecap="round"/>
+<text x="514.0" y="334.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="13.5" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="514.0" dy="0.0">BinaryVerdictParser</tspan></text>
+<text x="514.0" y="353.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">1.  leading word is yes / no  →  taken as decisive</tspan></text>
+<text x="514.0" y="368.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">2.  affirmative vs negative keyword count, negation-aware</tspan></text>
+<text x="514.0" y="383.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="514.0" dy="0.0">3.  ambiguous  →  False.  Alert fatigue is the worse failure.</tspan></text>
+<text x="710.0" y="418.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.5" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="710.0" dy="0.0">verdict written back to the memo, then published on :5558</tspan></text>
+</svg>
+
+    <figcaption><b>Figure 3 — The Stage 2 decision path.</b> The left half decides whether a
+    question is worth asking and runs before any pixels are touched; the memo there is the
+    load control. Two contracts bind the language surface: “Yes” means violation, so prompts must be
+    phrased that way round, and each rule asks a single predicate.</figcaption>
+  </figure>
+
+  <p>Stage 1 is the motion filter, not the classifier: YOLOv8n can only ever say
+  <em class="term">“person”</em> about a warehouse worker, and every question worth asking is asked
+  by Stage 2 in English. Identity must be resolved before the gate can work, and is — a greedy IoU
+  tracker matches boxes within a label across frames, chosen over ByteTrack because Ultralytics
+  resolves its <code>lap</code> dependency at import time by attempting a runtime
+  <code>pip install</code>, a hard failure offline. A swap under occlusion costs one redundant
+  inference, never a missed alert.</p>
+
+  <div class="footline"><span>§2–§3 &nbsp;Workflow and the AI/ML layer</span><span>Page 3 of 4</span></div>
+</section>
+
+<!-- ══════════════════ PAGE 4 — INNOVATION & LIMITS ══════════════════ -->
+<section class="sheet">
+
+  <h2><span class="num">§4</span>Innovation — what is genuinely hard here</h2>
+
+  <figure class="tight">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 322" role="img">
+<rect width="940" height="322" fill="#ffffff"/>
+<rect x="16.0" y="14.0" width="218.0" height="296.0" rx="9.0" fill="#00000008"/>
+<path d="M25.2,13.5C59.9,10.9 90.9,13.4 225.3,14.0M224.8,13.9C226.7,15.0 227.2,17.0 234.5,23.0M234.9,23.5C234.7,54.1 235.8,87.1 233.4,300.6M233.6,301.3C231.9,303.5 228.2,306.0 224.9,309.9M224.7,310.2C198.8,313.4 173.0,311.1 25.6,310.1M24.6,309.7C22.0,306.8 19.8,304.4 15.7,300.5M16.0,301.7C12.2,248.1 13.2,195.5 17.0,22.0M16.1,22.7C18.4,21.5 18.9,19.5 25.3,14.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M24.2,14.2C64.3,13.1 102.8,12.1 224.8,13.6M224.8,14.1C226.9,15.5 226.9,16.8 234.0,23.3M234.3,23.8C237.9,105.5 237.4,185.2 234.7,301.0M233.7,300.8C232.2,303.9 229.6,304.6 225.0,309.7M225.2,310.2C182.5,311.4 140.4,312.1 24.4,310.6M25.1,309.7C22.5,308.2 21.5,305.8 16.2,301.1M15.9,301.5C15.0,266.4 12.0,227.0 16.3,22.1M15.8,23.0C19.1,19.6 22.0,17.8 25.0,13.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="125.0" y="38.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="125.0" dy="0.0">Latency</tspan></text>
+<path d="M32.2,47.9C72.0,45.9 114.1,47.7 218.9,48.3" fill="none" stroke="#6b7280" stroke-width="0.90" stroke-linecap="round"/>
+<rect x="28.0" y="60.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M34.3,60.3C74.2,59.6 115.7,59.1 216.6,60.9M216.1,60.0C217.3,61.6 218.7,63.0 221.9,66.2M221.9,66.0C222.4,81.9 221.4,101.0 221.0,128.2M222.1,127.7C221.6,129.4 220.6,130.1 216.0,133.8M215.4,133.6C185.2,136.1 156.8,134.0 34.1,134.7M33.8,134.2C32.9,132.2 31.2,131.0 28.1,127.8M28.5,128.3C29.2,120.7 28.5,111.7 28.7,66.8M28.1,66.1C29.0,64.7 30.2,63.4 33.7,60.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M33.2,60.9C81.2,59.4 133.0,58.1 215.8,60.8M216.0,60.0C216.5,60.8 217.7,61.2 222.0,65.8M222.8,66.3C221.3,78.0 223.6,89.7 222.8,127.3M221.8,128.1C220.2,130.1 218.6,131.6 215.8,134.3M215.1,134.1C191.3,134.9 164.2,136.5 33.7,132.9M33.9,134.1C33.1,133.5 32.1,131.8 27.7,128.2M27.6,128.4C26.7,120.7 28.2,115.3 28.3,65.7M28.2,66.2C29.0,64.7 29.5,64.2 33.8,60.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="38.0" y="78.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="38.0" dy="0.0">Two-stage cascade</tspan></text>
+<text x="38.0" y="94.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">a 2–4 ms detector gates a</tspan><tspan x="38.0" dy="12.0">~5.6 s reasoner</tspan></text>
+<text x="38.0" y="125.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="38.0" dy="0.0">detector.py · vlm_worker.py</tspan></text>
+<rect x="28.0" y="144.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M34.5,143.9C59.2,141.2 89.0,141.4 216.1,143.9M215.8,144.1C217.3,144.9 217.5,145.5 221.8,150.3M222.5,149.8C222.8,157.0 221.2,163.3 222.2,211.2M222.2,212.0C220.4,213.1 218.6,215.4 215.9,218.1M216.3,218.4C176.3,218.8 133.2,220.1 34.9,217.9M34.2,217.8C32.2,216.3 30.6,214.7 28.1,211.7M28.1,211.9C26.6,197.1 25.8,183.5 28.1,149.1M28.1,150.1C28.7,148.4 30.8,147.5 33.8,143.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M34.9,144.2C64.0,144.3 95.0,140.9 216.5,143.1M215.9,143.8C217.4,145.3 218.2,146.8 221.8,150.0M222.4,149.4C220.8,164.3 222.9,177.8 222.3,211.1M221.8,212.2C219.9,213.7 218.8,214.9 215.7,218.1M215.8,217.2C179.8,219.8 146.1,217.9 35.0,217.4M34.0,217.9C33.0,216.6 31.5,215.8 28.0,212.1M28.2,211.2C26.5,194.9 28.4,177.2 28.4,149.9M28.0,149.8C29.2,148.7 31.0,146.8 34.0,143.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="38.0" y="162.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="38.0" dy="0.0">Crop before inference</tspan></text>
+<text x="38.0" y="178.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">inference outlives buffer</tspan><tspan x="38.0" dy="12.0">slots; crops do not</tspan></text>
+<text x="38.0" y="209.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="38.0" dy="0.0">vlm_worker.py:791</tspan></text>
+<rect x="28.0" y="228.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M33.9,228.2C71.7,225.0 106.4,225.5 216.4,227.6M216.3,228.1C217.1,228.8 216.8,228.8 221.8,234.0M221.5,234.8C222.1,244.0 220.8,256.2 222.8,295.0M222.2,295.7C220.4,297.5 218.6,298.6 216.0,301.9M215.6,301.9C188.0,303.4 158.9,304.9 35.1,302.1M34.0,301.8C32.6,301.2 31.7,299.1 28.1,295.7M28.3,295.7C28.5,283.6 25.9,276.0 29.0,233.4M27.9,234.3C29.4,233.6 30.4,231.5 33.9,228.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M33.3,228.7C82.7,225.8 132.8,225.9 216.8,228.6M216.0,227.8C217.7,229.2 218.7,231.5 222.0,233.9M222.5,234.8C224.2,248.6 222.2,265.4 222.5,296.3M222.1,296.2C220.6,297.3 220.7,297.7 215.7,302.3M215.8,301.7C183.5,303.7 149.0,301.9 33.1,302.4M34.1,301.9C32.9,300.3 30.8,299.0 28.2,295.9M27.3,295.8C26.0,281.8 26.0,269.3 28.3,234.6M28.2,233.9C29.5,232.6 29.5,232.1 34.3,227.7" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="38.0" y="246.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="38.0" dy="0.0">Prompt-side budgeting</tspan></text>
+<text x="38.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">24-token cap + forced Yes/No —</tspan><tspan x="38.0" dy="12.0">every token is a forward pass</tspan></text>
+<text x="38.0" y="293.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="38.0" dy="0.0">settings.py:209</tspan></text>
+<rect x="246.0" y="14.0" width="218.0" height="296.0" rx="9.0" fill="#00000008"/>
+<path d="M254.2,14.0C286.7,11.5 315.6,12.4 454.2,13.2M455.4,14.4C456.9,15.2 458.1,15.4 464.4,22.9M464.7,22.9C466.9,73.9 467.9,123.7 464.5,300.4M464.4,301.2C462.6,303.2 461.6,303.5 455.2,309.8M455.4,310.0C426.5,311.0 396.8,312.5 254.2,310.7M255.4,309.7C254.4,309.0 252.8,308.5 246.0,301.3M246.7,301.5C244.2,264.2 244.3,230.9 246.1,22.1M245.8,23.4C248.2,20.7 250.8,18.5 255.1,14.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M254.4,14.9C303.8,11.7 353.5,13.5 454.5,13.4M454.8,14.0C457.2,16.2 458.0,18.3 464.5,23.4M463.7,23.5C466.8,88.2 466.9,155.9 465.0,300.2M463.8,301.3C462.5,302.6 461.1,304.2 455.1,310.5M455.7,310.3C410.1,313.0 361.9,313.0 255.7,309.1M254.6,309.9C253.0,307.8 251.9,307.4 246.4,300.8M245.5,300.2C243.4,218.7 245.4,137.6 245.4,23.2M246.2,23.3C248.4,20.4 250.9,18.5 254.7,14.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="355.0" y="38.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="355.0" dy="0.0">Correctness</tspan></text>
+<path d="M262.0,47.3C309.8,45.8 355.8,44.9 447.6,48.3" fill="none" stroke="#6b7280" stroke-width="0.90" stroke-linecap="round"/>
+<rect x="258.0" y="60.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M264.7,60.5C304.4,57.6 346.4,59.7 446.6,60.1M445.8,59.8C447.2,61.3 449.6,62.4 452.3,65.7M451.1,66.1C451.8,84.3 451.1,102.3 452.5,128.1M451.8,128.0C450.7,129.1 450.7,129.9 445.9,133.8M445.6,133.6C419.6,133.9 392.9,135.6 263.1,133.6M264.2,133.8C262.7,133.1 261.9,132.0 258.2,128.3M257.8,127.8C258.6,116.5 259.1,103.9 257.2,65.4M258.2,65.8C258.6,64.5 259.9,63.7 264.3,59.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M264.7,59.4C313.8,58.8 365.7,57.3 447.0,59.0M445.8,60.2C447.0,61.8 448.2,62.1 451.7,65.7M452.1,65.6C452.2,81.9 451.9,96.5 451.6,128.8M452.1,128.1C450.6,128.7 449.4,130.4 445.8,134.3M446.7,133.5C424.2,137.0 404.1,136.6 265.0,133.5M263.9,133.8C262.4,132.3 261.1,130.5 257.9,128.0M257.6,127.7C257.9,110.0 258.2,93.5 258.8,65.7M257.8,66.0C258.1,65.8 259.2,64.7 263.7,60.1" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="268.0" y="78.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="268.0" dy="0.0">Focused crops</tspan></text>
+<text x="268.0" y="94.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="268.0" dy="0.0">dim outside the subject box so a</tspan><tspan x="268.0" dy="12.0">neighbour cannot flip the verdict</tspan></text>
+<text x="268.0" y="125.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="268.0" dy="0.0">vlm_worker.py:154</tspan></text>
+<rect x="258.0" y="144.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M264.3,144.6C282.8,142.5 301.7,143.6 446.6,144.9M445.8,143.7C446.9,145.2 447.2,144.9 452.0,150.0M452.9,150.1C452.7,161.9 452.7,171.4 451.7,211.7M451.8,211.8C451.2,213.3 449.3,214.8 446.0,217.7M445.4,217.8C403.4,218.3 358.6,221.2 263.4,218.7M264.0,218.2C263.1,217.7 263.0,216.6 258.3,211.9M258.7,212.0C258.4,195.4 255.8,174.5 257.0,149.5M258.1,150.0C259.0,148.4 260.2,147.4 263.7,144.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M263.7,144.6C299.5,144.2 334.0,143.1 445.6,144.7M446.1,143.9C447.4,145.1 448.6,147.0 452.2,149.7M452.5,150.2C453.8,164.5 452.5,179.6 451.3,211.8M452.2,212.1C450.9,213.0 449.7,214.9 446.1,218.1M446.7,217.9C418.7,218.2 392.0,221.2 263.9,217.1M264.1,218.0C262.9,217.3 262.5,216.5 257.7,212.3M257.8,212.4C259.3,196.6 258.2,181.8 258.4,149.3M258.0,150.2C259.2,149.1 259.3,147.7 263.9,144.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="268.0" y="162.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="268.0" dy="0.0">Per-subject identity</tspan></text>
+<text x="268.0" y="178.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="268.0" dy="0.0">greedy IoU ids, so five workers</tspan><tspan x="268.0" dy="12.0">yield five judgements</tspan></text>
+<text x="268.0" y="209.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="268.0" dy="0.0">tracker.py:51</tspan></text>
+<rect x="258.0" y="228.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M263.6,227.1C310.2,224.9 356.8,225.1 445.7,229.0M446.0,227.7C447.2,229.8 448.7,230.4 451.8,234.1M452.8,234.4C452.0,248.6 450.8,263.2 452.0,296.2M451.8,296.3C451.1,296.8 449.9,298.0 445.7,302.3M445.1,302.3C397.0,304.0 352.1,302.4 263.2,301.2M263.9,302.1C262.7,300.7 261.3,299.4 257.7,295.9M257.1,295.3C258.7,285.5 255.9,276.0 257.4,233.9M257.9,234.0C259.6,232.7 259.7,232.3 264.0,228.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M263.1,227.1C301.2,227.7 338.8,228.3 446.1,227.8M446.0,227.8C447.5,228.6 448.8,229.8 451.9,233.8M452.1,233.6C452.3,245.2 452.8,255.0 452.2,296.0M451.7,296.2C450.5,298.0 449.0,299.2 445.8,302.0M445.8,301.4C400.6,303.6 353.1,302.5 265.0,302.1M264.1,301.9C262.8,301.7 261.7,300.2 258.2,296.0M257.8,295.8C257.1,277.0 258.0,260.1 258.5,233.6M257.8,234.1C259.1,232.5 260.5,232.1 264.3,228.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="268.0" y="246.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="268.0" dy="0.0">Conservative parsing</tspan></text>
+<text x="268.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="268.0" dy="0.0">three strategies, defaulting to</tspan><tspan x="268.0" dy="12.0">"no alert" when ambiguous</tspan></text>
+<text x="268.0" y="293.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="268.0" dy="0.0">vlm_judge.py:73</tspan></text>
+<rect x="476.0" y="14.0" width="218.0" height="296.0" rx="9.0" fill="#00000008"/>
+<path d="M484.5,13.8C525.0,12.3 565.6,14.0 685.3,14.5M684.6,14.3C686.9,14.2 687.1,15.7 694.0,22.7M693.5,23.6C698.0,79.5 697.4,136.9 693.1,301.9M694.0,300.6C692.0,303.9 689.1,306.9 685.1,309.6M684.7,310.4C661.5,311.9 633.6,312.5 484.7,309.1M484.7,310.1C482.5,307.0 480.2,306.0 476.1,301.3M476.4,301.4C472.3,231.0 474.7,159.8 476.6,22.9M475.7,22.8C477.6,20.3 481.2,17.1 485.1,14.4" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M484.9,14.8C511.7,13.4 536.7,11.9 686.0,13.0M684.7,13.8C687.3,15.2 687.0,16.4 694.1,23.4M693.6,23.6C695.7,83.4 696.4,143.0 693.3,300.9M694.1,301.3C691.2,303.6 689.7,305.2 684.6,310.5M684.6,310.3C663.1,311.3 642.3,309.9 485.1,310.2M484.7,309.9C482.8,308.4 481.9,306.8 476.0,301.5M475.4,301.6C473.5,265.6 474.5,231.3 476.8,24.0M475.7,23.0C477.9,22.0 479.8,19.2 485.0,14.0" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="585.0" y="38.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="585.0" dy="0.0">Cost control</tspan></text>
+<path d="M491.6,48.6C524.5,48.3 559.0,46.0 678.4,48.7" fill="none" stroke="#6b7280" stroke-width="0.90" stroke-linecap="round"/>
+<rect x="488.0" y="60.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M493.7,60.7C513.9,59.9 534.8,57.4 675.8,61.0M675.9,59.9C677.1,60.9 678.2,62.4 681.7,65.8M682.8,65.6C681.0,71.7 683.5,78.6 682.7,128.2M681.7,127.8C681.0,129.8 679.1,130.7 676.3,134.3M675.9,133.2C636.9,134.9 600.3,135.3 493.8,135.0M494.1,134.2C492.1,131.9 490.9,130.3 488.3,127.8M487.5,128.9C488.1,111.8 487.8,96.3 487.2,66.0M488.3,66.3C489.7,64.7 491.5,63.2 493.8,59.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M494.1,60.9C547.6,57.8 598.6,60.2 676.8,60.5M676.0,60.2C676.6,60.7 677.9,62.0 682.3,66.2M682.5,66.1C684.2,83.2 682.6,98.6 682.7,128.9M681.7,127.9C681.3,128.2 680.7,128.9 675.9,133.7M675.1,133.2C651.3,133.7 626.2,136.8 495.1,133.7M494.0,134.3C492.9,132.5 491.9,131.4 487.8,127.7M487.2,128.4C488.3,113.2 487.9,100.4 488.6,66.0M488.0,65.9C488.2,65.4 489.5,64.7 493.8,60.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="498.0" y="78.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="498.0" dy="0.0">Four-layer shedding</tspan></text>
+<text x="498.0" y="94.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="498.0" dy="0.0">coalesce → memoise → prioritise</tspan><tspan x="498.0" dy="12.0">→ truncate</tspan></text>
+<text x="498.0" y="125.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="498.0" dy="0.0">vlm_worker.py:663</tspan></text>
+<rect x="488.0" y="144.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M494.2,144.3C540.4,144.2 589.1,144.1 675.8,144.9M675.7,143.9C677.4,144.2 677.9,145.6 682.1,150.1M682.2,149.6C684.1,165.9 683.5,180.5 681.7,211.8M682.0,212.3C680.6,213.3 680.6,214.3 675.9,217.9M675.8,217.3C648.6,218.1 621.1,218.2 494.4,218.2M494.2,217.9C492.9,216.8 493.1,216.3 488.1,211.8M488.4,212.7C486.4,194.5 486.1,176.6 488.1,149.7M487.8,150.2C488.4,149.6 489.3,148.8 494.0,144.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M493.5,143.1C534.4,142.5 573.6,143.2 676.7,143.3M676.0,144.2C677.3,145.1 677.7,145.3 682.3,149.7M682.1,150.5C681.0,164.6 681.3,178.4 681.7,211.4M681.9,212.2C680.6,213.4 679.4,214.4 676.1,217.8M675.5,218.0C636.2,219.5 597.2,219.9 495.0,218.6M494.2,218.3C493.8,217.4 492.2,216.3 487.7,212.0M487.8,212.5C486.0,195.4 487.9,181.7 488.1,149.9M488.1,150.2C489.3,149.0 490.4,147.4 494.1,143.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="498.0" y="162.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="498.0" dy="0.0">Verdict memoisation</tspan></text>
+<text x="498.0" y="178.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="498.0" dy="0.0">keyed (track_id, rule_id) under</tspan><tspan x="498.0" dy="12.0">TTL, motion and a re-judge floor</tspan></text>
+<text x="498.0" y="209.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="498.0" dy="0.0">vlm_worker.py:451</tspan></text>
+<rect x="488.0" y="228.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M494.4,227.3C534.7,225.2 573.7,227.5 676.5,228.6M675.9,228.1C678.0,229.2 679.5,231.2 682.1,234.0M682.0,233.5C683.2,239.2 682.1,246.0 682.3,295.9M681.8,295.7C681.1,297.8 679.1,299.1 675.6,301.9M676.1,302.0C631.4,302.4 589.0,302.8 493.0,301.2M494.0,301.9C492.8,300.8 491.9,300.5 487.7,295.7M487.7,295.4C486.6,285.3 486.5,272.5 488.8,233.9M488.3,233.9C488.8,232.6 490.2,231.8 494.3,228.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M494.8,228.0C524.9,226.9 552.8,228.2 676.7,227.3M675.7,228.1C677.4,228.8 677.9,230.3 681.9,233.7M682.5,234.2C682.3,243.9 681.9,254.8 681.7,295.7M681.9,295.7C680.9,297.1 679.8,298.3 676.2,302.1M676.6,302.9C653.6,301.9 632.3,302.8 494.0,303.0M494.1,302.0C492.6,300.3 491.0,298.6 488.3,295.8M487.5,296.1C486.3,286.3 487.4,279.2 487.5,234.2M488.2,234.2C489.8,232.0 491.6,230.5 493.8,228.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="498.0" y="246.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="498.0" dy="0.0">Zero-copy ring</tspan></text>
+<text x="498.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="498.0" dy="0.0">lock-free stale-OK readers; a</tspan><tspan x="498.0" dy="12.0">reader can never stall the writer</tspan></text>
+<text x="498.0" y="293.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="498.0" dy="0.0">buffer.py:56</tspan></text>
+<rect x="706.0" y="14.0" width="218.0" height="296.0" rx="9.0" fill="#00000008"/>
+<path d="M715.9,14.4C770.3,13.2 824.1,13.1 915.1,14.5M915.0,13.8C916.5,15.5 918.0,15.7 924.2,23.1M923.7,23.0C926.4,98.7 925.1,177.7 923.7,300.2M923.7,301.3C922.0,303.9 919.0,306.2 915.2,309.9M914.3,310.0C885.5,310.4 855.9,311.1 715.3,311.0M714.7,309.7C711.9,307.8 709.3,304.0 706.3,300.6M706.7,301.1C704.7,225.0 704.9,150.4 705.0,24.0M706.4,23.0C707.2,21.6 709.8,18.9 714.9,14.5" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M714.7,13.1C756.5,12.9 795.5,12.6 915.2,13.5M915.3,14.0C917.0,16.6 917.9,18.4 923.8,22.9M924.4,22.3C926.0,94.0 927.2,163.5 923.4,300.3M923.9,300.9C922.1,302.6 921.9,304.6 914.9,310.2M914.7,309.2C878.7,312.4 839.2,310.6 715.2,311.0M714.6,310.4C712.0,307.1 710.4,305.0 705.7,300.6M706.6,301.6C702.5,249.6 702.0,198.9 706.8,23.1M706.1,23.1C708.3,21.5 709.3,18.2 714.9,14.2" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="815.0" y="38.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.5" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="815.0" dy="0.0">Operability</tspan></text>
+<path d="M721.2,48.0C760.1,46.7 802.3,44.7 909.0,48.6" fill="none" stroke="#6b7280" stroke-width="0.90" stroke-linecap="round"/>
+<rect x="718.0" y="60.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M724.6,59.6C755.4,58.4 784.1,60.0 905.7,60.8M906.2,60.1C907.4,61.2 908.6,62.4 912.0,66.0M911.6,66.0C914.2,71.9 911.0,81.5 911.7,128.7M912.1,127.9C910.4,130.1 909.3,131.1 906.3,133.9M905.4,134.3C878.9,136.9 851.4,135.5 724.8,133.1M724.1,133.9C721.8,131.7 719.9,130.7 717.9,128.0M717.2,128.8C716.3,116.5 716.8,100.7 717.6,67.0M718.0,65.9C719.8,65.0 719.9,63.3 723.7,59.7" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M724.0,60.9C747.3,58.3 774.3,58.1 906.3,60.6M905.7,59.7C907.4,62.1 909.6,63.1 912.3,66.0M912.0,66.2C913.0,79.6 911.4,94.1 910.9,127.0M912.3,128.0C909.9,129.9 908.7,130.9 905.8,133.9M906.4,134.1C870.8,137.1 834.7,136.8 723.6,134.6M724.1,134.0C721.9,132.9 721.2,131.4 717.7,127.9M718.4,128.3C718.5,118.5 717.5,104.0 717.5,66.7M718.1,66.3C719.9,64.3 720.7,63.6 724.0,60.2" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="728.0" y="78.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="728.0" dy="0.0">Prompt linting</tspan></text>
+<text x="728.0" y="94.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="728.0" dy="0.0">warns when a rule asks about</tspan><tspan x="728.0" dy="12.0">people but watches all 80 classes</tspan></text>
+<text x="728.0" y="125.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="728.0" dy="0.0">labels.py:123</tspan></text>
+<rect x="718.0" y="144.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M724.2,143.3C777.3,142.9 827.0,142.2 905.6,144.2M905.9,144.1C907.2,145.0 908.2,146.3 912.0,150.1M911.5,149.7C911.9,165.0 912.8,180.6 912.7,212.4M912.3,212.2C911.5,212.6 910.2,213.6 905.7,218.2M905.4,218.4C863.4,219.1 824.9,218.2 723.5,217.8M724.1,217.8C722.6,216.6 720.4,214.5 717.8,212.1M717.9,211.7C718.8,200.9 716.4,190.3 717.1,149.1M718.1,150.3C719.4,148.0 720.5,147.3 723.8,144.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M723.3,144.3C759.8,140.9 796.1,143.2 906.9,143.5M906.2,143.7C907.2,145.2 907.0,145.2 911.9,149.7M912.9,150.9C913.2,165.0 912.6,179.4 911.2,211.7M911.9,211.8C911.1,212.5 910.9,213.0 906.2,218.3M905.6,218.0C852.0,220.8 797.9,217.8 723.4,217.6M723.7,218.0C722.0,215.9 720.2,214.2 718.2,212.2M718.4,212.8C717.1,204.6 717.5,193.9 717.8,150.0M718.2,150.1C718.2,149.2 719.8,148.8 723.9,144.2" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="728.0" y="162.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="728.0" dy="0.0">Display ≠ trigger</tspan></text>
+<text x="728.0" y="178.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="728.0" dy="0.0">a narrow rule never blinds the</tspan><tspan x="728.0" dy="12.0">operator to the rest of the scene</tspan></text>
+<text x="728.0" y="209.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="728.0" dy="0.0">detector.py:610</tspan></text>
+<rect x="718.0" y="228.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
+<path d="M724.5,227.3C744.7,228.2 761.7,227.1 906.6,227.8M905.9,228.1C907.5,229.6 908.5,230.4 912.1,234.0M912.8,234.2C913.5,251.5 914.0,267.3 911.2,296.4M912.2,295.8C911.1,297.1 910.3,296.9 906.0,302.0M906.4,301.7C857.5,305.2 806.1,302.0 724.7,302.1M724.1,301.8C721.9,301.1 720.7,299.4 718.3,296.0M717.8,295.8C716.7,280.8 718.3,265.2 718.4,233.3M718.1,234.3C719.0,232.9 720.6,231.1 724.1,228.0" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
+<path d="M723.4,227.6C744.5,227.2 767.9,225.4 905.0,228.0M905.9,227.7C907.0,229.0 908.5,230.4 912.3,233.9M911.9,234.1C911.3,246.3 913.2,256.3 911.2,296.6M912.3,296.2C911.1,297.0 909.3,298.9 905.8,301.9M906.3,302.8C858.1,302.5 808.5,304.5 723.9,302.6M724.3,302.1C722.7,300.5 721.4,300.4 717.8,296.2M718.8,296.8C718.4,281.3 716.0,268.8 717.1,234.2M718.0,234.2C719.3,232.9 720.3,231.6 723.9,227.8" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
+<text x="728.0" y="246.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="728.0" dy="0.0">Three backends, one Protocol</tspan></text>
+<text x="728.0" y="262.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="728.0" dy="0.0">laptop to Raspberry Pi on a</tspan><tspan x="728.0" dy="12.0">single environment variable</tspan></text>
+<text x="728.0" y="293.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="728.0" dy="0.0">vlm_backends.py:40</tspan></text>
+</svg>
+
+    <figcaption><b>Figure 4 — The twelve strongest ideas in the codebase,</b> grouped by the kind of
+    win each buys and tagged with its source. Every one is running code at this revision.</figcaption>
+  </figure>
+
+  <p>Two carry disproportionate weight. <strong>Four-layer load control with a published
+  formula</strong> is what makes per-subject judging affordable rather than merely correct, and the
+  status endpoint exposes <code>instances_judged</code>, <code>instances_memoised</code> and
+  <code>instances_shed</code> so the arithmetic can be checked against reality.
+  <strong>Focused crops</strong> are the subtlest: the padding that lets a VLM answer relational
+  questions at all is the same padding that drags in the neighbours.</p>
+
+  <h2 style="margin-top:3mm"><span class="num">§5</span>Deployment and security posture</h2>
+
+  <table>
+    <tr><th style="width:30mm">Concern</th><th>Position at this revision</th></tr>
+    <tr><td class="k">Runtime</td><td><code>uv sync</code>, Python ≥ 3.13, one uvicorn process; weights fetched on first run. The device is probed MPS → CUDA → CPU <em>functionally</em> rather than by capability flag, because the flag lies, and the VLM defaults to CPU on measurement: 5.6 s against 6.1 s on MPS.</td></tr>
+    <tr><td class="k">VLM backends</td><td>Three behind one <code>Protocol</code>, one variable apart: <code>moondream</code> in-process (default), <code>transformers</code> interruptible, <code>openai_compat</code> to a local llama.cpp / Ollama server.</td></tr>
+    <tr><td class="k">Edge profile</td><td><code>.env.pi5</code> targets an 8 GB ARM board: <code>openai_compat</code>, 960×540, watchdog 4 FPS, 900 s TTL, batch 3 — ~3 GB of 8. <b>Unverified on hardware.</b></td></tr>
+    <tr><td class="k">Network posture</td><td>No egress by default; the opt-in webhook is the only outbound path. <b>No authentication</b> — CORS <code>*</code>, bind <code>0.0.0.0:8000</code>, every mutating endpoint open. Trusted-LAN only.</td></tr>
+  </table>
+
+  <h2 style="margin-top:2.5mm"><span class="num">§6</span>Limitations</h2>
+
+  <table>
+    <tr><th style="width:46mm">Gap</th><th style="width:17mm">Severity</th><th>Consequence</th></tr>
+    <tr><td class="k">No authentication or TLS</td><td>High</td><td>Anyone on the network can watch the feed, rewrite rules and read evidence.</td></tr>
+    <tr><td class="k">No data retention policy</td><td>High</td><td><code>alerts</code> rows and snapshot JPEGs grow unbounded; only in-memory state is pruned.</td></tr>
+    <tr><td class="k">Single camera; dashboard on public CDNs</td><td>Medium</td><td>One capture though the schema is multi-camera; Tailwind and fonts load remotely, so the UI is not air-gap clean.</td></tr>
+    <tr><td class="k">No motion model; fire-and-forget webhooks; no ROI editor; dead surface</td><td>Low</td><td>~2 ids per person at 6 FPS — redundant inferences, never missed alerts. No webhook retry; <code>roi_json</code> undrawable; <code>SystemStatus</code> and <code>parse_with_confidence()</code> unused.</td></tr>
+  </table>
+
+  <div class="colophon">
+  <b>Colophon and method.</b> Written against a full read of the source at <code>e57a6dd</code>, with
+  every file reference re-verified against the working tree; the test figure is the actual output of
+  <code>pytest -q -m "not slow"</code> — 265 passed, 3 deselected, 23.1 s. Figures are hand-authored
+  vector SVG, generated by <code>docs/diagrams/build.py</code> and inlined.
+  <b>Claims omitted:</b> the README states Stage 1 “filters 99%+ of frames” and that VLM utilisation
+  drops “from 100% to &lt;1%”; neither is measured anywhere in the repository, so neither appears here
+  — §4’s duty-cycle arithmetic is what the code implements, and where the README rounds the ring to
+  “~405 MB” this uses the computed 414.7 MB. Two drifts noted: <code>demo_cctv.py</code> carries an
+  uncommitted change contradicting its own docstring’s filename, and the pytest cache still lists a
+  removed test file — hence 268 collected, not 311.
+  </div>
+
+  <div class="footline"><span>§4–§6 &nbsp;Innovation, deployment, limitations</span><span>Page 4 of 4</span></div>
+</section>
+
+</body>
+</html>
