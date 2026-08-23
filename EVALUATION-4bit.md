@@ -281,18 +281,65 @@ Adopt it for the other two properties, which are unchanged:
 
 ---
 
-## 6. Recommendation
+## 6. Only one stage can have the accelerator
 
-**Adopt, with the device default moved.**
+Moving the VLM onto MPS is not free, and the cost is not the one the old
+`vlm_device=cpu` comment anticipated. **Stage 1 and an in-process VLM cannot
+both drive MPS.** With both on it, the process segfaults:
+
+```
+EXC_BAD_ACCESS (SIGSEGV) ... faulting thread:
+  at::native::_mps_convolution_impl(...)  -> +[NSDictionary dictionaryWithObjects:forKeys:count:]
+concurrently, another thread:
+  -[MPSGraph .cxx_destruct] -> mlir::MLIRContext::~MLIRContext()
+```
+
+One thread building an `MPSGraph` while another tears one down. PyTorch's MPS
+backend is not safe to drive from two threads at once. It is a hard crash — no
+traceback, no shutdown hook, and the ring buffer's shared memory is orphaned —
+and it lands early, usually before the VLM has finished loading. Reproduced on
+every run of a 75 s trial:
+
+| `EYEQ_DEVICE` | `EYEQ_VLM_DEVICE` | Outcome over 75 s |
+|---|---|---|
+| `mps` | `mps` | **SIGSEGV**, model never finished loading |
+| `mps` | `cpu` | survives, 9 verdicts |
+| `cpu` | `mps` | survives, **29 verdicts** |
+
+So the accelerator has to be given to one stage, and the choice is not close.
+Per call on the M2:
+
+| | MPS | CPU | cost of losing it |
+|---|---:|---:|---:|
+| Stage 1 (YOLOv8n @720p) | 16.9 ms | 26.8 ms | **9.9 ms** |
+| Stage 2 (Moondream 2B 4-bit) | 1,873 ms | 11,712 ms | **9,839 ms** |
+
+Stage 1 gives up ten milliseconds a frame; Stage 2 would give up ten seconds a
+verdict — a thousandfold asymmetry. `Settings.inference_device` therefore
+arbitrates the two `auto`s in one place instead of resolving them
+independently, and Stage 1 takes CPU. Naming either device explicitly opts out;
+naming both as the same accelerator is honoured with a warning, because an
+operator who named both meant both.
+
+This applies only to the in-process backends. `openai_compat` keeps its weights
+in another process, so Stage 1 keeps the accelerator under that profile.
+
+Verified end to end: 90 s on the demo clip with defaults, no crash, 34 verdicts,
+inference steady at ~1,870 ms — matching §3.
+
+---
+
+## 7. Recommendation
+
+**Adopt, with the device defaults arbitrated.**
 
 1. `EYEQ_VLM_BACKEND` defaults to `moondream4bit`.
-2. `EYEQ_VLM_DEVICE` moves from `cpu` to `auto` (MPS → CUDA → CPU). This model
-   is vision-bound and the vision tower is what an accelerator is for. Note the
-   control run also **retires the old finding on its own terms**: the fp32
-   `2024-08-26` model now measures 3,327 ms on MPS against 4,757 ms on CPU,
-   reversing the 6.1 s vs 5.6 s recorded when `vlm_device=cpu` was chosen. That
-   default was correct when it was measured and has been overtaken by the
-   toolchain, not by this change.
+2. `EYEQ_VLM_DEVICE` moves from `cpu` to `auto`, and Stage 1 yields the
+   accelerator per §6. Note the control run also **retires the old finding on
+   its own terms**: the fp32 `2024-08-26` model now measures 3,327 ms on MPS
+   against 4,757 ms on CPU, reversing the 6.1 s vs 5.6 s recorded when
+   `vlm_device=cpu` was chosen. That default was correct when it was measured
+   and has been overtaken by the toolchain, not by this change.
 3. `EYEQ_VLM_BACKEND=moondream` remains the better choice on a CPU-only box,
    and is kept for exactly that.
 
@@ -303,6 +350,8 @@ What this change does **not** do:
   1.8× of disk.
 - It does not address the thing §3 identifies as dominant. 89% of the query is
   the vision encoder, and nothing here touches it.
+- It does not let both stages use the accelerator. §6 gives it to Stage 2 and
+  puts Stage 1 on CPU, at ~10 ms/frame.
 
 The next piece of work follows from §3, not from quantization:
 
@@ -319,7 +368,7 @@ The next piece of work follows from §3, not from quantization:
 
 ---
 
-## 7. Reproducing
+## 8. Reproducing
 
 ```bash
 # Fixtures — real Stage 2 person crops from the demo clip
@@ -348,14 +397,14 @@ on first `load()` into `models/moondream-4bit`. Each run writes JSON to
 
 ---
 
-## 8. Limitations
+## 9. Limitations
 
 - **n=9 distinct queries per arm, one clip, one machine.** Enough to settle a
   2.5× latency gap; not enough to say anything about accuracy.
 - **Verdict disagreement is confounded** between quantization, the revision
   gap, and the dtype/device change. Untangling it needs labelled ground truth.
 - **Measured on an M2, not on target hardware.** Every MPS number here is
-  irrelevant to a Pi 5, which is why §6 leaves `.env.pi5` alone.
+  irrelevant to a Pi 5, which is why §7 leaves `.env.pi5` alone.
 - **RSS is not comparable across devices** — see §3. The CPU-to-CPU comparison
   is the only honest memory read in the table.
 - **CUDA was not measured at all.** The int4 path in §1.1, the bf16 default,
@@ -363,3 +412,9 @@ on first `load()` into `models/moondream-4bit`. Each run writes JSON to
   machine has no CUDA device. The code path exists and is unexercised.
 - **The vision encoder was profiled on one crop**, not across the fixture set,
   when attributing the 2024/2025 difference in §3.
+- **The MPS concurrency crash was not bisected against PyTorch versions.** It
+  is reproducible here on torch 2.13 and the arbitration in §6 avoids it
+  rather than fixing it. A serialising lock around both stages' accelerator
+  work would be the alternative, and was not measured — Stage 1 would stall
+  for the ~1.9 s of each verdict, against the flat ~10 ms/frame the chosen fix
+  costs.

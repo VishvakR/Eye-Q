@@ -102,7 +102,7 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_DEVICE` | `auto` | Stage 1 device: `auto`, `mps`, `cuda`, `cpu` |
 | `EYEQ_VLM_BACKEND` | `moondream4bit` | `moondream4bit`, `moondream`, `transformers`, or `openai_compat` |
 | `EYEQ_VLM_MODEL` | `moondream/moondream-2b-2025-04-14-4bit` | Swap in Qwen2-VL-2B, SmolVLM, etc. |
-| `EYEQ_VLM_DEVICE` | `auto` | MPS → CUDA → CPU. The 4-bit model is vision-bound and wants the accelerator |
+| `EYEQ_VLM_DEVICE` | `auto` | MPS → CUDA → CPU. The 4-bit model is vision-bound and **wins the accelerator from Stage 1**, which drops to CPU — both on MPS segfaults PyTorch |
 | `EYEQ_API_PORT` | `8000` | Dashboard & API port |
 | `EYEQ_WEBHOOK_URL` | `None` | Webhook endpoint for alerts |
 | `EYEQ_TRACK_ENABLED` | `true` | Judge every subject in a frame, not one per label |

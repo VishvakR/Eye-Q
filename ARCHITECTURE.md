@@ -725,13 +725,15 @@ not a validation error afterwards.
    model on a laptop and a quantized model over HTTP on a Pi, with one env var between them.
 7. **Conservative verdict parsing.** Three strategies defaulting to `False`, because alert fatigue is
    a worse failure than a missed alert.
-8. **Measured defaults, and re-measured ones.** `vlm_device` defaulted to `cpu` for a year on the
-   finding that Moondream2 ran 5.6 s on CPU versus 6.1 s on MPS. Both halves of that have since
-   been overtaken: the 4-bit `2025-04-14` model is 89% vision encoder and wants the accelerator
-   (1,873 ms on MPS against 11,712 ms on CPU), and even the old fp32 model now measures 3,327 ms
-   on MPS against 4,757 ms on CPU. The default is now `auto`; see
-   [EVALUATION-4bit.md](EVALUATION-4bit.md). Device detection uses a *functional* probe
-   (`torch.zeros(1, device="mps")`), not a capability flag, because the flag lies.
+8. **The accelerator is arbitrated, not contended.** Stage 1 and an in-process VLM cannot both
+   drive MPS — the process segfaults inside `_mps_convolution_impl`, one thread building an
+   `MPSGraph` while another tears one down. So the two `auto`s resolve in one place, and Stage 2
+   wins: losing MPS costs Stage 1 **9.9 ms/frame** (16.9 → 26.8) and would cost Stage 2
+   **9.8 s/verdict** (1,873 → 11,712). A thousandfold asymmetry is not a close call. This also
+   retires a year-old default — `vlm_device` was `cpu` on the finding that Moondream2 ran 5.6 s
+   there against 6.1 s on MPS, and the fp32 model now measures 3,327 ms on MPS against 4,757 ms
+   on CPU. See [EVALUATION-4bit.md](EVALUATION-4bit.md) §6. Device detection uses a *functional*
+   probe (`torch.zeros(1, device="mps")`), not a capability flag, because the flag lies.
 9. **Prompt-side latency engineering.** `max_tokens=2` and a forced Yes/No suffix — each extra token
    is another sequential forward pass through the model. Note the ceiling is a *guard*, not a lever:
    it bounds a model that ignores the instruction and rambles, and it stops a batched `generate()`
@@ -819,8 +821,8 @@ authoritative configuration documentation.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `EYEQ_DEVICE` | `auto` | Stage 1 — `auto` \| `mps` \| `cuda` \| `cpu` |
-| `EYEQ_VLM_DEVICE` | `auto` | `auto` \| `mps` \| `cuda` \| `cpu`. The 4-bit model is vision-bound and wants the accelerator; `moondream` still prefers `cpu` |
+| `EYEQ_DEVICE` | `auto` | Stage 1 — `auto` \| `mps` \| `cuda` \| `cpu`. Under `auto` it **yields the accelerator to an in-process VLM and takes CPU**; two threads on one MPS device segfaults PyTorch |
+| `EYEQ_VLM_DEVICE` | `auto` | `auto` \| `mps` \| `cuda` \| `cpu`. The 4-bit model is vision-bound and wins the arbitration; `moondream` still prefers `cpu` |
 
 **API, storage, streaming, logging**
 

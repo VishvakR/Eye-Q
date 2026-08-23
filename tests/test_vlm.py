@@ -988,6 +988,71 @@ class TestBackendFactory:
             backend.query(Image.new("RGB", (64, 64)), "Is there a person?")
 
 
+class TestAcceleratorArbitration:
+    """Stage 1 and an in-process VLM must not both drive one accelerator.
+
+    Not a preference. PyTorch's MPS backend is not safe to drive from two
+    threads at once: with both stages on MPS this process segfaults inside
+    ``_mps_convolution_impl``, one thread building an ``MPSGraph`` while the
+    other tears one down. It is a hard crash — no traceback, no shutdown hook,
+    and the ring buffer's shared memory is orphaned — so nothing downstream
+    gets a chance to handle it and the only fix is to not create the pairing.
+    """
+
+    def _settings(self, monkeypatch, detected="mps", **kwargs):
+        from app.config import settings as settings_module
+        from app.config.settings import Settings
+
+        monkeypatch.setattr(
+            settings_module, "detect_inference_device", lambda: detected
+        )
+        return Settings(**kwargs)
+
+    def test_the_vlm_wins_the_accelerator_by_default(self, monkeypatch):
+        """Stage 1 pays ~10 ms/frame for the swap; Stage 2 would pay ~10 s."""
+        s = self._settings(monkeypatch)
+        assert s.vlm_inference_device == "mps"
+        assert s.inference_device == "cpu"
+
+    def test_an_out_of_process_vlm_does_not_contend(self, monkeypatch):
+        """openai_compat holds its weights elsewhere, so Stage 1 keeps MPS."""
+        s = self._settings(monkeypatch, vlm_backend="openai_compat")
+        assert s.inference_device == "mps"
+
+    def test_no_accelerator_means_nothing_to_arbitrate(self, monkeypatch):
+        s = self._settings(monkeypatch, detected="cpu")
+        assert s.inference_device == "cpu"
+        assert s.vlm_inference_device == "cpu"
+
+    def test_an_explicit_stage_1_device_opts_out(self, monkeypatch):
+        """Naming a device means getting it, arbitration included."""
+        s = self._settings(monkeypatch, device="mps")
+        assert s.inference_device == "mps"
+
+    def test_an_explicit_vlm_device_leaves_stage_1_alone(self, monkeypatch):
+        """Sending the VLM to CPU removes the contention, so Stage 1 keeps MPS."""
+        s = self._settings(monkeypatch, vlm_device="cpu")
+        assert s.vlm_inference_device == "cpu"
+        assert s.inference_device == "mps"
+
+    def test_an_explicit_crashing_pairing_warns(self, monkeypatch, caplog):
+        """Honoured, because it was asked for — but never silently."""
+        import logging
+
+        s = self._settings(monkeypatch, device="mps", vlm_device="mps")
+        with caplog.at_level(logging.WARNING):
+            assert s.vlm_inference_device == "mps"
+        assert s.inference_device == "mps"
+        assert "segfault" in caplog.text.lower()
+
+    def test_the_arbitration_reaches_the_built_backend(self, monkeypatch):
+        """End of the chain — build_backend must see the arbitrated device."""
+        from app.pipelines.vlm_backends import build_backend
+
+        s = self._settings(monkeypatch)
+        assert build_backend(s).device == "mps"
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Backlog Coalescing Tests
 # ═══════════════════════════════════════════════════════════════════

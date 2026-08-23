@@ -468,12 +468,21 @@ class Settings(BaseSettings):
     # ── Inference Device ─────────────────────────────────────────
     device: Literal["auto", "mps", "cuda", "cpu"] = Field(
         default="auto",
-        description="Inference device for YOLO. 'auto' detects MPS → CUDA → CPU.",
+        description=(
+            "Inference device for YOLO. 'auto' detects MPS → CUDA → CPU, then "
+            "yields the accelerator to an in-process VLM and takes CPU — two "
+            "threads on one MPS device segfaults PyTorch, and Stage 1 pays "
+            "~10 ms/frame for the swap where Stage 2 would pay ~10 s/verdict. "
+            "Set this explicitly to opt out of that arbitration."
+        ),
     )
     vlm_device: Literal["auto", "mps", "cuda", "cpu"] = Field(
         default="auto",
         description=(
-            "Inference device for the VLM. 'auto' probes MPS -> CUDA -> CPU. "
+            "Inference device for the VLM. 'auto' probes MPS -> CUDA -> CPU "
+            "and wins it from Stage 1, which drops to CPU — see "
+            "Settings.inference_device for why that arbitration exists and "
+            "what it costs. "
             "This used to default to 'cpu' on the measurement that Moondream2 "
             "at the 2024-08-26 revision ran no faster on MPS (6.1s vs 5.6s per "
             "query) and loaded ~10s slower, so the accelerator only cost "
@@ -536,19 +545,79 @@ class Settings(BaseSettings):
         default="INFO", description="Application log level."
     )
 
+    # Backends that run the model inside this process, and therefore contend
+    # with Stage 1 for an accelerator. ``openai_compat`` holds its weights in
+    # another process and never does.
+    _IN_PROCESS_VLM_BACKENDS = ("moondream4bit", "moondream", "transformers")
+
+    def _accelerator_contended(self) -> bool:
+        """Whether both stages would land on the same accelerator by default.
+
+        Only true when *neither* device was set explicitly. An operator who
+        names a device gets that device, and a warning if the pairing is the
+        unsafe one.
+        """
+        return (
+            self.device == "auto"
+            and self.vlm_device == "auto"
+            and self.vlm_backend in self._IN_PROCESS_VLM_BACKENDS
+            and detect_inference_device() != "cpu"
+        )
+
     @property
     def inference_device(self) -> str:
-        """Resolve ``'auto'`` to the actual best-available device string."""
-        if self.device == "auto":
-            return detect_inference_device()
-        return self.device
+        """Resolve Stage 1's device, yielding the accelerator to Stage 2.
+
+        PyTorch's MPS backend is not safe to drive from two threads at once.
+        With Stage 1 and an in-process VLM both on MPS, this process segfaults
+        inside ``_mps_convolution_impl`` — one thread building an ``MPSGraph``
+        while the other tears one down — usually before the VLM has even
+        finished loading. It is a hard crash, not an exception: no traceback,
+        no shutdown hook, and the ring buffer's shared memory is left behind.
+
+        So the two `auto`s are arbitrated here rather than resolved
+        independently, and the accelerator goes to Stage 2. The measurement is
+        lopsided enough that it is not a close call — on an M2, per call:
+
+        | | MPS | CPU | cost of losing it |
+        |---|---|---|---|
+        | Stage 1 (YOLOv8n @720p) | 16.9 ms | 26.8 ms | **9.9 ms** |
+        | Stage 2 (Moondream 2B 4-bit) | 1,873 ms | 11,712 ms | **9,839 ms** |
+
+        Stage 1 gives up ten milliseconds a frame; Stage 2 would give up ten
+        seconds a verdict. Setting ``EYEQ_DEVICE`` explicitly opts out.
+        """
+        if self.device != "auto":
+            return self.device
+        if self._accelerator_contended():
+            return "cpu"
+        return detect_inference_device()
 
     @property
     def vlm_inference_device(self) -> str:
-        """Resolve the VLM device. Falls back to CPU inside the backend's load()."""
-        if self.vlm_device == "auto":
-            return detect_inference_device()
-        return self.vlm_device
+        """Resolve the VLM device. Falls back to CPU inside the backend's load().
+
+        Wins the arbitration described on :attr:`inference_device`. Warns when
+        an explicit pairing recreates the crash rather than silently overriding
+        it — an operator who named both devices meant both devices.
+        """
+        resolved = (
+            detect_inference_device() if self.vlm_device == "auto" else self.vlm_device
+        )
+        if (
+            resolved != "cpu"
+            and self.vlm_backend in self._IN_PROCESS_VLM_BACKENDS
+            and self.device != "auto"
+            and self.device == resolved
+        ):
+            logger.warning(
+                f"EYEQ_DEVICE and EYEQ_VLM_DEVICE are both '{resolved}'. Driving "
+                "it from Stage 1 and an in-process VLM at the same time "
+                "segfaults inside PyTorch's MPS backend. Set EYEQ_DEVICE=cpu, "
+                "or EYEQ_VLM_BACKEND=openai_compat to move the weights out of "
+                "this process."
+            )
+        return resolved
 
     @property
     def video_source(self) -> str | int:

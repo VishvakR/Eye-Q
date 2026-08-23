@@ -367,7 +367,7 @@ Everything flows through `Settings` (`app/config/settings.py`), overridable by
 | `EYEQ_BUFFER_CAPACITY` | `150` | ~405 MB at 720p; 5s of history |
 | `EYEQ_TARGET_FPS` | `30` | Capture rate cap |
 | `EYEQ_DEVICE` | `auto` | Stage 1: MPS → CUDA → CPU |
-| `EYEQ_VLM_DEVICE` | `auto` | MPS → CUDA → CPU. The 4-bit model is vision-bound and wants the accelerator |
+| `EYEQ_VLM_DEVICE` | `auto` | MPS → CUDA → CPU; wins it from Stage 1, which takes CPU |
 | `EYEQ_VLM_BACKEND` | `moondream4bit` | or `moondream` / `transformers` / `openai_compat` |
 | `EYEQ_VLM_MODEL` | `moondream/moondream-2b-2025-04-14-4bit` | HF id for the in-process backends |
 | `EYEQ_VLM_API_BASE` | `http://127.0.0.1:11434/v1` | Local server for `openai_compat` |
@@ -480,10 +480,17 @@ uv run python demo.py --source demovideo.mp4 --labels person
   CUDA kernel, so off CUDA the weights are dequantized at load: disk drops
   1.8× (2.0 GB vs 3.7 GB) but CPU RSS only 12%. The CUDA int4 path exists in
   the backend and has never been run — this machine has no CUDA device.
+- **Only one stage may use the accelerator.** Stage 1 and an in-process VLM
+  both on MPS segfaults inside PyTorch's `_mps_convolution_impl` — one thread
+  building an `MPSGraph` while another tears one down. `Settings.inference_device`
+  arbitrates the two `auto`s and gives it to Stage 2, because losing it costs
+  Stage 1 9.9 ms/frame and would cost Stage 2 9.8 s/verdict. The arbitration
+  avoids the race rather than fixing it; a serialising lock was not measured.
+  See [EVALUATION-4bit.md](EVALUATION-4bit.md) §6.
 - **`vlm_device` is no longer `cpu`.** It was, on the measurement that
   Moondream2 ran 6.1s/query on MPS vs 5.6s on CPU. Both the model and that
-  finding have been overtaken; see the entry above and
-  [EVALUATION-4bit.md](EVALUATION-4bit.md) §6. Real *edge* throughput still
+  finding have been overtaken; see the entries above and
+  [EVALUATION-4bit.md](EVALUATION-4bit.md) §7. Real *edge* throughput still
   comes from `openai_compat` against a local quantized server — a Pi 5 has no
   MPS, and this model on CPU is 11.7 s.
 - **Only the in-process Moondream paths are exercised end to end here.** The `transformers`
