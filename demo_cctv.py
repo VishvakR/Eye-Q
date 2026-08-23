@@ -18,7 +18,7 @@ Usage:
     # Full cascade + dashboard on http://localhost:8000
     uv run python demo_cctv.py
 
-    # Stage 1 only — YOLO boxes and the live feed, no 3.5 GB model load
+    # Stage 1 only — YOLO boxes and the live feed, no 2 GB model load
     uv run python demo_cctv.py --stage1
 
     # Native OpenCV window instead of the dashboard (Stage 1 visual runner)
@@ -128,10 +128,12 @@ def _demo_environment(args: argparse.Namespace) -> dict[str, str]:
         # Wide CCTV shot: the figures are small. 0.25 starts inventing boats
         # and chairs out of the pallet stacks; 0.35 loses real workers.
         "EYEQ_YOLO_CONFIDENCE": "0.30",
-        # Moondream2 on CPU is seconds per query, so a trigger can easily wait
-        # longer than the 5s default before Stage 2 reaches it (measured ~4s
-        # per query, two enabled rules per trigger, against a 12s cooldown).
-        # Discarding it then would leave the demo silent.
+        # A trigger can wait longer than the 5s default before Stage 2
+        # reaches it, and discarding it then would leave the demo silent.
+        # Sized against the old fp32-on-CPU backend at ~4s per query; the
+        # 4-bit default answers in ~1.9s on an accelerator, so this is now
+        # slack rather than a fit — deliberately, since the demo also has to
+        # survive a CPU-only machine where the same query takes ~11.7s.
         "EYEQ_VLM_STALENESS_S": "25.0",
         "EYEQ_DETECTION_COOLDOWN_S": "12.0",
     }
@@ -254,7 +256,7 @@ def _run_dashboard(args: argparse.Namespace) -> None:
             f"  Stage 2:    {settings.vlm_backend} / {settings.vlm_model} "
             f"on {settings.vlm_inference_device}"
         )
-        logger.info("              First run loads ~3.5 GB — verdicts start after that.")
+        logger.info("              First run downloads ~2 GB — verdicts start after that.")
     else:
         logger.info("  Stage 2:    disabled (--stage1)")
     logger.info(f"  Dashboard:  http://localhost:{settings.api_port}")
