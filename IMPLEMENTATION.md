@@ -19,7 +19,7 @@ cascade**.
 
 | | Stage 1 — Watchdog | Stage 2 — VLM |
 |---|---|---|
-| Model | YOLOv8n (nano) | Moondream2 (1.86B) or a local server |
+| Model | YOLOv8n (nano) | Moondream 2B 4-bit (2025-04-14) or a local server |
 | Runs | Always, up to 30 FPS | Wake-on-event only |
 | Cost | ~2–4 ms/frame | ~800 ms (GPU) – 8 s (CPU) |
 | Job | Cheap filter: *is anything here?* | Expensive judgement: *does it violate the rule?* |
@@ -147,9 +147,9 @@ What happens when a person walks into frame:
 | Filters (pure geometry) | <0.1 ms |
 | ZMQ round trip | ~0.1 ms |
 | Crop | ~0.5 ms |
-| **VLM inference** | **~8,300 ms (Moondream2, CPU)** |
+| **VLM inference** | **~1,900 ms (Moondream 2B 4-bit, MPS)** |
 | Verdict parse + DB insert | ~1 ms |
-| **Total trigger → alert** | **~8.3 s** |
+| **Total trigger → alert** | **~1.9 s** |
 
 The VLM dominates by three orders of magnitude — hence the cascade, and hence
 `vlm_timeout_s` defaulting to 60s as a runaway guard rather than a latency
@@ -257,12 +257,13 @@ Stage 1 published ~74/min — the shortfall is arithmetic, not inefficiency.
 
 ### `app/pipelines/vlm_backends.py` — pluggable VLM
 
-All three backends are **fully local** — Eye-Q has no cloud dependency in any
+All four backends are **fully local** — Eye-Q has no cloud dependency in any
 configuration. Select with `EYEQ_VLM_BACKEND`.
 
 | Backend | When to use |
 |---|---|
-| `moondream` (default) | Simplest. In-process, no external service. Pinned to revision `2024-08-26`, whose API is `encode_image()` + `answer_question()` — hence `transformers<4.50`. |
+| `moondream4bit` (default) | In-process, no external service, ~2 GB on disk. The `2025-04-14` revision, shipped 4-bit. The only in-process backend that can read a verdict off the prefill logits. Its weights are dequantized at load off CUDA — the remote code's `int4_weight_only()` kernel is CUDA-only. |
+| `moondream` | The fp32 `2024-08-26` revision, whose API is `encode_image()` + `answer_question()` — hence `transformers<4.50`. Kept as the measured baseline, and the better choice when the VLM must run on CPU. |
 | `transformers` | Any chat-templated vision-to-text model in-process via `AutoProcessor` + `AutoModelForVision2Seq` — Qwen2-VL-2B, SmolVLM, MiniCPM-V. Set `EYEQ_VLM_MODEL` to the HF id. |
 | `openai_compat` | **Fastest on constrained edge hardware.** Points at Ollama / llama.cpp / vLLM on the same box. A quantized server typically beats HF Transformers on CPU by a wide margin and keeps multi-GB weights out of this process. |
 
@@ -293,16 +294,21 @@ Edge-viable options:
 | SmolVLM-Instruct | 2B | ~4.5 GB | Lightest; Idefics3 architecture |
 | **Qwen2-VL-2B-Instruct** | 2B | ~4.4 GB | Best quality-per-watt at this size |
 | Qwen2.5-VL-3B-Instruct | 3B | ~7 GB | Stronger; needs `transformers>=4.49` |
-| Moondream2 | 1.86B | ~3.7 GB | Current default; VQA-focused |
+| **Moondream 2B 4-bit** | 2B | ~2.0 GB | Current default; VQA-focused, probe-capable |
+| Moondream2 | 1.86B | ~3.7 GB | The fp32 baseline it replaced |
 
 The installed `transformers` is **4.49.0**, pinned `<4.50` for Moondream2's
-`2024-08-26` revision. Models whose `model_type` shipped in 4.50+ (SmolVLM2,
-among others) will not load until that pin is raised — which means retesting
-Moondream.
+`2024-08-26` revision, which the `moondream` backend still targets. The
+default `moondream4bit` backend's `2025-04-14` remote code declares 4.44 and
+is happy anywhere in that range. Models whose `model_type` shipped in 4.50+
+(SmolVLM2, among others) will not load until that pin is raised — which means
+retesting both Moondream paths.
 
-Generation is greedy (`do_sample=False`) in the in-process backends: a binary
-verdict must be reproducible, and sampling would make the same frame answer
-differently between runs.
+Generation is greedy in the in-process backends: a binary verdict must be
+reproducible, and sampling would make the same frame answer differently
+between runs. That is `do_sample=False` for `transformers`, and an explicit
+`temperature=0` for `moondream4bit` — whose `query()` otherwise samples at
+temperature 0.5 / top_p 0.3 by default.
 
 Whatever the model, `BinaryVerdictParser` handles the response, and Eye-Q
 appends `" Answer with only Yes or No."` to every prompt — so a new model
@@ -361,9 +367,9 @@ Everything flows through `Settings` (`app/config/settings.py`), overridable by
 | `EYEQ_BUFFER_CAPACITY` | `150` | ~405 MB at 720p; 5s of history |
 | `EYEQ_TARGET_FPS` | `30` | Capture rate cap |
 | `EYEQ_DEVICE` | `auto` | Stage 1: MPS → CUDA → CPU |
-| `EYEQ_VLM_DEVICE` | `cpu` | Moondream2 crashes on MPS |
-| `EYEQ_VLM_BACKEND` | `moondream` | or `transformers` / `openai_compat` |
-| `EYEQ_VLM_MODEL` | `vikhyatk/moondream2` | HF id for `moondream` / `transformers` |
+| `EYEQ_VLM_DEVICE` | `auto` | MPS → CUDA → CPU. The 4-bit model is vision-bound and wants the accelerator |
+| `EYEQ_VLM_BACKEND` | `moondream4bit` | or `moondream` / `transformers` / `openai_compat` |
+| `EYEQ_VLM_MODEL` | `moondream/moondream-2b-2025-04-14-4bit` | HF id for the in-process backends |
 | `EYEQ_VLM_API_BASE` | `http://127.0.0.1:11434/v1` | Local server for `openai_compat` |
 | `EYEQ_VLM_API_MODEL` | `moondream` | Model name requested from that server |
 | `EYEQ_VLM_TIMEOUT_S` | `60.0` | Runaway guard, not a latency target |
@@ -464,20 +470,33 @@ uv run python demo.py --source demovideo.mp4 --labels person
 - **Single camera.** The schema, API, and buffer IDs are multi-camera-shaped,
   but one capture/watchdog pair runs today. Multi-camera needs a buffer per
   stream (~405 MB each at 720p).
-- **Moondream2 gets no benefit from MPS.** It runs there without crashing
-  (contrary to a stale comment in the original `settings.py`), but measured
-  6.1s/query on MPS vs 5.6s on CPU, with a ~10s longer load — so `vlm_device`
-  defaults to CPU and MPS is left to Stage 1. Real edge throughput comes from
-  `openai_compat` against a local quantized server, not from the accelerator.
-- **Only the Moondream path is exercised end to end here.** The `transformers`
+- **Stage 2 is now vision-bound, and nothing here addresses that.** On the
+  default 4-bit model the vision encoder is **89%** of a query (1,664 ms of
+  1,873 ms on MPS); prefill is 207 ms and decode is negligible. That makes
+  `EYEQ_VLM_MAX_CROP_EDGE=511` stale — it was tuned against the 2024 encoder's
+  single-pass threshold, and the 2025 one always emits a global view plus at
+  least one tile. See [EVALUATION-4bit.md](EVALUATION-4bit.md) §3.
+- **The 4-bit model is only 4-bit on disk here.** `int4_weight_only()` needs a
+  CUDA kernel, so off CUDA the weights are dequantized at load: disk drops
+  1.8× (2.0 GB vs 3.7 GB) but CPU RSS only 12%. The CUDA int4 path exists in
+  the backend and has never been run — this machine has no CUDA device.
+- **`vlm_device` is no longer `cpu`.** It was, on the measurement that
+  Moondream2 ran 6.1s/query on MPS vs 5.6s on CPU. Both the model and that
+  finding have been overtaken; see the entry above and
+  [EVALUATION-4bit.md](EVALUATION-4bit.md) §6. Real *edge* throughput still
+  comes from `openai_compat` against a local quantized server — a Pi 5 has no
+  MPS, and this model on CPU is 11.7 s.
+- **Only the in-process Moondream paths are exercised end to end here.** The `transformers`
   and `openai_compat` backends are unit-tested for construction and protocol
   conformance, but were not run against live weights — validate your chosen
   model on the target board before deploying.
 - **Aborting a timed-out inference is backend-dependent.** The
   `transformers` backend halts generation cooperatively via a
-  `StoppingCriteria` watching a stop event. `moondream` cannot — its wrapper
-  drives `generate()` internally and takes no stopping hook — so a timed-out
-  Moondream inference still runs to completion and is merely ignored.
+  `StoppingCriteria` watching a stop event. Neither Moondream backend can —
+  their wrappers drive generation internally and take no stopping hook — so a
+  timed-out Moondream inference still runs to completion and is merely
+  ignored. It is a shrinking problem on the probe path, which has no token
+  boundary to stop at because it generates nothing.
 - **Watchdog ROI is global.** Per-rule ROI is enforced in Stage 2, so a
   detection outside every rule's ROI still costs a YOLO trigger and a buffer
   fetch (but no VLM call).

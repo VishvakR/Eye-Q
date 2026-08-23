@@ -13,13 +13,13 @@ RTSP Camera → VideoCapture → Ring Buffer (Shared Memory)
                                   ↓
                           Stage 1: YOLOv8n (~16ms/frame on M2 MPS)
                                   ↓ (ZMQ trigger)
-                          Stage 2: Moondream2 VLM (~4s, wake-on-event)
+                          Stage 2: Moondream 2B 4-bit VLM (~1.9s, wake-on-event)
                                   ↓
                           Binary Verdict → Webhook / Dashboard
 ```
 
 - **Stage 1** (Always-On Watchdog): Lightweight YOLOv8n filters 99%+ of frames
-- **Stage 2** (Wake-on-Event VLM): Moondream2 processes only triggered frames
+- **Stage 2** (Wake-on-Event VLM): Moondream 2B processes only triggered frames
 - **Result**: VLM GPU utilization drops from 100% to <1%
 
 ## Quickstart
@@ -100,8 +100,9 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_BUFFER_CAPACITY` | `150` | Frames in ring buffer (~5s at 30 FPS, ~405 MB at 720p) |
 | `EYEQ_YOLO_MODEL` | `yolov8n.pt` | YOLO model file |
 | `EYEQ_DEVICE` | `auto` | Stage 1 device: `auto`, `mps`, `cuda`, `cpu` |
-| `EYEQ_VLM_BACKEND` | `moondream` | `moondream`, `transformers`, or `openai_compat` |
-| `EYEQ_VLM_MODEL` | `vikhyatk/moondream2` | Swap in Qwen2-VL-2B, SmolVLM, etc. |
+| `EYEQ_VLM_BACKEND` | `moondream4bit` | `moondream4bit`, `moondream`, `transformers`, or `openai_compat` |
+| `EYEQ_VLM_MODEL` | `moondream/moondream-2b-2025-04-14-4bit` | Swap in Qwen2-VL-2B, SmolVLM, etc. |
+| `EYEQ_VLM_DEVICE` | `auto` | MPS → CUDA → CPU. The 4-bit model is vision-bound and wants the accelerator |
 | `EYEQ_API_PORT` | `8000` | Dashboard & API port |
 | `EYEQ_WEBHOOK_URL` | `None` | Webhook endpoint for alerts |
 | `EYEQ_TRACK_ENABLED` | `true` | Judge every subject in a frame, not one per label |
@@ -138,7 +139,9 @@ So batching buys little here, and it is not free:
 
 - **KV cache scales linearly with batch size** — roughly 295 MB per sequence for
   Moondream2 at fp32. On an 8 GB SBC already holding YOLO, the ring buffer and a
-  3.5 GB model, `4` is not obviously affordable.
+  3.5 GB model, `4` is not obviously affordable. The default `moondream4bit`
+  backend cannot batch at all — its revision's `batch_answer()` is a sequential
+  loop upstream — so there this only groups queries, it does not fuse them.
 - **A timeout costs the whole group.** The worker abandons the remaining batch
   when an inference overruns, so one wedged dispatch takes N subjects with it
   instead of one.
@@ -175,19 +178,25 @@ distribution the prefill already computed: compare the probability mass on the
 `Yes` tokens against the `No` tokens at the first answer position. One forward
 pass, no decode, no parsing, and a calibrated `confidence` on every result.
 
-Measured on an M-series CPU, moondream2 fp32, over the real fixtures:
+Be clear that the win is correctness, not speed. Measured over the real
+fixtures on the default 4-bit model at MPS, removing the decode is worth
+**11 ms — 0.6%**, because the query is dominated by something else entirely:
 
-| | |
-|---|---|
-| `encode_image` (vision) | 1109 ms |
-| answer capped at 1 token — what a probe costs | 2690 ms |
-| answer at natural stop — what `generate()` costs | 2960 ms |
-| **decode beyond the first token** | **270 ms — 9.1% of the query** |
+| | | |
+|---|---:|---:|
+| `encode_image` (vision) | 1,664 ms | **88.8%** |
+| decoder prefill | 207 ms | 11.1% |
+| decode beyond the first token | ~11 ms | 0.6% |
 
-Be clear about which half of this is the win. Because prefill is ~99% of the
-query, removing decode entirely is worth **~9%**, not a step change. The reason
-to do it is the `"Crouching"` case: probing cannot produce that class of error,
-because it never has to recognise the wording.
+On the older fp32 model the same saving was ~9%. Either way it is not a step
+change, and on this model it is nearly nothing. The reason to probe is the
+`"Crouching"` case: it cannot produce that class of error, because it never
+has to recognise the wording. The calibrated `confidence` — and the
+`EYEQ_VLM_PROBE_THRESHOLD` dial that acts on it — comes free with it.
+
+Stage 2 being 89% vision encoder is the standing performance problem, and
+nothing in the cascade addresses it yet. See
+[EVALUATION-4bit.md](EVALUATION-4bit.md) §3.
 
 Not every backend can. `EYEQ_VLM_PROBE=auto` uses it where available and falls
 back permanently on the first backend that refuses:
@@ -196,7 +205,8 @@ back permanently on the first backend that refuses:
 |---|---|---|
 | `transformers` | Yes | Logits are directly available |
 | `openai_compat` | Server-dependent | **llama.cpp implements `logprobs`; Ollama does not** |
-| `moondream` (default) | No | Its remote-code wrapper exposes no logits |
+| `moondream4bit` (default) | Yes | The 2025-04-14 revision returns logits from its prefill |
+| `moondream` | No | The pinned 2024-08-26 remote-code wrapper exposes no logits |
 
 The fallback is latched after a single refusal — re-checking would buy a doomed
 request before every generate — and the query that triggered it is still
@@ -244,8 +254,9 @@ missing a hard hat?"* no longer matches what the model is shown.
 
 - **Runtime**: Python 3.13+ / `uv`
 - **Detection**: YOLOv8n (Ultralytics) on Apple MPS
-- **VLM**: Moondream2 (1.86B) by default; swappable for Qwen2-VL-2B, SmolVLM,
-  or any model behind a local llama.cpp/Ollama server (`.env.pi5`, `.env.ollama`)
+- **VLM**: Moondream 2B 4-bit (`2025-04-14`) by default; swappable for
+  Moondream2 fp32, Qwen2-VL-2B, SmolVLM, or any model behind a local
+  llama.cpp/Ollama server (`.env.pi5`, `.env.ollama`)
 - **IPC**: ZeroMQ (PUB/SUB)
 - **Buffer**: POSIX Shared Memory (zero-copy)
 - **API**: FastAPI + SQLite (aiosqlite)

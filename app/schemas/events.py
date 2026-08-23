@@ -187,7 +187,8 @@ class VLMResult(BaseModel):
         ),
     )
     model_name: str = Field(
-        default="moondream2", description="Name of the VLM model used."
+        default="moondream-2b-2025-04-14-4bit",
+        description="Name of the VLM model used.",
     )
     snapshot_path: str | None = Field(
         default=None,

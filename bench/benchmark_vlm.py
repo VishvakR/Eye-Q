@@ -69,6 +69,7 @@ class QueryRecord:
     n_prompt_tokens: int = 0
     n_generated: int = 0
     decode_tok_s: float = 0.0
+    p_yes: float | None = None
 
 
 @dataclass
@@ -139,13 +140,21 @@ def dir_size_mb(path: Path, patterns: tuple[str, ...]) -> float:
     return total / 1e6
 
 
-def build(name: str, threads: int, max_tokens: int):
+def build(
+    name: str,
+    threads: int,
+    max_tokens: int,
+    compute_dtype: str = "",
+    device: str = "cpu",
+):
     """Construct a backend plus the disk footprint it will occupy.
 
     Args:
         name: Backend key from the CLI.
         threads: ORT intra-op threads (ONNX backends only).
         max_tokens: Generation cap, applied to every backend equally.
+        compute_dtype: Weight dtype override (moondream4bit only).
+        device: Torch device for the in-process backends.
 
     Returns:
         Tuple of (backend, label, disk_mb).
@@ -178,9 +187,30 @@ def build(name: str, threads: int, max_tokens: int):
     if name == "torch":
         from app.pipelines.vlm_backends import MoondreamBackend
 
-        backend = MoondreamBackend(device="cpu")
+        backend = MoondreamBackend(device=device)
         disk = dir_size_mb(Path("models/moondream2"), ("*.safetensors", "*.bin"))
-        return backend, "vikhyatk/moondream2 @2024-08-26 (HF Transformers, CPU)", disk
+        label = f"vikhyatk/moondream2 @2024-08-26 (HF Transformers, {device})"
+        return backend, label, disk
+
+    if name == "moondream4bit":
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        backend = Moondream4BitBackend(
+            device=device,
+            max_new_tokens=max_tokens,
+            compute_dtype=compute_dtype or None,
+        )
+        # Only the safetensors: the repo also ships two GGUFs for llama.cpp
+        # that this backend never opens, and counting them would inflate the
+        # download by more than the quantization saves.
+        disk = dir_size_mb(Path("models/moondream-4bit"), ("*.safetensors",))
+        dtype = compute_dtype or "auto"
+        return (
+            backend,
+            f"moondream/moondream-2b-2025-04-14-4bit (HF Transformers, "
+            f"{device}, dequantized to {dtype})",
+            disk,
+        )
 
     if name == "openai_compat":
         # The profile .env.pi5 actually deploys: a quantized model behind
@@ -207,7 +237,14 @@ def build(name: str, threads: int, max_tokens: int):
 
 
 def run(
-    name: str, crops: list[Path], repeats: int, threads: int, max_tokens: int
+    name: str,
+    crops: list[Path],
+    repeats: int,
+    threads: int,
+    max_tokens: int,
+    compute_dtype: str = "",
+    use_probe: bool = False,
+    device: str = "cpu",
 ) -> BenchmarkReport:
     """Load one backend, run every prompt over every crop, and measure.
 
@@ -215,6 +252,11 @@ def run(
     for ORT arena allocation and lazy kernel selection, and folding that
     one-off cost into the steady-state median would overstate the latency an
     operator actually sees.
+
+    With ``use_probe=True`` the verdict is read off the prefill logits instead of
+    generated as text. That is the same work minus the decode loop, so the two
+    arms are directly comparable on the same crops and prompts — which is the
+    only way to see what the decode was actually costing.
     """
     import psutil
 
@@ -222,7 +264,13 @@ def run(
     report = BenchmarkReport(backend=name, label="", system=system_info())
     report.baseline_rss_mb = proc.memory_info().rss / 1e6
 
-    backend, label, disk = build(name, threads, max_tokens)
+    backend, label, disk = build(name, threads, max_tokens, compute_dtype, device)
+    if use_probe:
+        from app.pipelines.vlm_backends import BinaryProbeBackend
+
+        if not isinstance(backend, BinaryProbeBackend):
+            raise SystemExit(f"--probe: {name} cannot report token probabilities.")
+        label = f"{label} [probe]"
     report.label = label
     report.disk_mb = round(disk, 1)
 
@@ -231,29 +279,37 @@ def run(
     print(f"  process RSS before load: {report.baseline_rss_mb:,.0f} MB")
 
     try:
-        with ResourceProbe("load") as probe:
+        with ResourceProbe("load") as load_probe:
             backend.load()
     except Exception as exc:  # noqa: BLE001 — a failed load is a result
         report.error = f"{type(exc).__name__}: {exc}"
         print(f"  LOAD FAILED: {report.error}")
         return report
 
-    report.load_wall_s = round(probe.phase.wall_s, 2)
-    report.load_cpu_s = round(probe.phase.cpu_s, 2)
-    report.load_rss_peak_mb = round(probe.phase.rss_peak_mb, 1)
-    report.load_rss_delta_mb = round(probe.phase.rss_delta_mb, 1)
+    report.load_wall_s = round(load_probe.phase.wall_s, 2)
+    report.load_cpu_s = round(load_probe.phase.cpu_s, 2)
+    report.load_rss_peak_mb = round(load_probe.phase.rss_peak_mb, 1)
+    report.load_rss_delta_mb = round(load_probe.phase.rss_delta_mb, 1)
     print(
         f"  loaded in {report.load_wall_s}s  "
-        f"(RSS {report.baseline_rss_mb:,.0f} -> {probe.phase.rss_end_mb:,.0f} MB, "
+        f"(RSS {report.baseline_rss_mb:,.0f} -> {load_probe.phase.rss_end_mb:,.0f} MB, "
         f"peak {report.load_rss_peak_mb:,.0f} MB)"
     )
 
     images = {p.name: Image.open(p).convert("RGB") for p in crops}
 
+    def ask(image, prompt: str) -> tuple[str, bool, float | None]:
+        """One measured verdict, by whichever path is under test."""
+        if not use_probe:
+            answer = backend.query(image, prompt)
+            return answer, BinaryVerdictParser.parse(answer), None
+        result = backend.probe_binary(backend.encode(image), prompt)
+        return result.raw, result.verdict, result.p_yes
+
     # Warmup — excluded from the statistics on purpose.
     first = next(iter(images.values()))
     t0 = time.perf_counter()
-    warm = backend.query(first, PROMPTS[0][1] + VERDICT_SUFFIX)
+    warm, _, _ = ask(first, PROMPTS[0][1] + VERDICT_SUFFIX)
     print(f"  warmup: {(time.perf_counter() - t0) * 1000:,.0f} ms -> {warm[:60]!r}")
 
     trace_of = getattr(backend, "_runtime", None)
@@ -263,15 +319,16 @@ def run(
             for crop_name, image in images.items():
                 for rule, prompt in PROMPTS:
                     t0 = time.perf_counter()
-                    answer = backend.query(image, prompt + VERDICT_SUFFIX)
+                    answer, verdict, p_yes = ask(image, prompt + VERDICT_SUFFIX)
                     latency_ms = (time.perf_counter() - t0) * 1000.0
 
                     rec = QueryRecord(
                         crop=crop_name,
                         rule=rule,
                         answer=answer,
-                        verdict=BinaryVerdictParser.parse(answer),
+                        verdict=verdict,
                         latency_ms=round(latency_ms, 1),
+                        p_yes=None if p_yes is None else round(p_yes, 4),
                     )
                     trace = getattr(trace_of, "last_trace", None)
                     if trace is not None:
@@ -283,9 +340,10 @@ def run(
                         rec.decode_tok_s = round(trace.decode_tokens_per_s, 2)
 
                     report.records.append(rec)
+                    conf = "" if p_yes is None else f"  p(yes)={p_yes:.3f}"
                     print(
                         f"    {crop_name} [{rule:9s}] {latency_ms:8,.0f} ms  "
-                        f"{'RED ' if rec.verdict else 'green'}  {answer[:44]!r}"
+                        f"{'RED ' if rec.verdict else 'green'}  {answer[:44]!r}{conf}"
                     )
 
     report.infer_wall_s = round(infer_probe.phase.wall_s, 2)
@@ -413,8 +471,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--backend",
-        default="onnx-q4",
-        choices=["onnx-q4", "onnx-q4f16", "torch", "openai_compat"],
+        default="moondream4bit",
+        choices=[
+            "moondream4bit",
+            "onnx-q4",
+            "onnx-q4f16",
+            "torch",
+            "openai_compat",
+        ],
         help="Which Stage 2 backend to measure.",
     )
     ap.add_argument("--fixtures", type=Path, default=Path("bench/fixtures"))
@@ -423,6 +487,35 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--limit-crops", type=int, default=3)
     ap.add_argument("--out", type=Path, default=Path("bench/results"))
+    ap.add_argument(
+        "--compute-dtype",
+        default="",
+        choices=["", "float32", "float16", "bfloat16"],
+        help=(
+            "Weight dtype for the moondream4bit backend; empty picks per "
+            "device. The CPU choice is the one worth sweeping — upstream "
+            "dequantizes to bf16 on its way to a CUDA kernel that is not "
+            "reachable here."
+        ),
+    )
+    ap.add_argument(
+        "--device",
+        default="cpu",
+        choices=["cpu", "mps", "cuda"],
+        help=(
+            "Torch device for the in-process backends. The default is 'cpu' "
+            "because that is what the committed baseline was measured on; the "
+            "moondream4bit arm is vision-bound and wants 'mps' on Apple."
+        ),
+    )
+    ap.add_argument(
+        "--probe",
+        action="store_true",
+        help=(
+            "Read the verdict off the prefill logits instead of generating "
+            "text. Measures what the decode loop was costing."
+        ),
+    )
     ap.add_argument(
         "--batch-sizes",
         default="",
@@ -451,10 +544,25 @@ def main() -> None:
         print(f"  written to {path}")
         return
 
-    report = run(args.backend, crops, args.repeats, args.threads, args.max_tokens)
+    report = run(
+        args.backend,
+        crops,
+        args.repeats,
+        args.threads,
+        args.max_tokens,
+        args.compute_dtype,
+        args.probe,
+        args.device,
+    )
 
     args.out.mkdir(parents=True, exist_ok=True)
     tag = f"{args.backend}-t{args.threads}" if args.threads else args.backend
+    if args.device != "cpu":
+        tag = f"{tag}-{args.device}"
+    if args.compute_dtype:
+        tag = f"{tag}-{args.compute_dtype}"
+    if args.probe:
+        tag = f"{tag}-probe"
     path = args.out / f"{tag}-{platform.machine()}.json"
     payload = asdict(report) | {"summary": report.summary()}
     path.write_text(json.dumps(payload, indent=2))

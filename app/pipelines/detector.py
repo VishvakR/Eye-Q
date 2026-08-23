@@ -7,7 +7,7 @@ it publishes a ``DetectionEvent`` to the ZMQ PUB socket for the Stage 2
 VLM worker to consume.
 
 Key design principles:
-    - **Lightweight**: YOLOv8n inference is ~2-4ms on Apple MPS, making
+    - **Lightweight**: YOLOv8n inference is ~16ms on Apple MPS, making
       it feasible to run at full 30 FPS without thermal throttling.
     - **Non-blocking**: Runs in its own thread, never blocks capture or VLM.
     - **Trigger throttling**: Per-label cooldown prevents flooding the VLM

@@ -62,7 +62,7 @@ def make_result(
         verdict=verdict,
         raw_response=raw_response,
         inference_time_ms=812.5,
-        model_name="moondream2",
+        model_name="moondream-2b-2025-04-14-4bit",
         snapshot_path=snapshot_path,
     )
 

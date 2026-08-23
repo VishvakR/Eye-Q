@@ -180,11 +180,20 @@ class Settings(BaseSettings):
     )
 
     # ── VLM (Stage 2) ───────────────────────────────────────────
-    vlm_backend: Literal["moondream", "transformers", "openai_compat"] = Field(
-        default="moondream",
+    vlm_backend: Literal[
+        "moondream4bit", "moondream", "transformers", "openai_compat"
+    ] = Field(
+        default="moondream4bit",
         description=(
-            "Which VLM backend to use. All three run locally — no cloud. "
-            "'moondream' loads Moondream2 in-process via its bespoke API. "
+            "Which VLM backend to use. All four run locally — no cloud. "
+            "'moondream4bit' — the default — loads the 4-bit 2025-04-14 "
+            "Moondream in-process: a third the download of the fp32 revision, "
+            "and the only in-process backend that can read a verdict off the "
+            "prefill logits instead of generating text (see vlm_probe). "
+            "'moondream' loads Moondream2 at the pinned 2024-08-26 revision "
+            "in fp32 via its older bespoke API; it is the baseline the 4-bit "
+            "backend is measured against and stays available if that "
+            "comparison ever goes the wrong way on your hardware. "
             "'transformers' loads any chat-templated vision-to-text model "
             "in-process (Qwen2-VL-2B, SmolVLM, MiniCPM-V) — set vlm_model to "
             "the HF id. 'openai_compat' calls a local OpenAI-compatible server "
@@ -193,7 +202,12 @@ class Settings(BaseSettings):
         ),
     )
     vlm_model: str = Field(
-        default="vikhyatk/moondream2", description="Hugging Face model ID for the VLM."
+        default="moondream/moondream-2b-2025-04-14-4bit",
+        description=(
+            "Hugging Face model ID for the VLM. Set this and vlm_revision "
+            "together — they are read by whichever in-process backend is "
+            "selected, and the two Moondream backends want different pairs."
+        ),
     )
     vlm_api_base: str = Field(
         default="http://127.0.0.1:11434/v1",
@@ -217,16 +231,35 @@ class Settings(BaseSettings):
             "'answer Yes or No' instruction and rambles — each extra token is "
             "another sequential forward pass. This is not a latency lever: it "
             "does not speed up a model that already stops at EOS, and Stage 2 "
-            "is ~99% prefill regardless. It matters to a batched "
-            "generate(), which runs until every row in the batch has "
-            "finished — without this cap one rambling answer would hold the "
-            "whole batch to its own token budget. Raise it if a backend "
-            "prefixes its answer, because a truncated leading word parses as "
-            "'no alert' and disappears silently."
+            "is ~99% prefill regardless. It is moot on the probe path, which "
+            "generates nothing at all. Raise it if a backend prefixes its "
+            "answer, because a truncated leading word parses as 'no alert' "
+            "and disappears silently."
         ),
     )
     vlm_revision: str = Field(
-        default="2024-08-26", description="Model revision/commit for reproducibility."
+        default="a89c59223ef8b5bb7826780728eeec172727ca84",
+        description=(
+            "Model revision/commit for reproducibility. Pinned to a sha rather "
+            "than a branch because the moondream4bit backend patches the "
+            "repo's remote code — it replaces QuantizedLinear.unpack to skip a "
+            "CUDA-only torchao kernel — and a moving revision could change "
+            "what is being patched without anything failing loudly. "
+            "vlm_backend='moondream' wants '2024-08-26' instead."
+        ),
+    )
+    vlm_compute_dtype: Literal["", "float32", "float16", "bfloat16"] = Field(
+        default="",
+        description=(
+            "Dtype the moondream4bit backend dequantizes its packed weights "
+            "to. Empty — the default — picks per device: fp32 on CPU, fp16 on "
+            "MPS, bf16 on CUDA. The CPU choice is the load-bearing one: torch "
+            "has no Accelerate-backed bf16 GEMM on ARM, and Stage 2 is "
+            "prefill-bound, so upstream's bf16 would buy memory at the "
+            "expense of the thing being optimized. Override only against a "
+            "bench/benchmark_vlm.py --compute-dtype sweep on your own board. "
+            "Ignored by every other backend."
+        ),
     )
     vlm_timeout_s: float = Field(
         default=60.0,
@@ -348,7 +381,10 @@ class Settings(BaseSettings):
             "prefill is not waiting on, so it buys little — while the KV cache "
             "grows linearly with this value (~295 MB per sequence for "
             "Moondream at fp32). Measure with bench/benchmark_vlm.py before "
-            "raising it, and never raise it on a memory-bound board."
+            "raising it, and never raise it on a memory-bound board. The "
+            "default moondream4bit backend cannot batch at all — its "
+            "revision's batch_answer() is a sequential loop upstream — so "
+            "there this only groups queries, it does not fuse them."
         ),
     )
     vlm_min_subject_px: int = Field(
@@ -408,8 +444,9 @@ class Settings(BaseSettings):
             "anything it fails to recognise, turning a malformed answer into a "
             "silent false negative. 'auto' probes wherever the backend can and "
             "falls back permanently on the first backend that cannot: the "
-            "transformers backend always can, llama.cpp can via logprobs, "
-            "Ollama and the in-process Moondream wrapper cannot. 'off' forces "
+            "moondream4bit and transformers backends always can, llama.cpp "
+            "can via logprobs, Ollama and the pinned 2024-08-26 Moondream "
+            "wrapper cannot. 'off' forces "
             "generate-and-parse; 'on' is the same as 'auto' but logs the "
             "fallback as a warning rather than an informational message."
         ),
@@ -434,13 +471,18 @@ class Settings(BaseSettings):
         description="Inference device for YOLO. 'auto' detects MPS → CUDA → CPU.",
     )
     vlm_device: Literal["auto", "mps", "cuda", "cpu"] = Field(
-        default="cpu",
+        default="auto",
         description=(
-            "Inference device for the VLM. Defaults to 'cpu': Moondream2 does "
-            "run on MPS, but measured no faster there (6.1s vs 5.6s per query) "
-            "and took ~10s longer to load, so MPS only costs unified memory "
-            "that Stage 1 wants. Other backends may benefit — try 'mps' when "
-            "running vlm_backend='transformers'."
+            "Inference device for the VLM. 'auto' probes MPS -> CUDA -> CPU. "
+            "This used to default to 'cpu' on the measurement that Moondream2 "
+            "at the 2024-08-26 revision ran no faster on MPS (6.1s vs 5.6s per "
+            "query) and loaded ~10s slower, so the accelerator only cost "
+            "unified memory Stage 1 wanted. That finding does not carry to the "
+            "2025-04-14 model now behind moondream4bit, whose vision tower "
+            "dominates its query: measured on an M2 over one real crop, "
+            "encode_image takes 7,313 ms on CPU against 1,672 ms on MPS at "
+            "fp16. Set 'cpu' explicitly to restore the old behaviour, and note "
+            "that vlm_backend='moondream' is still better off there."
         ),
     )
 
@@ -503,7 +545,7 @@ class Settings(BaseSettings):
 
     @property
     def vlm_inference_device(self) -> str:
-        """Resolve the VLM device. Defaults to CPU to avoid MPS crashes."""
+        """Resolve the VLM device. Falls back to CPU inside the backend's load()."""
         if self.vlm_device == "auto":
             return detect_inference_device()
         return self.vlm_device

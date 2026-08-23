@@ -7,12 +7,15 @@ Test groups:
     - VLMWorker unit tests: initialization, rule management, staleness,
       statistics (using mocked VLM model)
     - MoondreamVLM: initialization, repr (without loading the actual model)
+    - Moondream4BitBackend: greedy decoding, the encode seam, the torchao
+      stub, and reading a verdict off the prefill logits
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -31,6 +34,7 @@ from app.pipelines.vlm_judge import BinaryVerdictParser
 from app.pipelines.vlm_worker import (
     _LETTERBOX_GREY,
     _MIN_CROP_PX,
+    VERDICT_SUFFIX,
     VLMWorker,
     _percentile,
     crop_bounds,
@@ -299,6 +303,358 @@ class TestMoondreamBackend:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Moondream4BitBackend Tests (without loading the model)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class _FakeEncodedImage:
+    """Stands in for the remote code's frozen EncodedImage dataclass."""
+
+    def __init__(self, pos: int = 729):
+        self.pos = pos
+
+
+class FakeMoondreamModel:
+    """The ``MoondreamModel`` surface Moondream4BitBackend actually touches.
+
+    A real class rather than a mock for the same reason :class:`ProbeStub` is:
+    the code under test reaches for nested attributes (``config.tokenizer.
+    templates``) whose shape is the thing being asserted, and a mock would
+    conjure any of them on access and pass regardless.
+    """
+
+    _DEFAULT_TEMPLATE = {"prefix": [1, 2], "suffix": [3]}
+
+    def __init__(self, template=_DEFAULT_TEMPLATE, logits=None):
+        self.device = "cpu"
+        self.query_calls: list[tuple] = []
+        self.loaded_images: list = []
+        self.prefill_calls: list[tuple] = []
+        self.encode_calls = 0
+        self._logits = logits
+
+        self.config = SimpleNamespace(
+            tokenizer=SimpleNamespace(templates={"query": template})
+        )
+        self.tokenizer = SimpleNamespace(
+            encode=lambda text: SimpleNamespace(ids=[10, 11])
+        )
+
+    def encode_image(self, image):
+        self.encode_calls += 1
+        return _FakeEncodedImage()
+
+    def query(self, handle, question, settings=None):
+        self.query_calls.append((handle, question, settings))
+        return {"answer": "  Yes  "}
+
+    def load_encoded_image(self, handle):
+        self.loaded_images.append(handle)
+
+    def _prefill_prompt(self, tokens, pos, temperature, top_p):
+        self.prefill_calls.append((tokens, pos, temperature, top_p))
+        return self._logits, None, None, pos + tokens.shape[1]
+
+
+def loaded_4bit(model=None, yes_ids=(100,), no_ids=(200,), **kwargs):
+    """A Moondream4BitBackend wired to a fake model, without a real load()."""
+    from app.pipelines.vlm_backends import Moondream4BitBackend
+
+    backend = Moondream4BitBackend(device="cpu", **kwargs)
+    backend._model = SimpleNamespace(model=model or FakeMoondreamModel())
+    backend._tokenizer = object()
+    backend._loaded = True
+    backend._yes_ids = list(yes_ids)
+    backend._no_ids = list(no_ids)
+    return backend
+
+
+class TestMoondream4BitBackend:
+    """Initialization, state, and the generate path."""
+
+    def test_initialization(self):
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        vlm = Moondream4BitBackend(device="cpu")
+        assert not vlm.is_loaded
+        assert vlm.device == "cpu"
+        assert not vlm.is_int4
+
+    def test_revision_is_pinned_to_a_sha(self):
+        """This backend patches the repo's remote code. A branch name would
+        let upstream change what is being patched with nothing failing."""
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        revision = Moondream4BitBackend()._revision
+        assert len(revision) == 40
+        assert all(c in "0123456789abcdef" for c in revision)
+
+    def test_query_before_load_raises(self):
+        from PIL import Image
+
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        vlm = Moondream4BitBackend(device="cpu")
+        with pytest.raises(RuntimeError, match="not loaded"):
+            vlm.query(Image.new("RGB", (64, 64)), "Is there a person?")
+
+    def test_probe_before_load_raises(self):
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        vlm = Moondream4BitBackend(device="cpu")
+        with pytest.raises(RuntimeError, match="not loaded"):
+            vlm.probe_binary(_FakeEncodedImage(), "q")
+
+    def test_repr(self):
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        r = repr(Moondream4BitBackend(device="mps"))
+        assert "Moondream4BitBackend" in r
+        assert "moondream-2b-2025-04-14-4bit" in r
+        assert "unloaded" in r
+
+    def test_answer_forces_greedy_decoding(self):
+        """This revision samples by default (temperature 0.5, top_p 0.3). A
+        sampled binary verdict alerts on one frame and not the next for the
+        same crop and rule, which is indistinguishable from a flickering
+        detection and impossible to tune against."""
+        model = FakeMoondreamModel()
+        backend = loaded_4bit(model, max_new_tokens=2)
+
+        answer = backend.answer(_FakeEncodedImage(), "Is this person bending?")
+
+        assert answer == "Yes", "must be stripped"
+        (_handle, question, settings) = model.query_calls[0]
+        assert question == "Is this person bending?"
+        assert settings["temperature"] == 0.0
+        assert settings["max_tokens"] == 2
+
+    def test_answer_does_not_use_the_compat_shim(self):
+        """answer_question() ignores max_new_tokens and leaves sampling on, so
+        going through it would silently drop vlm_max_tokens."""
+        model = FakeMoondreamModel()
+        model.answer_question = lambda *a, **k: pytest.fail(
+            "must not call the answer_question shim"
+        )
+        backend = loaded_4bit(model)
+
+        backend.answer(_FakeEncodedImage(), "q")
+
+    def test_encode_runs_the_vision_tower_once_per_subject(self):
+        """The encode/answer seam Stage 2 relies on: one handle, many rules."""
+        from PIL import Image
+
+        model = FakeMoondreamModel()
+        backend = loaded_4bit(model)
+
+        handle = backend.encode(Image.new("RGB", (64, 64)))
+        for question in ("bending?", "ppe?", "carrying?"):
+            backend.answer(handle, question)
+
+        assert model.encode_calls == 1
+        assert len(model.query_calls) == 3
+        assert all(call[0] is handle for call in model.query_calls)
+
+    def test_query_batch_is_sequential(self):
+        """This revision's batch_answer() is a for-loop upstream, so calling it
+        would claim a batching win that no longer exists."""
+        from PIL import Image
+
+        model = FakeMoondreamModel()
+        model.batch_answer = lambda *a, **k: pytest.fail("no real batching here")
+        backend = loaded_4bit(model)
+
+        images = [Image.new("RGB", (32, 32)) for _ in range(3)]
+        answers = backend.query_batch(images, ["a?", "b?", "c?"])
+
+        assert answers == ["Yes", "Yes", "Yes"]
+        assert model.encode_calls == 3
+
+    def test_query_batch_rejects_a_length_mismatch(self):
+        from PIL import Image
+
+        backend = loaded_4bit()
+        with pytest.raises(ValueError, match="one question per image"):
+            backend.query_batch([Image.new("RGB", (32, 32))], ["a?", "b?"])
+
+
+class TestMoondream4BitComputeDtype:
+    """Which dtype the packed weights are dequantized to."""
+
+    def test_defaults_are_per_device(self):
+        """fp32 on CPU is the load-bearing one: torch has no Accelerate-backed
+        bf16 GEMM on ARM, and Stage 2 is prefill-bound, so upstream's bf16
+        would buy memory at the expense of the thing being optimized."""
+        import torch
+
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        backend = Moondream4BitBackend()
+        assert backend._resolve_dtype("cpu") is torch.float32
+        assert backend._resolve_dtype("mps") is torch.float16
+        assert backend._resolve_dtype("cuda") is torch.bfloat16
+
+    def test_an_explicit_dtype_overrides_the_device(self):
+        import torch
+
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        backend = Moondream4BitBackend(compute_dtype="bfloat16")
+        assert backend._resolve_dtype("cpu") is torch.bfloat16
+
+    def test_an_unknown_dtype_fails_loudly(self):
+        """Silently falling back would make a bench sweep report the default's
+        numbers under the override's name."""
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        backend = Moondream4BitBackend(compute_dtype="float8")
+        with pytest.raises(ValueError, match="Unknown compute_dtype"):
+            backend._resolve_dtype("cpu")
+
+
+class TestTorchaoStub:
+    """``layers.py`` imports torchao at module scope, on every device."""
+
+    def test_the_stub_satisfies_the_remote_import(self):
+        """Installing torchao just to satisfy an import would pin a package
+        whose API already moved: 0.14 removed the int4_weight_only name that
+        the remote code imports."""
+        import sys
+
+        from app.pipelines.vlm_backends import _ensure_torchao_importable
+
+        saved = {k: sys.modules.get(k) for k in ("torchao", "torchao.quantization")}
+        for key in saved:
+            sys.modules.pop(key, None)
+        try:
+            real = _ensure_torchao_importable()
+
+            from torchao import quantize_
+            from torchao.quantization import int4_weight_only
+
+            if not real:
+                sentinel = object()
+                assert quantize_(sentinel, int4_weight_only(group_size=128)) is sentinel
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = value
+
+
+class TestMoondream4BitProbe:
+    """Reading the verdict off the prefill instead of generating it."""
+
+    def _logits(self, mapping, vocab=256):
+        import torch
+
+        row = torch.full((1, vocab), -30.0)
+        for token_id, value in mapping.items():
+            row[0, token_id] = value
+        return row
+
+    def test_probe_reads_the_yes_no_mass(self):
+        model = FakeMoondreamModel(logits=self._logits({100: 4.0, 200: 0.0}))
+        backend = loaded_4bit(model)
+
+        probe = backend.probe_binary(_FakeEncodedImage(), "Is this person bending?")
+
+        assert probe.verdict is True
+        assert probe.raw == "Yes"
+        assert probe.p_yes > 0.9
+        assert probe.p_yes + probe.p_no == pytest.approx(1.0)
+
+    def test_probe_generates_nothing(self):
+        """The whole point: one prefill, no decode loop, no string parsing."""
+        model = FakeMoondreamModel(logits=self._logits({100: 4.0, 200: 0.0}))
+        backend = loaded_4bit(model)
+
+        backend.probe_binary(_FakeEncodedImage(), "q")
+
+        assert len(model.prefill_calls) == 1
+        assert model.query_calls == []
+
+    def test_probe_prefills_greedily_from_the_image_position(self):
+        model = FakeMoondreamModel(logits=self._logits({100: 0.0, 200: 4.0}))
+        backend = loaded_4bit(model)
+        handle = _FakeEncodedImage(pos=729)
+
+        probe = backend.probe_binary(handle, "q")
+
+        (tokens, pos, temperature, top_p) = model.prefill_calls[0]
+        assert pos == 729
+        assert temperature == 0.0
+        assert top_p == 1.0
+        # prefix + question + suffix, as MoondreamModel.query builds it.
+        assert tokens.tolist() == [[1, 2, 10, 11, 3]]
+        assert probe.verdict is False
+
+    def test_probe_restores_this_subjects_image_cache(self):
+        """The previous question wrote past the image tokens in the live KV
+        caches; without the reload the second probe reads the first one's
+        leftovers."""
+        model = FakeMoondreamModel(logits=self._logits({100: 4.0, 200: 0.0}))
+        backend = loaded_4bit(model)
+        handle = _FakeEncodedImage()
+
+        backend.probe_binary(handle, "a?")
+        backend.probe_binary(handle, "b?")
+
+        assert model.loaded_images == [handle, handle]
+
+    def test_probe_tolerates_unreduced_logits(self):
+        """lm_head reduces to the final position today. Indexing a vocab axis
+        that moved would read noise rather than fail."""
+        import torch
+
+        reduced = self._logits({100: 4.0, 200: 0.0})
+        model = FakeMoondreamModel(logits=torch.stack([reduced[0]] * 3).unsqueeze(0))
+        backend = loaded_4bit(model)
+
+        assert backend.probe_binary(_FakeEncodedImage(), "q").verdict is True
+
+    def test_no_usable_token_ids_is_unsupported_not_a_failure(self):
+        """The worker latches probing off on this and falls back to
+        generate-and-parse, which is what every deployment did before."""
+        from app.pipelines.vlm_backends import ProbeUnsupportedError
+
+        backend = loaded_4bit(yes_ids=(), no_ids=())
+
+        with pytest.raises(ProbeUnsupportedError, match="Yes/No token ids"):
+            backend.probe_binary(_FakeEncodedImage(), "q")
+
+    def test_a_model_without_a_query_template_is_unsupported(self):
+        from app.pipelines.vlm_backends import ProbeUnsupportedError
+
+        backend = loaded_4bit(FakeMoondreamModel(template=None))
+
+        with pytest.raises(ProbeUnsupportedError, match="query template"):
+            backend.probe_binary(_FakeEncodedImage(), "q")
+
+    def test_probe_batch_matches_positionally(self):
+        model = FakeMoondreamModel(logits=self._logits({100: 4.0, 200: 0.0}))
+        backend = loaded_4bit(model)
+        handles = [_FakeEncodedImage(), _FakeEncodedImage(), _FakeEncodedImage()]
+
+        probes = backend.probe_binary_batch(handles, ["a?", "b?", "c?"])
+
+        assert len(probes) == 3
+        assert model.loaded_images == handles
+        assert [call[0].tolist() for call in model.prefill_calls] == [[[1, 2, 10, 11, 3]]] * 3
+
+    def test_probe_batch_rejects_a_length_mismatch(self):
+        backend = loaded_4bit()
+        with pytest.raises(ValueError, match="one question per image"):
+            backend.probe_binary_batch([_FakeEncodedImage()], ["a?", "b?"])
+
+    def test_the_worker_probes_this_backend(self):
+        """End of the chain: the capability check the worker actually runs."""
+        from app.pipelines.vlm_backends import BinaryProbeBackend
+
+        assert isinstance(loaded_4bit(), BinaryProbeBackend)
+
+# ═══════════════════════════════════════════════════════════════════
 # VLM Worker Unit Tests (mocked model)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -447,6 +803,97 @@ class TestVLMWorkerLive:
         assert not vlm.is_loaded
 
 
+class TestMoondream4BitLive:
+    """Live tests for the 4-bit backend. Downloads ~1.1 GB on first run.
+
+    Skip with ``pytest -m 'not slow'``.
+    """
+
+    @pytest.mark.slow
+    def test_quantized_linear_premise(self):
+        """Pin what the load-time patch assumes about the remote code.
+
+        Moondream4BitBackend replaces ``QuantizedLinear.unpack`` and reaches
+        for ``dequantize_tensor`` in the same generated module. Both are
+        upstream's, not ours. If a re-upload changes either, the patch has to
+        fail *here* — loudly, against a named premise — rather than be carried
+        forever as a workaround for a defect that no longer exists, or worse,
+        silently stop applying. This is why ``vlm_revision`` is a sha.
+        """
+        import sys
+
+        from app.pipelines.vlm_backends import (
+            _QUANTIZED_LINEAR,
+            Moondream4BitBackend,
+        )
+
+        vlm = Moondream4BitBackend(device="cpu")
+        vlm.load()
+        try:
+            layers = [
+                m
+                for m in vlm._model.modules()
+                if type(m).__name__ == _QUANTIZED_LINEAR
+            ]
+            assert layers, "no packed 4-bit layers; this is not a 4-bit export"
+
+            remote = sys.modules[type(layers[0]).__module__]
+            assert callable(getattr(remote, "dequantize_tensor", None))
+            assert layers[0].unpacked, "load() must unpack eagerly, not lazily"
+        finally:
+            vlm.unload()
+
+    @pytest.mark.slow
+    def test_load_and_query(self):
+        from PIL import Image
+
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        vlm = Moondream4BitBackend(device="cpu", max_new_tokens=16)
+        vlm.load()
+        try:
+            assert vlm.is_loaded
+            img = Image.new("RGB", (128, 128), color=(255, 0, 0))
+            answer = vlm.query(img, "What color is this image?")
+            assert isinstance(answer, str)
+            assert len(answer) > 0
+        finally:
+            vlm.unload()
+        assert not vlm.is_loaded
+
+    @pytest.mark.slow
+    def test_the_probe_agrees_with_generate_and_parse(self):
+        """The probe is only a shortcut if it reaches the same verdict.
+
+        Both paths read the same distribution at the same position — one
+        samples from it greedily and stringifies, the other sums two sets of
+        token ids — so a disagreement means the probe is reading the wrong
+        position or the wrong ids, not that the model is uncertain.
+        """
+        from PIL import Image
+
+        from app.pipelines.vlm_backends import Moondream4BitBackend
+
+        vlm = Moondream4BitBackend(device="cpu", max_new_tokens=4)
+        vlm.load()
+        try:
+            img = Image.new("RGB", (128, 128), color=(255, 0, 0))
+            handle = vlm.encode(img)
+
+            for question in (
+                "Is this image red?" + VERDICT_SUFFIX,
+                "Is there a person in this image?" + VERDICT_SUFFIX,
+            ):
+                probe = vlm.probe_binary(handle, question)
+                parsed = BinaryVerdictParser().parse(vlm.answer(handle, question))
+                assert probe.verdict == parsed, (
+                    f"probe {probe.verdict} (p_yes={probe.p_yes:.3f}) disagrees "
+                    f"with generate-and-parse {parsed} on {question!r}"
+                )
+        finally:
+            vlm.unload()
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Backend Selection Tests
 # ═══════════════════════════════════════════════════════════════════
@@ -455,17 +902,46 @@ class TestVLMWorkerLive:
 class TestBackendFactory:
     """EYEQ_VLM_BACKEND must select the right implementation.
 
-    All three run locally; the choice is about speed and model availability
+    All four run locally; the choice is about speed and model availability
     on the target edge device, not about where inference happens.
     """
 
-    def test_moondream_is_the_default(self):
+    def test_moondream_4bit_is_the_default(self):
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import Moondream4BitBackend, build_backend
+
+        backend = build_backend(Settings())
+        assert isinstance(backend, Moondream4BitBackend)
+        assert backend.model_name == "moondream/moondream-2b-2025-04-14-4bit"
+        assert not backend.is_loaded
+
+    def test_the_fp32_baseline_stays_selectable(self):
+        """The 2024-08-26 fp32 revision is what the 4-bit one is measured
+        against, so it has to remain reachable by name."""
         from app.config.settings import Settings
         from app.pipelines.vlm_backends import MoondreamBackend, build_backend
 
-        backend = build_backend(Settings())
+        backend = build_backend(
+            Settings(
+                vlm_backend="moondream",
+                vlm_model="vikhyatk/moondream2",
+                vlm_revision="2024-08-26",
+            )
+        )
         assert isinstance(backend, MoondreamBackend)
-        assert not backend.is_loaded
+        assert backend.model_name == "vikhyatk/moondream2"
+
+    def test_compute_dtype_reaches_the_4bit_backend(self):
+        """The empty default means 'pick per device', not 'pass an empty
+        string down and fail on the first unpack'."""
+        from app.config.settings import Settings
+        from app.pipelines.vlm_backends import build_backend
+
+        assert build_backend(Settings())._compute_dtype is None
+        assert (
+            build_backend(Settings(vlm_compute_dtype="float16"))._compute_dtype
+            == "float16"
+        )
 
     def test_transformers_backend_carries_the_model_id(self):
         from app.config.settings import Settings
@@ -497,7 +973,7 @@ class TestBackendFactory:
         from app.config.settings import Settings
         from app.pipelines.vlm_backends import VLMBackend, build_backend
 
-        for name in ("moondream", "transformers", "openai_compat"):
+        for name in ("moondream4bit", "moondream", "transformers", "openai_compat"):
             backend = build_backend(Settings(vlm_backend=name))
             assert isinstance(backend, VLMBackend), f"{name} does not conform"
 
@@ -2252,11 +2728,14 @@ class TestWorkerProbing:
 
         probeable = {
             name: isinstance(build_backend(Settings(vlm_backend=name)), BinaryProbeBackend)
-            for name in ("moondream", "transformers", "openai_compat")
+            for name in ("moondream4bit", "moondream", "transformers", "openai_compat")
         }
-        # Moondream's remote-code wrapper exposes no logits, so it cannot be
-        # probed and must fall back rather than fail.
+        # The pinned 2024-08-26 remote-code wrapper exposes no logits, so that
+        # backend cannot be probed and must fall back rather than fail. The
+        # 2025-04-14 revision behind moondream4bit returns them from
+        # _prefill_prompt, which is most of why it is worth adopting.
         assert probeable == {
+            "moondream4bit": True,
             "moondream": False,
             "transformers": True,
             "openai_compat": True,

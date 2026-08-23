@@ -53,11 +53,11 @@ def fig1_system() -> Canvas:
 
     # The vertical chain
     c.node(428, 106, 228, 54, "YOLOv8n watchdog",
-           sub="always on · ~2–4 ms/frame", size=14)
+           sub="always on · ~16 ms/frame", size=14)
     c.node(428, 190, 228, 50, "Trigger gate",
            sub="scope → ROI → per-subject cooldown", size=13.5)
     c.node(428, 272, 228, 58, "VLM worker",
-           sub="wake-on-event · Moondream2 1.86 B", size=14)
+           sub="wake-on-event · Moondream 2 B 4-bit", size=14)
     c.node(428, 368, 228, 50, "AlertSink",
            sub="persist · broadcast · webhook", size=13.5)
 
@@ -256,7 +256,7 @@ def fig4_innovation() -> Canvas:
 
     columns = [
         ("Latency", [
-            ("Two-stage cascade", "a 2–4 ms detector gates a\n~5.6 s reasoner", "detector.py · vlm_worker.py"),
+            ("Two-stage cascade", "a ~16 ms detector gates a\n~1.9 s reasoner", "detector.py · vlm_worker.py"),
             ("Crop before inference", "inference outlives buffer\nslots; crops do not", "vlm_worker.py:791"),
             ("Prompt-side budgeting", "24-token cap + forced Yes/No —\nevery token is a forward pass", "settings.py:209"),
         ]),

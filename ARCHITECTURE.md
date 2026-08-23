@@ -20,7 +20,7 @@ The whole design falls out of one measurement:
 | Stage | Model | Cost per call |
 |---|---|---|
 | Stage 1 | YOLOv8n object detection | **~16 ms** |
-| Stage 2 | Moondream2 vision-language model | **~4,200 ms** |
+| Stage 2 | Moondream 2B vision-language model | **~1,900 ms** |
 
 Three orders of magnitude. A VLM cannot look at a 30 FPS video stream; it can barely look at one
 frame every eight seconds. So Eye-Q is a **cascade**: a cheap detector looks at everything and a
@@ -447,22 +447,23 @@ returns `None` on mismatch ([:1017-1028](app/pipelines/vlm_worker.py#L1017-L1028
 ### `app/pipelines/vlm_backends.py` — Three swappable backends
 
 One `@runtime_checkable` Protocol (`load`, `query`, `encode`, `answer`, `query_batch`,
-`request_stop`, `cleanup`, `unload`), three implementations, chosen by `EYEQ_VLM_BACKEND` through
+`request_stop`, `cleanup`, `unload`), four implementations, chosen by `EYEQ_VLM_BACKEND` through
 [`build_backend`](app/pipelines/vlm_backends.py#L1010):
 
 | Backend | Mechanism | Use for |
 |---|---|---|
-| `moondream` (default) | In-process HF model, revision-pinned | Laptop / workstation |
+| `moondream4bit` (default) | In-process 4-bit `2025-04-14` Moondream, sha-pinned | Laptop / workstation with an accelerator |
+| `moondream` | In-process fp32 `2024-08-26` Moondream2, revision-pinned | The measured baseline; CPU-only boxes |
 | `transformers` | Any chat-templated vision-to-text HF model | Swapping in Qwen2-VL, SmolVLM, MiniCPM-V |
 | `openai_compat` | HTTP to Ollama / llama.cpp / vLLM / SGLang | Quantized models, edge hardware |
 
-All three are local — there is no cloud path in this codebase. `build_backend` returns an
+All four are local — there is no cloud path in this codebase. `build_backend` returns an
 **unloaded** backend deliberately: the consuming thread calls `load()` itself, so model weights land
 in the thread that will use them.
 
 Only `TransformersVLMBackend` supports genuine interruption, via a `StoppingCriteria` watching a
 `threading.Event` checked per token ([:396-399](app/pipelines/vlm_backends.py#L396-L399)). On the other two,
-`request_stop()` is an honest no-op — Moondream's remote-code wrapper accepts no stopping hook, and
+`request_stop()` is an honest no-op — neither Moondream wrapper accepts a stopping hook, and
 the HTTP backend is bounded by its request timeout instead. Interruption does not apply to a probe
 either: one forward pass has no token boundary to stop at. That is a shrink, not a regression — the
 worst case falls from `prefill + N decode` to `prefill`.
@@ -476,14 +477,15 @@ computed: compare the probability mass on the Yes tokens against the No tokens a
 position, one forward pass, no decode, no parsing.
 
 It is kept **separate** from `VLMBackend` on purpose. Adding it to the base Protocol would force all
-three backends to implement it, and one genuinely cannot — so the worker checks the capability with
+four backends to implement it, and one genuinely cannot — so the worker checks the capability with
 `isinstance` and falls back:
 
 | Backend | Probing | Why |
 |---|---|---|
+| `moondream4bit` (default) | Yes | `_prefill_prompt()` returns its logits |
 | `transformers` | Yes | Logits are directly available |
 | `openai_compat` | Depends on the server | **llama.cpp implements `logprobs`; Ollama does not** |
-| `moondream` | No | The remote-code `answer_question()` exposes no logits |
+| `moondream` | No | The pinned revision's `answer_question()` exposes no logits |
 
 A backend that refuses raises `ProbeUnsupportedError`, and the worker **latches** it off for the rest of
 the session — re-checking would buy a doomed request before every single generate. The query that
@@ -516,7 +518,7 @@ Note for anyone writing tests here: since Python 3.12 `runtime_checkable` `isins
 double is therefore reported as probe-*incapable* however it is specced. `tests/test_vlm.py` uses a
 real `ProbeStub` class for this reason.
 
-`transformers` is pinned `<4.50` because Moondream's pinned revision depends on APIs removed after
+`transformers` is pinned `<4.50` because the `moondream` backend's pinned revision depends on APIs removed after
 that.
 
 ### `app/pipelines/vlm_judge.py` — `BinaryVerdictParser`
@@ -719,13 +721,17 @@ not a validation error afterwards.
 4. **Focused crops.** Dim everything outside the subject's own box so a neighbour can't flip the
    verdict. A correctness fix that costs nothing at inference time.
 5. **Crop-before-infer as a correctness guarantee.** Inference outlives buffer slots; crops don't.
-6. **Three swappable VLM backends behind one Protocol.** The same appliance runs an in-process HF
+6. **Four swappable VLM backends behind one Protocol.** The same appliance runs an in-process HF
    model on a laptop and a quantized model over HTTP on a Pi, with one env var between them.
 7. **Conservative verdict parsing.** Three strategies defaulting to `False`, because alert fatigue is
    a worse failure than a missed alert.
-8. **Measured, counter-intuitive defaults.** `vlm_device` defaults to `cpu` because Moondream2
-   measured 5.6 s on CPU versus 6.1 s on MPS, with ~10 s more load time. Device detection uses a
-   *functional* probe (`torch.zeros(1, device="mps")`), not a capability flag, because the flag lies.
+8. **Measured defaults, and re-measured ones.** `vlm_device` defaulted to `cpu` for a year on the
+   finding that Moondream2 ran 5.6 s on CPU versus 6.1 s on MPS. Both halves of that have since
+   been overtaken: the 4-bit `2025-04-14` model is 89% vision encoder and wants the accelerator
+   (1,873 ms on MPS against 11,712 ms on CPU), and even the old fp32 model now measures 3,327 ms
+   on MPS against 4,757 ms on CPU. The default is now `auto`; see
+   [EVALUATION-4bit.md](EVALUATION-4bit.md). Device detection uses a *functional* probe
+   (`torch.zeros(1, device="mps")`), not a capability flag, because the flag lies.
 9. **Prompt-side latency engineering.** `max_tokens=2` and a forced Yes/No suffix — each extra token
    is another sequential forward pass through the model. Note the ceiling is a *guard*, not a lever:
    it bounds a model that ignores the instruction and rambles, and it stops a batched `generate()`
@@ -785,9 +791,10 @@ authoritative configuration documentation.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `EYEQ_VLM_BACKEND` | `moondream` | `moondream` \| `transformers` \| `openai_compat` |
-| `EYEQ_VLM_MODEL` | `vikhyatk/moondream2` | |
-| `EYEQ_VLM_REVISION` | `2024-08-26` | Pinned — the API changed after this |
+| `EYEQ_VLM_BACKEND` | `moondream4bit` | `moondream4bit` \| `moondream` \| `transformers` \| `openai_compat` |
+| `EYEQ_VLM_MODEL` | `moondream/moondream-2b-2025-04-14-4bit` | `vikhyatk/moondream2` for the `moondream` backend |
+| `EYEQ_VLM_REVISION` | `a89c5922…` | Pinned to a sha — this backend patches the repo's remote code. `2024-08-26` for the `moondream` backend |
+| `EYEQ_VLM_COMPUTE_DTYPE` | *(auto)* | Dequantized weight dtype: fp32 on CPU, fp16 on MPS, bf16 on CUDA |
 | `EYEQ_VLM_API_BASE` | `http://127.0.0.1:11434/v1` | `openai_compat` only |
 | `EYEQ_VLM_API_MODEL` | `moondream` | |
 | `EYEQ_VLM_API_KEY` | `EMPTY` | |
@@ -801,7 +808,7 @@ authoritative configuration documentation.
 | `EYEQ_VLM_REJUDGE_IOU` | `0.5` | Below this counts as "moved" |
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20.0` | Floor on movement-triggered re-judging |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Hard cap on inferences per batch |
-| `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Below Moondream's 512 px hi-res cliff; `0` disables |
+| `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Below Moondream's 512 px hi-res cliff; `0` disables. Tuned for the 2024 encoder — the 2025 one always emits a global view plus a tile |
 | `EYEQ_VLM_MIN_SUBJECT_PX` | `96` | Skip subjects with too little pixel evidence, measured on the longer side; `0` disables |
 | `EYEQ_VLM_BATCH_SIZE` | `1` | Crops per forward pass. `1` dispatches singly |
 | `EYEQ_VLM_SQUARE_EDGE` | `378` | Letterbox canvas edge. `0` falls back to max-edge downscaling |
@@ -813,7 +820,7 @@ authoritative configuration documentation.
 | Variable | Default | Notes |
 |---|---|---|
 | `EYEQ_DEVICE` | `auto` | Stage 1 — `auto` \| `mps` \| `cuda` \| `cpu` |
-| `EYEQ_VLM_DEVICE` | `cpu` | Measured: CPU beats MPS for Moondream2 |
+| `EYEQ_VLM_DEVICE` | `auto` | `auto` \| `mps` \| `cuda` \| `cpu`. The 4-bit model is vision-bound and wants the accelerator; `moondream` still prefers `cpu` |
 
 **API, storage, streaming, logging**
 
@@ -847,7 +854,7 @@ is pure CPU and competes directly with YOLO. It is explicitly labelled unverifie
 ```bash
 uv run ruff check .
 uv run pytest -m "not slow"    # fast suite: no model downloads, no camera
-uv run pytest                  # includes real YOLO + Moondream2
+uv run pytest                  # includes real YOLO + both Moondream backends
 ```
 
 **Only 3 tests are marked `slow`.** Everything else runs with no camera and no model weights, which
@@ -898,7 +905,7 @@ names at 31 characters, so buffer ids in tests are short and time-derived.
 - **Webhooks are fire-and-forget.** No retry, no queue, and the task handle isn't retained.
 - **The tracker has no motion model** — roughly 2 ids per real person at 6 FPS. Costs redundant
   inferences, never missed alerts.
-- **Probing is unavailable on two of the three backends.** Moondream exposes no logits and Ollama
+- **Probing is unavailable on two of the four backends.** The pinned `2024-08-26` Moondream exposes no logits and Ollama
   serves no `logprobs`, so both fall back to generate-and-parse — including its conservative default,
   which turns an unrecognised answer into a silent "no alert". Measured on this project's own
   fixtures, Moondream answers `"Crouching"` to "is this person bending over or crouching?" on 1 of

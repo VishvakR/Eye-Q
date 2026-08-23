@@ -168,8 +168,8 @@
   <p>The problem this creates is arithmetic. A VLM able to answer an arbitrary question about an
   image costs <em class="term">seconds</em> per query on edge CPUs, while a camera delivers thirty
   frames a second. Eye-Q resolves the mismatch with a two-stage cascade that arbitrages three orders
-  of magnitude of latency: YOLOv8n runs continuously at 2–4 ms per frame and does nothing but decide
-  when reasoning is worth paying for; Moondream2 wakes only for the subjects that survive that gate.
+  of magnitude of latency: YOLOv8n runs continuously at ~16 ms per frame and does nothing but decide
+  when reasoning is worth paying for; Moondream wakes only for the subjects that survive that gate.
   Between them sits a zero-copy shared-memory ring whose readers are lock-free and stale-tolerant,
   so the slow stage can lag seconds behind live without the fast stage ever blocking.</p>
 
@@ -188,7 +188,7 @@
   <table>
     <tr><td class="k">Purpose</td><td>Plain-English alert rules over existing RTSP / USB / file sources; no per-condition training</td></tr>
     <tr><td class="k">Topology</td><td>One Python 3.13 process — four daemon threads plus an asyncio control plane</td></tr>
-    <tr><td class="k">Two stages</td><td>YOLOv8n at ~2–4 ms/frame gates Moondream2 1.86 B at ~5.6 s/query (measured, Apple-Silicon CPU)</td></tr>
+    <tr><td class="k">Two stages</td><td>YOLOv8n at ~16 ms/frame gates Moondream 2 B 4-bit at ~1.9 s/query (measured, Apple-Silicon MPS)</td></tr>
     <tr><td class="k">Transport</td><td>ZeroMQ PUB/SUB, two endpoints — <code>:5557</code> detections, <code>:5558</code> verdicts</td></tr>
     <tr><td class="k">Frame store</td><td>POSIX shared-memory ring — 150 slots, 414.7 MB at 1280×720, lock-free readers</td></tr>
     <tr><td class="k">Control plane</td><td>FastAPI + uvicorn, 17 routes, MJPEG preview, WebSocket broadcast; SQLite in WAL mode</td></tr>
@@ -275,7 +275,7 @@
 <path d="M435.7,105.6C482.9,103.0 528.8,102.8 647.7,106.6M648.1,106.0C649.9,107.3 651.7,108.9 656.5,113.5M655.7,113.4C655.2,121.4 656.5,130.7 655.7,151.9M655.7,151.8C654.1,153.2 652.7,154.4 647.6,160.3M648.8,160.6C599.6,163.5 551.8,162.7 435.4,160.4M435.8,159.6C434.4,158.4 433.1,157.3 428.3,151.6M428.2,152.6C427.5,146.8 426.8,137.2 428.9,114.9M428.0,114.2C430.3,112.4 433.1,108.7 435.8,105.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
 <path d="M435.4,106.1C487.8,105.8 540.9,104.5 647.4,106.6M648.4,105.7C650.9,107.7 652.1,109.6 656.0,114.3M655.4,113.1C658.0,119.1 655.6,128.5 656.2,151.5M655.9,152.3C654.5,153.9 654.2,154.0 648.0,160.0M648.0,160.3C621.9,160.1 595.3,162.2 435.7,160.1M435.8,160.1C434.6,158.8 433.1,157.4 427.8,151.8M427.5,152.0C429.4,148.4 428.5,144.9 428.8,114.1M427.8,113.8C429.7,111.9 430.2,111.0 436.4,106.5" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
 <text x="542.0" y="129.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="542.0" dy="0.0">YOLOv8n watchdog</tspan></text>
-<text x="542.0" y="146.1" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.9" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">always on · ~2–4 ms/frame</tspan></text>
+<text x="542.0" y="146.1" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.9" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">always on · ~16 ms/frame</tspan></text>
 <rect x="428.0" y="190.0" width="228.0" height="50.0" rx="8.0" fill="#ffffff"/>
 <path d="M435.9,189.7C457.7,186.5 479.3,187.0 647.8,190.6M648.2,190.3C649.9,191.7 653.0,194.3 655.8,197.7M656.6,197.9C658.0,207.1 657.5,212.0 656.3,232.8M656.1,232.3C654.6,233.0 652.5,235.3 648.1,239.9M647.3,240.8C607.7,240.2 567.7,242.1 435.5,240.3M435.8,240.4C433.4,238.7 431.2,236.4 428.2,231.8M428.6,232.0C428.3,224.7 427.5,218.1 428.7,197.3M428.4,197.9C429.4,196.4 432.0,195.2 436.2,189.7" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
 <path d="M436.5,189.7C489.1,189.6 541.3,188.7 647.8,190.0M648.3,189.9C649.2,191.1 651.1,192.2 656.4,197.9M656.3,197.9C656.6,205.1 657.1,212.1 656.4,232.9M656.2,231.8C655.4,233.1 652.9,235.2 647.6,240.3M647.5,239.3C621.2,242.2 595.5,242.1 435.5,240.8M436.2,240.3C434.7,238.8 432.5,236.2 427.6,231.8M427.7,232.9C426.9,221.4 429.4,213.8 428.3,197.1M428.2,197.7C430.2,195.6 431.1,193.9 436.4,189.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
@@ -285,7 +285,7 @@
 <path d="M436.1,272.5C494.8,271.4 552.6,269.2 647.3,272.2M647.8,272.2C648.8,272.9 650.1,274.6 656.2,279.8M656.2,279.9C657.4,285.2 654.6,293.2 656.4,322.8M655.9,322.3C653.3,324.9 652.4,325.9 647.9,330.1M648.3,330.2C585.9,333.4 526.5,330.9 436.2,330.8M435.7,330.3C434.0,328.2 431.7,325.6 428.4,322.2M427.8,322.5C428.3,310.5 428.0,298.1 428.5,280.8M427.7,279.7C429.7,278.8 431.2,277.3 435.9,272.2" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
 <path d="M436.2,272.4C464.1,269.8 489.3,271.3 648.6,272.7M648.0,272.3C650.7,274.1 652.7,277.1 655.9,279.7M656.1,279.4C656.9,288.6 655.7,293.2 656.8,321.1M656.0,321.7C654.4,323.4 653.8,324.1 647.7,329.9M647.8,330.0C596.0,331.9 542.7,331.7 435.5,329.8M436.2,330.4C435.9,328.6 435.1,328.6 428.0,321.9M428.5,322.8C427.6,316.7 428.6,309.6 428.3,280.5M428.1,280.1C430.1,277.5 432.3,275.5 436.2,272.5" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
 <text x="542.0" y="297.6" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="14.0" font-weight="normal" fill="#1b1b1f" text-anchor="middle"><tspan x="542.0" dy="0.0">VLM worker</tspan></text>
-<text x="542.0" y="314.1" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.9" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">wake-on-event · Moondream2 1.86 B</tspan></text>
+<text x="542.0" y="314.1" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.9" font-weight="normal" fill="#6b7280" text-anchor="middle"><tspan x="542.0" dy="0.0">wake-on-event · Moondream 2 B 4-bit</tspan></text>
 <rect x="428.0" y="368.0" width="228.0" height="50.0" rx="8.0" fill="#ffffff"/>
 <path d="M436.0,368.1C497.4,366.4 560.8,365.1 648.0,367.8M648.2,367.9C650.0,369.2 651.4,371.9 655.6,376.1M655.6,376.6C656.1,381.8 657.5,385.0 655.9,410.0M655.8,410.4C655.6,410.9 654.5,411.3 648.1,417.9M647.4,417.7C608.5,421.4 571.3,419.9 436.4,417.6M436.2,417.8C434.8,416.1 432.9,413.9 428.1,410.3M428.4,409.7C427.2,403.0 427.9,394.2 428.2,375.6M428.2,376.1C429.7,374.1 433.5,370.6 435.7,368.1" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
 <path d="M436.5,367.8C467.5,367.3 496.1,367.1 647.0,367.5M648.0,367.9C650.4,370.6 651.5,371.6 656.0,376.3M656.3,375.3C656.4,379.3 657.0,387.5 656.4,409.3M656.2,410.2C654.9,412.2 652.6,413.9 648.4,417.9M648.5,417.8C610.3,419.5 572.4,420.7 435.9,418.6M435.9,418.0C434.3,416.0 432.1,414.6 428.0,410.2M427.6,409.7C427.5,402.3 426.3,395.1 427.1,374.9M428.3,376.1C428.7,375.3 431.0,373.5 436.1,367.9" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
@@ -655,7 +655,7 @@
 <path d="M34.3,60.3C74.2,59.6 115.7,59.1 216.6,60.9M216.1,60.0C217.3,61.6 218.7,63.0 221.9,66.2M221.9,66.0C222.4,81.9 221.4,101.0 221.0,128.2M222.1,127.7C221.6,129.4 220.6,130.1 216.0,133.8M215.4,133.6C185.2,136.1 156.8,134.0 34.1,134.7M33.8,134.2C32.9,132.2 31.2,131.0 28.1,127.8M28.5,128.3C29.2,120.7 28.5,111.7 28.7,66.8M28.1,66.1C29.0,64.7 30.2,63.4 33.7,60.3" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
 <path d="M33.2,60.9C81.2,59.4 133.0,58.1 215.8,60.8M216.0,60.0C216.5,60.8 217.7,61.2 222.0,65.8M222.8,66.3C221.3,78.0 223.6,89.7 222.8,127.3M221.8,128.1C220.2,130.1 218.6,131.6 215.8,134.3M215.1,134.1C191.3,134.9 164.2,136.5 33.7,132.9M33.9,134.1C33.1,133.5 32.1,131.8 27.7,128.2M27.6,128.4C26.7,120.7 28.2,115.3 28.3,65.7M28.2,66.2C29.0,64.7 29.5,64.2 33.8,60.3" fill="none" stroke="#1b1b1f" stroke-width="1.15" stroke-linecap="round"/>
 <text x="38.0" y="78.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="12.0" font-weight="normal" fill="#1b1b1f" text-anchor="start"><tspan x="38.0" dy="0.0">Two-stage cascade</tspan></text>
-<text x="38.0" y="94.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">a 2–4 ms detector gates a</tspan><tspan x="38.0" dy="12.0">~5.6 s reasoner</tspan></text>
+<text x="38.0" y="94.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="10.0" font-weight="normal" fill="#6b7280" text-anchor="start"><tspan x="38.0" dy="0.0">a ~16 ms detector gates a</tspan><tspan x="38.0" dy="12.0">~1.9 s reasoner</tspan></text>
 <text x="38.0" y="125.0" font-family="'Chalkboard SE','Bradley Hand','Comic Sans MS',cursive" font-size="9.0" font-weight="normal" fill="#c2410c" text-anchor="start"><tspan x="38.0" dy="0.0">detector.py · vlm_worker.py</tspan></text>
 <rect x="28.0" y="144.0" width="194.0" height="74.0" rx="6.0" fill="#ffffff"/>
 <path d="M34.5,143.9C59.2,141.2 89.0,141.4 216.1,143.9M215.8,144.1C217.3,144.9 217.5,145.5 221.8,150.3M222.5,149.8C222.8,157.0 221.2,163.3 222.2,211.2M222.2,212.0C220.4,213.1 218.6,215.4 215.9,218.1M216.3,218.4C176.3,218.8 133.2,220.1 34.9,217.9M34.2,217.8C32.2,216.3 30.6,214.7 28.1,211.7M28.1,211.9C26.6,197.1 25.8,183.5 28.1,149.1M28.1,150.1C28.7,148.4 30.8,147.5 33.8,143.9" fill="none" stroke="#1b1b1f" stroke-width="1.60" stroke-linecap="round"/>
@@ -755,9 +755,9 @@
 
   <table>
     <tr><th style="width:30mm">Concern</th><th>Position at this revision</th></tr>
-    <tr><td class="k">Runtime</td><td><code>uv sync</code>, Python ≥ 3.13, one uvicorn process; weights fetched on first run. The device is probed MPS → CUDA → CPU <em>functionally</em> rather than by capability flag, because the flag lies, and the VLM defaults to CPU on measurement: 5.6 s against 6.1 s on MPS.</td></tr>
-    <tr><td class="k">VLM backends</td><td>Three behind one <code>Protocol</code>, one variable apart: <code>moondream</code> in-process (default), <code>transformers</code> interruptible, <code>openai_compat</code> to a local llama.cpp / Ollama server.</td></tr>
-    <tr><td class="k">Edge profile</td><td><code>.env.pi5</code> targets an 8 GB ARM board: <code>openai_compat</code>, 960×540, watchdog 4 FPS, 900 s TTL, batch 3 — ~3 GB of 8. <b>Unverified on hardware.</b></td></tr>
+    <tr><td class="k">Runtime</td><td><code>uv sync</code>, Python ≥ 3.13, one uvicorn process; weights fetched on first run. The device is probed MPS → CUDA → CPU <em>functionally</em> rather than by capability flag, because the flag lies. The VLM defaulted to CPU for a year on measurement; the 4-bit model is 89&#37; vision encoder and reverses it, at 1.9 s on MPS against 11.7 s on CPU.</td></tr>
+    <tr><td class="k">VLM backends</td><td>Four behind one <code>Protocol</code>, one variable apart: <code>moondream4bit</code> in-process and probe-capable (default), <code>moondream</code> the fp32 baseline, <code>transformers</code> interruptible, <code>openai_compat</code> to a local llama.cpp / Ollama server.</td></tr>
+    <tr><td class="k">Edge profile</td><td><code>.env.pi5</code> targets an 8 GB ARM board: <code>openai_compat</code>, 960×540, watchdog 4 FPS, 900 s TTL, batch 1 — ~3 GB of 8. <b>Unverified on hardware.</b></td></tr>
     <tr><td class="k">Network posture</td><td>No egress by default; the opt-in webhook is the only outbound path. <b>No authentication</b> — CORS <code>*</code>, bind <code>0.0.0.0:8000</code>, every mutating endpoint open. Trusted-LAN only.</td></tr>
   </table>
 

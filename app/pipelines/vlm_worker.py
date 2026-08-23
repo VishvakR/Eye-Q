@@ -52,7 +52,7 @@ from app.core.roi import RegionOfInterest
 from app.pipelines.vlm_backends import (
     BinaryProbe,
     BinaryProbeBackend,
-    MoondreamBackend,
+    Moondream4BitBackend,
     ProbeUnsupportedError,
     VLMBackend,
     VLMUnavailableError,
@@ -488,7 +488,8 @@ class VLMWorker:
         zmq_endpoint: ZMQ endpoint to subscribe to detection events.
         result_endpoint: ZMQ endpoint to publish ``vlm_result`` events on.
                          Must differ from ``zmq_endpoint``.
-        backend: VLM backend to use. Defaults to in-process Moondream2.
+        backend: VLM backend to use. Defaults to the in-process 4-bit
+            Moondream (``2025-04-14``).
         device: Inference device for the default backend.
         model_id: Hugging Face model ID for the default backend.
         model_revision: Model revision for the default backend.
@@ -531,8 +532,8 @@ class VLMWorker:
         result_endpoint: str = "tcp://127.0.0.1:5558",
         backend: VLMBackend | None = None,
         device: str = "cpu",
-        model_id: str = "vikhyatk/moondream2",
-        model_revision: str = "2024-08-26",
+        model_id: str = "moondream/moondream-2b-2025-04-14-4bit",
+        model_revision: str = "a89c59223ef8b5bb7826780728eeec172727ca84",
         staleness_threshold_s: float = 5.0,
         crop_padding: float = 0.15,
         inference_timeout_s: float = 30.0,
@@ -588,7 +589,7 @@ class VLMWorker:
         self._memo_lock = threading.Lock()
 
         # VLM backend (loaded lazily inside the worker thread)
-        self._vlm: VLMBackend = backend or MoondreamBackend(
+        self._vlm: VLMBackend = backend or Moondream4BitBackend(
             device=device,
             model_id=model_id,
             revision=model_revision,
