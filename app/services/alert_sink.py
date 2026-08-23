@@ -144,6 +144,7 @@ class AlertSink:
             frame_snapshot=result.snapshot_path,
             track_id=detection.track_id,
             label=detection.label,
+            confidence=result.confidence,
         )
 
         self._alerts_stored += 1
@@ -157,7 +158,15 @@ class AlertSink:
         if alert_row is not None:
             alert_row["rule_name"] = result.query.rule_name
             alert_row["label"] = detection.label
-            alert_row["confidence"] = detection.confidence
+            # Two different confidences meet here and they are not
+            # interchangeable. ``confidence`` is the VLM's p(yes), read off the
+            # stored row, and it is what decides whether an alert was a close
+            # call. ``detection_confidence`` is YOLO's box score — how sure the
+            # detector was that this was a person at all. This line previously
+            # published the detector's score under the name ``confidence``,
+            # so every dashboard card and webhook payload carried a number that
+            # meant something entirely different from what it claimed.
+            alert_row["detection_confidence"] = detection.confidence
             await self._ws.broadcast({"type": "alert", "data": alert_row})
 
         if result.verdict and self._webhook.enabled:
@@ -172,7 +181,11 @@ class AlertSink:
                         "camera_id": detection.camera_id,
                         "label": detection.label,
                         "track_id": detection.track_id,
-                        "confidence": detection.confidence,
+                        # See the note above: the VLM's p(yes) and the
+                        # detector's box score are different questions, and
+                        # this payload used to send the latter as "confidence".
+                        "confidence": result.confidence,
+                        "detection_confidence": detection.confidence,
                         "verdict": result.verdict,
                         "raw_response": result.raw_response,
                         "inference_ms": result.inference_time_ms,

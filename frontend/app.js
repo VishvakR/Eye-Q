@@ -456,6 +456,19 @@ function renderAlerts(alertList) {
             ? escapeHtml(alert.label) + (alert.track_id >= 0 ? ` #${alert.track_id}` : '')
             : '';
 
+        // The VLM's own p(yes), not the detector's box score. Null whenever the
+        // verdict came from generate-and-parse, which produces no strength —
+        // so the badge is omitted rather than shown as 0.
+        const confident = typeof alert.confidence === 'number';
+        const closeCall = confident && Math.abs(alert.confidence - 0.5) < 0.1;
+        const confidenceBadge = confident
+            ? `<span class="${closeCall ? 'alert-closecall' : ''}" title="${
+                closeCall
+                    ? 'Close call — the model was near the alert threshold'
+                    : 'Probability the model assigned to Yes'
+              }">p(yes) ${alert.confidence.toFixed(2)}${closeCall ? ' ⚠' : ''}</span>`
+            : '';
+
         return `
             <div class="alert-card ${cardClass}">
                 <div class="alert-header">
@@ -472,6 +485,7 @@ function renderAlerts(alertList) {
                     <span>${ruleLabel}</span>
                     ${subject ? `<span>${subject}</span>` : ''}
                     <span>Camera: ${escapeHtml(alert.camera_id)}</span>
+                    ${confidenceBadge}
                     <span>VLM: ${(alert.inference_ms || 0).toFixed(0)}ms</span>
                 </div>
             </div>

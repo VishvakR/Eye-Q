@@ -138,6 +138,56 @@ def _widen(lo: int, hi: int, minimum: int, limit: int) -> tuple[int, int]:
     return lo, hi
 
 
+def prepare_vlm_crop(
+    frame: np.ndarray,
+    bbox: BoundingBox,
+    *,
+    crop_padding: float = 0.15,
+    focus_dim: float = 1.0,
+    square_edge: int = 378,
+    max_crop_edge: int = 511,
+) -> np.ndarray:
+    """Turn a frame and a box into the exact array Stage 2 is shown.
+
+    The whole crop sequence in one place, because it had drifted. Stage 2's
+    inputs were produced here with one set of arguments and by
+    ``bench/make_fixtures.py`` with another — that harness called
+    :func:`crop_detection_focused` bare, taking its *signature* default of
+    ``dim=0.4``, and never letterboxed at all. Production dims at
+    ``vlm_focus_dim`` (1.0, i.e. off) and always letterboxes. So every verdict
+    number ever measured on those fixtures described a crop the appliance does
+    not generate.
+
+    That is not a small discrepancy. Dimming changes what the model can see
+    outside the subject's own box, and letterboxing changes the aspect ratio
+    and the image-token count. An accuracy measurement taken on the wrong
+    inputs is worse than none, because it looks like evidence.
+
+    Callers pass their own settings; the defaults here mirror the shipped ones
+    so a caller that wants "whatever production does" can simply omit them.
+
+    Args:
+        frame: Full BGR frame.
+        bbox: Normalised subject box.
+        crop_padding: Context added around the box, as a fraction of its size.
+        focus_dim: Brightness multiplier outside the subject's own box. 1.0
+            disables dimming.
+        square_edge: Letterbox canvas edge. 0 falls back to ``max_crop_edge``.
+        max_crop_edge: Longest-side cap, used only when ``square_edge`` is 0.
+
+    Returns:
+        The crop as it will be handed to the backend, in BGR.
+    """
+    focused = crop_detection_focused(frame, bbox, crop_padding, focus_dim)
+    # Letterboxing subsumes the max-edge cap: it already scales the long side
+    # to a fixed value, so nothing can reach the tiling cliff
+    # downscale_for_vlm exists to dodge. The old path stays for square_edge=0,
+    # which is how a deployment opts out.
+    if square_edge > 0:
+        return letterbox_square(focused, square_edge)
+    return downscale_for_vlm(focused, max_crop_edge)
+
+
 def subject_pixel_size(
     frame_shape: tuple[int, ...], bbox: BoundingBox
 ) -> tuple[int, int]:
@@ -1412,17 +1462,13 @@ class VLMWorker:
                     )
                     continue
 
-                focused = crop_detection_focused(
-                    frame, event.bbox, self._crop_padding, self._focus_dim
-                )
-                # Letterboxing subsumes the max-edge cap: it already scales the
-                # long side to a fixed value, so nothing can reach the tiling
-                # cliff downscale_for_vlm exists to dodge. The old path stays
-                # for square_edge=0, which is how a deployment opts out.
-                cropped = (
-                    letterbox_square(focused, self._square_edge)
-                    if self._square_edge > 0
-                    else downscale_for_vlm(focused, self._max_crop_edge)
+                cropped = prepare_vlm_crop(
+                    frame,
+                    event.bbox,
+                    crop_padding=self._crop_padding,
+                    focus_dim=self._focus_dim,
+                    square_edge=self._square_edge,
+                    max_crop_edge=self._max_crop_edge,
                 )
                 prepared.append(
                     (event, rules, cropped, self._is_new_subject(event.track_id))

@@ -1,0 +1,276 @@
+{
+  "fixtures": [
+    {
+      "name": "crop_000.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 2,
+      "track_id": 3,
+      "subject_px": 138,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_001.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 7,
+      "track_id": 3,
+      "subject_px": 132,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_002.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 8,
+      "track_id": 2,
+      "subject_px": 288,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_003.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 10,
+      "track_id": 4,
+      "subject_px": 190,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_004.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 13,
+      "track_id": 4,
+      "subject_px": 175,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_005.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 18,
+      "track_id": 6,
+      "subject_px": 147,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_006.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 19,
+      "track_id": 6,
+      "subject_px": 147,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_007.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 23,
+      "track_id": 7,
+      "subject_px": 96,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_008.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 27,
+      "track_id": 9,
+      "subject_px": 207,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_009.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 31,
+      "track_id": 11,
+      "subject_px": 125,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_010.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 31,
+      "track_id": 12,
+      "subject_px": 138,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_011.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 34,
+      "track_id": 10,
+      "subject_px": 228,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_012.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 39,
+      "track_id": 1,
+      "subject_px": 233,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_013.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 40,
+      "track_id": 5,
+      "subject_px": 195,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_014.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 40,
+      "track_id": 9,
+      "subject_px": 197,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_015.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 43,
+      "track_id": 10,
+      "subject_px": 179,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_016.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 46,
+      "track_id": 8,
+      "subject_px": 275,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_017.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 52,
+      "track_id": 11,
+      "subject_px": 150,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_018.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 55,
+      "track_id": 14,
+      "subject_px": 108,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_019.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 57,
+      "track_id": 1,
+      "subject_px": 161,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_020.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 60,
+      "track_id": 12,
+      "subject_px": 107,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_021.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 73,
+      "track_id": 5,
+      "subject_px": 187,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_022.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 81,
+      "track_id": 8,
+      "subject_px": 225,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_023.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 81,
+      "track_id": 15,
+      "subject_px": 109,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_024.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 83,
+      "track_id": 7,
+      "subject_px": 124,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_025.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 87,
+      "track_id": 16,
+      "subject_px": 190,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_026.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 88,
+      "track_id": 15,
+      "subject_px": 111,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_027.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 93,
+      "track_id": 16,
+      "subject_px": 187,
+      "width": 378,
+      "height": 378
+    },
+    {
+      "name": "crop_028.png",
+      "clip": "cctv_demo.mp4",
+      "frame_index": 98,
+      "track_id": 2,
+      "subject_px": 249,
+      "width": 378,
+      "height": 378
+    }
+  ],
+  "clips": [
+    "cctv_demo.mp4"
+  ],
+  "crop_settings": {
+    "crop_padding": 0.15,
+    "focus_dim": 1.0,
+    "square_edge": 378,
+    "max_crop_edge": 511,
+    "min_subject_px": 96
+  },
+  "subjects": 15
+}

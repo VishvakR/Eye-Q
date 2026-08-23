@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     frame_snapshot  TEXT,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     track_id        INTEGER NOT NULL DEFAULT -1,
-    label           TEXT    NOT NULL DEFAULT ''
+    label           TEXT    NOT NULL DEFAULT '',
+    confidence      REAL
 );
 
 -- Cameras: Registered video sources
@@ -89,6 +90,13 @@ CREATE INDEX IF NOT EXISTS idx_rules_camera_id ON rules(camera_id);
 _ALERT_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("track_id", "INTEGER NOT NULL DEFAULT -1"),
     ("label", "TEXT NOT NULL DEFAULT ''"),
+    # Nullable on purpose. Only the probe path produces a confidence; a verdict
+    # generated as text and parsed carries no strength, and NULL says that
+    # honestly where 0.0 would read as "the model was certain it was not a
+    # violation". Without this column the number is computed on every probed
+    # verdict and then discarded, which makes it impossible to ask what a
+    # different vlm_probe_threshold would have done to alerts already filed.
+    ("confidence", "REAL"),
 )
 
 
@@ -321,18 +329,24 @@ class Database:
         frame_snapshot: str | None = None,
         track_id: int = -1,
         label: str = "",
+        confidence: float | None = None,
     ) -> int:
         """Record a VLM verdict as an alert.
 
         ``track_id`` distinguishes alerts raised about different subjects in the
         same frame; ``label`` is stored rather than re-attached in memory so it
         survives into history reads, not just live broadcasts.
+
+        ``confidence`` is the VLM's own p(yes) from the probe path, **not** the
+        detector's box score. It is ``None`` when the verdict came from
+        generate-and-parse, which produces no strength. Storing it is what
+        makes a threshold question answerable against alerts already filed.
         """
         cursor = await self._db.execute(
             """INSERT INTO alerts (rule_id, camera_id, timestamp, verdict,
                                    raw_response, inference_ms, bbox_json, frame_snapshot,
-                                   track_id, label)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   track_id, label, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rule_id,
                 camera_id,
@@ -344,6 +358,7 @@ class Database:
                 frame_snapshot,
                 track_id,
                 label,
+                confidence,
             ),
         )
         await self._db.commit()

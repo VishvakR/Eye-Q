@@ -316,3 +316,11 @@ body { -webkit-font-smoothing: antialiased; }
 .pulse-online {
     animation: pulse-glow 2s infinite;
 }
+
+/* A probed verdict that landed near the alert threshold. Worth an operator's
+   eye precisely because the model was not sure either way — the text path
+   never carried this signal, so there was nothing to surface. */
+.alert-meta .alert-closecall {
+    color: #d98324;
+    font-weight: 600;
+}

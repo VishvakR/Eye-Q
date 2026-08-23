@@ -42,6 +42,7 @@ def make_result(
     rule_id: int = DEFAULT_RULE_ID,
     raw_response: str = "Yes, a person is blocking the fire exit.",
     snapshot_path: str | None = None,
+    confidence: float | None = None,
 ) -> VLMResult:
     """Build a VLMResult exactly as the worker would publish it."""
     detection = DetectionEvent(
@@ -64,6 +65,7 @@ def make_result(
         inference_time_ms=812.5,
         model_name="moondream-2b-2025-04-14-4bit",
         snapshot_path=snapshot_path,
+        confidence=confidence,
     )
 
 
@@ -361,3 +363,81 @@ class TestSchemaMigration:
         row = await db.get_alert(alert_id)
         assert row["track_id"] == -1
         assert row["label"] == ""
+
+
+class TestConfidenceAttribution:
+    """Two different confidences meet in the sink and must not be swapped.
+
+    ``VLMResult.confidence`` is the VLM's p(yes) from the probe path — the
+    number that says whether a verdict was a close call.
+    ``DetectionEvent.confidence`` is YOLO's box score — how sure the detector
+    was that this was a person at all. The sink used to publish the detector's
+    score under the name ``confidence`` and never store the VLM's at all, so
+    every dashboard card and webhook payload carried a number that meant
+    something entirely different from what it claimed, and no threshold
+    question could be asked of alerts already filed.
+    """
+
+    async def _run(self, db, settings, ws, confidence):
+        """Drive one verdict through the sink's handler.
+
+        The sentinel rule is seeded first because ``alerts.rule_id`` is a
+        foreign key; ``AlertSink.start()`` normally does this, but starting it
+        would also spin up the ZMQ subscriber this test does not need.
+        """
+        await db.ensure_default_rule()
+        sink = AlertSink(db, ws, settings)
+        await sink._handle_result(make_result(confidence=confidence).model_dump())
+        return sink
+
+    async def test_the_vlm_confidence_reaches_sqlite(self, db, settings):
+        await self._run(db, settings, FakeWSManager(), 0.83)
+
+        alerts = await db.list_alerts()
+        assert alerts[0]["confidence"] == pytest.approx(0.83)
+
+    async def test_generate_and_parse_stores_null_not_zero(self, db, settings):
+        """A parsed verdict carries no strength, and 0.0 would read as
+        'certainly not a violation' rather than 'no number available'."""
+        await self._run(db, settings, FakeWSManager(), None)
+
+        alerts = await db.list_alerts()
+        assert alerts[0]["confidence"] is None
+
+    async def test_the_broadcast_does_not_publish_the_detector_score(
+        self, db, settings
+    ):
+        """The exact bug: 0.91 is YOLO's box score, 0.83 is the VLM's p(yes)."""
+        ws = FakeWSManager()
+        await self._run(db, settings, ws, 0.83)
+
+        payload = ws.messages[-1]["data"]
+        assert payload["confidence"] == pytest.approx(0.83), "must be the VLM's p(yes)"
+        assert payload["detection_confidence"] == pytest.approx(0.91)
+
+    async def test_the_webhook_separates_the_two(self, db, settings):
+        sent: list[dict] = []
+        ws = FakeWSManager()
+
+        await db.ensure_default_rule()
+        sink = AlertSink(db, ws, settings)
+
+        async def capture(payload: dict) -> bool:
+            sent.append(payload)
+            return True
+
+        # The dispatcher is disabled without a URL, so stub both the gate and
+        # the send rather than reaching for the read-only property.
+        sink._webhook.dispatch = capture
+        type(sink._webhook).enabled = property(lambda self: True)
+        try:
+            await sink._handle_result(
+                make_result(verdict=True, confidence=0.83).model_dump()
+            )
+            await asyncio.sleep(0)  # let the fire-and-forget task run
+        finally:
+            del type(sink._webhook).enabled
+
+        assert sent, "no webhook payload dispatched"
+        assert sent[0]["confidence"] == pytest.approx(0.83)
+        assert sent[0]["detection_confidence"] == pytest.approx(0.91)
