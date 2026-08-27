@@ -179,6 +179,33 @@ class Settings(BaseSettings):
         ),
     )
 
+    yolo_pair_overlap: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How much of the smaller box must lie inside the larger for a "
+            "rule's pair_label to count as a co-occurrence, measured as "
+            "BoundingBox.overlap_ratio — intersection over the *smaller* "
+            "area.\n\n"
+            "Explicitly not IoU. A cell phone fully inside a person's box "
+            "scores about 0.028 on IoU, not because the phone is barely inside "
+            "but because the person is roughly thirty-six times larger and IoU "
+            "divides by the union. Any IoU threshold loose enough to admit "
+            "that pair also admits two boxes that merely graze at a corner. "
+            "Dividing by the smaller area asks the question the operator means "
+            "— 'is the phone in the person?' — and returns ~1.0 for full "
+            "containment at any size ratio.\n\n"
+            "0.5 reads as 'at least half the smaller object is inside the "
+            "larger'. Lower it toward 0 for partners YOLO boxes loosely; "
+            "raising it above ~0.9 demands near-total containment, which a "
+            "phone held out to the side will fail. 0.0 accepts any touch at "
+            "all, which on generous axis-aligned boxes is close to no gate — "
+            "a phone on a desk two metres behind someone clips their box by a "
+            "pixel, and at 30 FPS that is a firehose."
+        ),
+    )
+
     # ── VLM (Stage 2) ───────────────────────────────────────────
     vlm_backend: Literal[
         "moondream4bit", "moondream", "transformers", "openai_compat"
@@ -392,8 +419,18 @@ class Settings(BaseSettings):
         ge=0,
         description=(
             "Skip a detection whose own box, before padding, is smaller than "
-            "this on its longer side. Such a subject cannot support the "
-            "question: "
+            "this on its longer side. Governs BOTH stages: Stage 1 sheds "
+            "against it before publishing (watchdog.detections_filtered_size) "
+            "and Stage 2 keeps the same test as a backstop. One setting on "
+            "purpose — both call BoundingBox.pixel_size on the same "
+            "fixed-shape ring buffer, so the predicate is literally the same "
+            "function and the two floors cannot drift by a pixel. The "
+            "consequence to know when reading /api/status: "
+            "vlm.instances_too_small should now read ZERO, which is the "
+            "healthy steady state and not a regression — Stage 1 sheds first. "
+            "A non-zero value there means something other than this watchdog "
+            "is publishing on the detection endpoint. "
+            "Such a subject cannot support the question: "
             "demo_cctv.py already records that at this camera distance a head "
             "is about 20 px and Moondream answers 'No' to every phrasing of a "
             "hard-hat question regardless of what is on the worker's head. "

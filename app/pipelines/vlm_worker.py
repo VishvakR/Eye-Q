@@ -196,9 +196,14 @@ def subject_pixel_size(
     Separate from :func:`crop_bounds` because the question it answers is not
     "where do I cut" but "is there anything here worth asking about" — and the
     padded crop is the wrong thing to measure for that.
+
+    A thin adapter over :meth:`BoundingBox.pixel_size`, which Stage 1's own size
+    floor also calls. The two floors must agree exactly about the same box or
+    Stage 2's becomes unreachable in a way no counter would show, so the
+    arithmetic lives in one place and both stages borrow it.
     """
     h, w = frame_shape[:2]
-    return int((bbox.x2 - bbox.x1) * w), int((bbox.y2 - bbox.y1) * h)
+    return bbox.pixel_size(w, h)
 
 
 def crop_bounds(

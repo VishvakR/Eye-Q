@@ -193,6 +193,8 @@ class WatchdogStats:
     tracks_active: int = 0
     cooldown_keys: int = 0
     frames_repeated: int = 0
+    detections_filtered_size: int = 0
+    detections_filtered_pair: int = 0
 
 
 # ── YOLO Watchdog ────────────────────────────────────────────────
@@ -222,6 +224,21 @@ class YOLOWatchdog:
             off restores the original per-label behaviour exactly.
         track_iou_threshold: Minimum IoU to continue an existing track.
         track_max_age_frames: Frames a track survives unmatched.
+        min_subject_px: Discard a detection whose own box, in captured pixels
+            and before padding, is smaller than this on its longer side. 0
+            disables. Defaults to off rather than to Stage 2's 96 so that
+            constructing a watchdog directly filters nothing until the caller
+            asks — matching ``target_labels=None`` and ``roi=None``, which
+            already work that way. ``app/api/server.py`` supplies the real
+            policy from ``vlm_min_subject_px``, the same setting Stage 2 reads.
+        pair_requirements: Map of ``label -> {acceptable partner labels}``. A
+            label in the map only triggers when one of its partners has an
+            overlapping box in the same frame. Labels absent from the map are
+            unaffected, so a pair rule about people cannot silence a rule about
+            forklifts. None or empty disables the gate entirely.
+        pair_overlap: How much of the smaller box must lie inside the larger
+            for ``pair_requirements`` to count as a co-occurrence, measured as
+            :meth:`BoundingBox.overlap_ratio`. Not IoU — see that method.
     """
 
     def __init__(
@@ -240,6 +257,9 @@ class YOLOWatchdog:
         track_enabled: bool = True,
         track_iou_threshold: float = 0.2,
         track_max_age_frames: int = 60,
+        min_subject_px: int = 0,
+        pair_requirements: dict[str, set[str]] | None = None,
+        pair_overlap: float = 0.5,
     ) -> None:
         self._buffer = buffer
         self._publisher = publisher
@@ -250,6 +270,9 @@ class YOLOWatchdog:
         self._target_labels = target_labels
         self._roi = roi or RegionOfInterest.full_frame()
         self._cooldown = CooldownGate(cooldown_seconds)
+        self._min_subject_px = min_subject_px
+        self._pair_requirements = pair_requirements or None
+        self._pair_overlap = pair_overlap
         self._camera_id = camera_id
         self._target_fps = target_fps
         self._frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
@@ -280,6 +303,8 @@ class YOLOWatchdog:
         self._detections_filtered_confidence = 0
         self._detections_filtered_cooldown = 0
         self._detections_filtered_label = 0
+        self._detections_filtered_size = 0
+        self._detections_filtered_pair = 0
         self._start_time: float = 0.0
         self._fps_counter = _WatchdogFPSCounter(window_size=30)
         self._last_timestamp: float | None = None
@@ -388,6 +413,8 @@ class YOLOWatchdog:
             tracks_active=self._tracker.active_count if self._tracker else 0,
             cooldown_keys=self._cooldown.tracked_keys,
             frames_repeated=self._frames_repeated,
+            detections_filtered_size=self._detections_filtered_size,
+            detections_filtered_pair=self._detections_filtered_pair,
         )
 
     # ── Configuration Mutators ───────────────────────────────────
@@ -408,6 +435,24 @@ class YOLOWatchdog:
         """
         self._target_labels = labels
         logger.info(f"YOLOWatchdog target labels updated to: {labels}")
+
+    def update_pair_requirements(
+        self, requirements: dict[str, set[str]] | None
+    ) -> None:
+        """Update the co-occurrence requirements at runtime.
+
+        Driven by ``sync_rules``, which composes the map from each rule's
+        ``pair_label`` column. Read atomically in the watchdog loop, like the
+        ROI and the label whitelist.
+
+        Args:
+            requirements: Map of ``label -> {acceptable partner labels}``, or
+                None to require no co-occurrence of anything.
+        """
+        self._pair_requirements = requirements or None
+        logger.info(
+            f"YOLOWatchdog pair requirements updated to: {self._pair_requirements}"
+        )
 
     def update_cooldown(self, seconds: float) -> None:
         """Update the per-label cooldown duration at runtime."""
@@ -532,6 +577,84 @@ class YOLOWatchdog:
             logger.error(f"Failed to load YOLO model '{self._model_name}': {exc}")
             return False
 
+    def _too_small(self, bbox: BoundingBox, frame_w: int, frame_h: int) -> bool:
+        """Whether a box carries too few captured pixels to be worth waking Stage 2.
+
+        The same test :meth:`VLMWorker._too_small` applies, moved to where it is
+        cheapest. A box rejected here never crosses ZMQ, never costs Stage 2 a
+        ring-buffer read, and never occupies a slot in the batch that
+        ``vlm_max_instances_per_batch`` is about to truncate — so it can no
+        longer displace a legible subject from that batch's priority sort.
+
+        Measured on the *longer* side of the subject's own box, before padding:
+        a person is tall and narrow, so requiring both sides to clear the floor
+        would discard subjects that are perfectly legible.
+
+        This gates the trigger, not the display, and it must stay *above* the
+        cooldown in the ladder — a box rejected here has not spent its
+        subject's cooldown, so the same person is asked about the moment they
+        are close enough to answer.
+        """
+        if self._min_subject_px <= 0:
+            return False
+        return max(bbox.pixel_size(frame_w, frame_h)) < self._min_subject_px
+
+    def _pair_blocked(
+        self, candidates: list[tuple[str, BoundingBox, float]]
+    ) -> set[int]:
+        """Indices of candidates their co-occurrence requirement rejects.
+
+        Whole-frame, like tracking, and for the same reason: whether a
+        detection qualifies is a fact about the *other* boxes in its frame, not
+        about itself. Resolved once per frame so the per-detection ladder stays
+        a set lookup rather than an O(N) rescan.
+
+        Runs over the raw candidate list — before the label allowlist, and
+        before the size floor. Both exemptions matter, and both fail silently
+        if removed:
+
+            - A rule watching only "person" narrows ``target_labels`` to that
+              one label, so the "cell phone" would be filtered away before the
+              pair could be tested. The pair search has to see everything YOLO
+              scored, and it does, because Pass 1 applies only the confidence
+              threshold.
+            - A partner such as a phone is *always* under the size floor.
+              Testing partners against it would mean the gate could never fire
+              at all — and it fails closed, so Stage 2 would simply go quiet
+              while every counter looked like a peaceful scene.
+
+        Only labels named in the requirements map are constrained. "person +
+        cell phone" says nothing about a forklift, so a rule about forklifts
+        keeps firing.
+
+        Returns:
+            Indices into ``candidates`` to reject. Empty when no requirement is
+            configured, so the gate costs one attribute read on an appliance
+            not using it.
+        """
+        if not self._pair_requirements:
+            return set()
+
+        boxes_by_label: dict[str, list[BoundingBox]] = {}
+        for label, bbox, _confidence in candidates:
+            boxes_by_label.setdefault(label, []).append(bbox)
+
+        blocked: set[int] = set()
+        for idx, (label, bbox, _confidence) in enumerate(candidates):
+            partners = self._pair_requirements.get(label)
+            if not partners:
+                continue
+            # No partner in frame blocks every primary, which falls out of
+            # `any()` over an empty generator being False — no special case.
+            if not any(
+                bbox.overlap_ratio(partner_box) >= self._pair_overlap
+                for partner in partners
+                for partner_box in boxes_by_label.get(partner, ())
+            ):
+                blocked.add(idx)
+
+        return blocked
+
     def _process_frame(
         self,
         frame: np.ndarray,
@@ -555,7 +678,15 @@ class YOLOWatchdog:
         if self._model is None:
             return
 
-        # Run inference
+        # Run inference over every class YOLO knows, deliberately.
+        #
+        # Ultralytics accepts a `classes=` argument that would restrict
+        # inference to the target labels, and it looks like free savings. Do
+        # not add it. Two things downstream read the full candidate list: the
+        # live overlay, which must show the forklift beside the person a rule
+        # watches, and the co-occurrence gate, which cannot test "person holding
+        # a phone" if the phone was never scored. Narrowing here would disable
+        # that gate completely with no counter moving.
         results = self._model.predict(
             frame,
             device=self._device,
@@ -626,8 +757,16 @@ class YOLOWatchdog:
         else:
             track_ids = [-1] * len(candidates)
 
+        # ── Pass 2.5: resolve co-occurrence for the whole frame at once ──
+        # Whole-frame for the same reason tracking is, and *after* tracking so
+        # the box that publishes already carries the track id Stage 2's memo
+        # and coalescer key on.
+        pair_blocked = self._pair_blocked(candidates)
+
         # ── Pass 3: gate and publish ─────────────────────────────────
-        for (label, bbox, confidence), track_id in zip(candidates, track_ids):
+        for idx, ((label, bbox, confidence), track_id) in enumerate(
+            zip(candidates, track_ids)
+        ):
             event = DetectionEvent(
                 timestamp=timestamp,
                 camera_id=self._camera_id,
@@ -651,11 +790,27 @@ class YOLOWatchdog:
             # original behaviour.
             key = f"{label}#{track_id}" if track_id >= 0 else label
 
+            # Order is load-bearing. Both the size floor and the pair gate
+            # sit ABOVE the cooldown because `should_trigger` *mutates* — it
+            # records the trigger and returns True in the same breath. A gate
+            # below it would spend a subject's cooldown on a detection it then
+            # discarded, so a person rejected at 30 px would be suppressed by a
+            # cooldown they never spent when they walk close enough to answer.
+            # Stage 2 makes the same call one stage later by refusing to
+            # memoise a subject it skipped for being too small.
+            #
+            # Size sits after the two scope gates for attributability, not
+            # cost: first in the ladder it would count distant background
+            # objects of classes no rule watches, and stop being actionable.
             fired = False
             if self._target_labels is not None and label not in self._target_labels:
                 self._detections_filtered_label += 1
             elif not self._roi.contains_bbox_center(bbox):
                 self._detections_filtered_roi += 1
+            elif self._too_small(bbox, frame_w, frame_h):
+                self._detections_filtered_size += 1
+            elif idx in pair_blocked:
+                self._detections_filtered_pair += 1
             elif not self._cooldown.should_trigger(key):
                 self._detections_filtered_cooldown += 1
             else:

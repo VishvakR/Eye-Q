@@ -129,6 +129,73 @@ class TestBoundingBoxIoU:
         assert flat.iou(flat) == 0.0
 
 
+class TestBoundingBoxOverlapRatio:
+    """Containment, not similarity — the predicate co-occurrence gating needs."""
+
+    def test_a_contained_small_box_scores_one_where_iou_scores_almost_nothing(self):
+        """This test is the whole reason the method exists.
+
+        A phone fully inside a person scores ~0.028 on IoU, not because the
+        phone is barely inside but because the person is ~36x larger and IoU
+        divides by the union. Any IoU threshold loose enough to admit this pair
+        also admits two boxes that merely graze at a corner.
+        """
+        person = BoundingBox(x1=0.20, y1=0.20, x2=0.60, y2=0.90)
+        phone = BoundingBox(x1=0.35, y1=0.45, x2=0.41, y2=0.58)
+
+        assert person.iou(phone) < 0.03
+        assert person.overlap_ratio(phone) == pytest.approx(1.0)
+
+    def test_identical_boxes_score_one(self):
+        box = BoundingBox(x1=0.1, y1=0.1, x2=0.5, y2=0.5)
+        assert box.overlap_ratio(box) == pytest.approx(1.0)
+
+    def test_disjoint_boxes_score_zero(self):
+        left = BoundingBox(x1=0.0, y1=0.0, x2=0.2, y2=0.2)
+        right = BoundingBox(x1=0.6, y1=0.6, x2=0.9, y2=0.9)
+        assert left.overlap_ratio(right) == 0.0
+
+    def test_touching_edges_score_zero(self):
+        """A phone beside someone is not a phone in their hand."""
+        left = BoundingBox(x1=0.0, y1=0.0, x2=0.4, y2=0.4)
+        right = BoundingBox(x1=0.4, y1=0.0, x2=0.8, y2=0.4)
+        assert left.overlap_ratio(right) == 0.0
+
+    def test_half_the_smaller_box_inside_scores_one_half(self):
+        """Same geometry IoU would call 0.2 — the divisor is the difference."""
+        a = BoundingBox(x1=0.0, y1=0.0, x2=0.4, y2=0.4)
+        b = BoundingBox(x1=0.3, y1=0.0, x2=0.5, y2=0.4)
+        assert a.overlap_ratio(b) == pytest.approx(0.5)
+        assert a.iou(b) == pytest.approx(0.2)
+
+    def test_is_symmetric(self):
+        """`min` is symmetric, so a rule cannot depend on argument order."""
+        a = BoundingBox(x1=0.1, y1=0.2, x2=0.5, y2=0.7)
+        b = BoundingBox(x1=0.3, y1=0.1, x2=0.8, y2=0.6)
+        assert a.overlap_ratio(b) == pytest.approx(b.overlap_ratio(a))
+
+    def test_degenerate_box_returns_zero_not_an_error(self):
+        flat = BoundingBox(x1=0.3, y1=0.3, x2=0.3, y2=0.7)
+        real = BoundingBox(x1=0.1, y1=0.1, x2=0.5, y2=0.9)
+        assert flat.overlap_ratio(real) == 0.0
+        assert flat.overlap_ratio(flat) == 0.0
+
+
+class TestBoundingBoxPixelSize:
+    """Both stages' size floors measure through this one method."""
+
+    def test_reports_the_boxs_own_extent(self):
+        box = BoundingBox(x1=0.25, y1=0.10, x2=0.75, y2=0.60)
+        assert box.pixel_size(640, 480) == (320, 240)
+
+    def test_both_stages_measure_the_same_box(self):
+        """The only thing standing between the two floors and a 1px drift."""
+        from app.pipelines.vlm_worker import subject_pixel_size
+
+        box = BoundingBox(x1=0.2, y1=0.2, x2=0.6, y2=0.9)
+        assert subject_pixel_size((480, 640, 3), box) == box.pixel_size(640, 480)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Region of Interest Tests
 # ═══════════════════════════════════════════════════════════════════
@@ -590,6 +657,247 @@ class TestDisplayVsTriggerScope:
         self._run_frame(watchdog, [("person", 0.2)])
 
         assert watchdog.recent_detections(max_age_s=60) == []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Stage 1 Load Shedding
+# ═══════════════════════════════════════════════════════════════════
+
+# Shared geometry for the two gate suites, on a 100x100 frame.
+_PERSON = [20.0, 20.0, 60.0, 90.0]  # 40 x 70 px
+_PHONE_HELD = [35.0, 45.0, 41.0, 58.0]  # 6 x 13 px, fully inside _PERSON
+_PHONE_AWAY = [80.0, 10.0, 86.0, 23.0]  # 6 x 13 px, disjoint from _PERSON
+_CAR = [5.0, 5.0, 45.0, 45.0]  # 40 x 40 px
+
+
+class _GateHarness:
+    """Drives `_process_frame` directly on a 100x100 frame."""
+
+    def _watchdog(self, **kwargs):
+        return YOLOWatchdog(buffer=MagicMock(), publisher=MagicMock(), **kwargs)
+
+    def _run_frame(self, watchdog, detections, timestamp=1.0):
+        watchdog._model = MagicMock()
+        watchdog._model.predict.return_value = [_stub_result(detections)]
+        watchdog._process_frame(
+            np.zeros((100, 100, 3), dtype=np.uint8), timestamp, 0
+        )
+
+    def _published(self, watchdog):
+        """The payload dicts handed to the ZMQ publisher, in order."""
+        return [
+            call.args[1] for call in watchdog._publisher.publish.call_args_list
+        ]
+
+
+class TestStageOneSizeFloor(_GateHarness):
+    """The floor Stage 2 already applied, moved to where it is cheapest.
+
+    A box rejected here never crosses ZMQ, never costs Stage 2 a ring-buffer
+    read, and can no longer displace a legible subject from the batch that
+    `vlm_max_instances_per_batch` truncates.
+    """
+
+    def test_a_box_under_the_floor_never_publishes(self):
+        watchdog = self._watchdog(min_subject_px=40)
+        self._run_frame(watchdog, [("person", 0.9, [40.0, 40.0, 70.0, 70.0])])
+
+        assert watchdog.stats.detections_published == 0
+        assert watchdog.stats.detections_filtered_size == 1
+
+    def test_a_box_under_the_floor_is_still_drawn(self):
+        """The display-vs-trigger invariant: gating decides what wakes the VLM."""
+        watchdog = self._watchdog(min_subject_px=40)
+        self._run_frame(watchdog, [("person", 0.9, [40.0, 40.0, 70.0, 70.0])])
+
+        recent = watchdog.recent_detections(max_age_s=60)
+        assert len(recent) == 1
+        assert recent[0][1] is False
+
+    def test_the_longer_side_is_what_counts(self):
+        """A person is tall and narrow; both-sides would drop legible subjects."""
+        watchdog = self._watchdog(min_subject_px=40)
+        self._run_frame(watchdog, [("person", 0.9, [47.0, 25.0, 53.0, 75.0])])
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_size == 0
+
+    def test_zero_disables_the_floor(self):
+        watchdog = self._watchdog(min_subject_px=0)
+        self._run_frame(watchdog, [("person", 0.9, [10.0, 10.0, 14.0, 14.0])])
+
+        assert watchdog.stats.detections_published == 1
+
+    def test_the_floor_does_not_consume_the_cooldown(self):
+        """The ordering test. Fails if the gate moves below the cooldown.
+
+        `CooldownGate.should_trigger` records the trigger and returns True in
+        the same breath, so a gate below it would spend this subject's cooldown
+        on a frame it discarded — and the person would be suppressed when they
+        finally walk close enough to answer.
+        """
+        watchdog = self._watchdog(min_subject_px=40, cooldown_seconds=999.0)
+        self._run_frame(watchdog, [("person", 0.9, [40.0, 40.0, 70.0, 70.0])])
+        self._run_frame(watchdog, [("person", 0.9, [35.0, 35.0, 85.0, 85.0])])
+
+        recent = watchdog.recent_detections(max_age_s=60)
+        # Vacuous unless both frames resolved to the same subject.
+        assert recent[0][0].track_id == recent[1][0].track_id
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_cooldown == 0
+
+    def test_a_subject_under_the_floor_still_reaches_the_tracker(self):
+        """Fails if anyone "optimises" the floor into Pass 1.
+
+        Filtering before `tracker.update()` would give a subject a fresh
+        track_id on crossing the floor, and Stage 2's memo is keyed
+        (track_id, rule_id) — so every approach would become a cache miss and
+        the filter would *increase* VLM load.
+        """
+        watchdog = self._watchdog(min_subject_px=40)
+        self._run_frame(watchdog, [("person", 0.9, [40.0, 40.0, 70.0, 70.0])])
+        self._run_frame(watchdog, [("person", 0.9, [35.0, 35.0, 85.0, 85.0])])
+
+        recent = watchdog.recent_detections(max_age_s=60)
+        assert recent[0][0].track_id == recent[1][0].track_id
+        assert watchdog.stats.tracks_active == 1
+
+
+class TestCoOccurrenceGating(_GateHarness):
+    """Only wake the VLM about a person who actually has a phone."""
+
+    PAIR = {"person": {"cell phone"}}
+
+    def test_a_person_without_the_partner_does_not_trigger(self):
+        watchdog = self._watchdog(pair_requirements=self.PAIR)
+        self._run_frame(watchdog, [("person", 0.9, _PERSON)])
+
+        assert watchdog.stats.detections_published == 0
+        assert watchdog.stats.detections_filtered_pair == 1
+
+    def test_a_person_with_an_overlapping_partner_triggers(self):
+        """And the *person's* box publishes — not the phone's, not a union."""
+        watchdog = self._watchdog(pair_requirements=self.PAIR)
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, _PHONE_HELD)],
+        )
+
+        people = [p for p in self._published(watchdog) if p["label"] == "person"]
+        assert len(people) == 1
+        assert people[0]["bbox"] == pytest.approx(
+            {"x1": 0.20, "y1": 0.20, "x2": 0.60, "y2": 0.90}
+        )
+        assert watchdog.stats.detections_filtered_pair == 0
+
+    def test_the_pair_is_found_even_when_the_partner_is_out_of_scope(self):
+        """The ordering test. Fails if the pair search moves below the label gate.
+
+        `sync_rules` narrows target_labels to {"person"} for a person-only
+        rule, so the phone would already be gone if the search ran after it.
+        """
+        watchdog = self._watchdog(
+            pair_requirements=self.PAIR, target_labels={"person"}
+        )
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, _PHONE_HELD)],
+        )
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_label == 1
+
+    def test_a_disjoint_partner_does_not_pair(self):
+        """A phone on a shelf across the room is not a phone in a hand."""
+        watchdog = self._watchdog(pair_requirements=self.PAIR)
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, _PHONE_AWAY)],
+        )
+
+        assert watchdog.stats.detections_published == 1  # the phone itself
+        assert self._published(watchdog)[0]["label"] == "cell phone"
+        assert watchdog.stats.detections_filtered_pair == 1
+
+    def test_iou_would_have_missed_this_pair(self):
+        """Guards against a future "simplification" back to `iou`."""
+        person = BoundingBox(x1=0.20, y1=0.20, x2=0.60, y2=0.90)
+        phone = BoundingBox(x1=0.35, y1=0.45, x2=0.41, y2=0.58)
+        assert person.iou(phone) < 0.03
+
+        watchdog = self._watchdog(pair_requirements=self.PAIR)
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, _PHONE_HELD)],
+        )
+        assert watchdog.stats.detections_filtered_pair == 0
+
+    def test_a_tiny_partner_is_not_dropped_by_the_size_floor(self):
+        """The interaction test.
+
+        A phone is *always* under the floor. If the pair search ran over a
+        size-filtered list the gate could never fire — and it fails closed, so
+        Stage 2 would go quiet while every counter looked like a calm scene.
+        """
+        watchdog = self._watchdog(pair_requirements=self.PAIR, min_subject_px=40)
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, _PHONE_HELD)],
+        )
+
+        published = self._published(watchdog)
+        assert len(published) == 1
+        assert published[0]["label"] == "person"
+        # The phone was too small to publish itself, yet still a valid partner.
+        assert watchdog.stats.detections_filtered_size == 1
+        assert watchdog.stats.detections_filtered_pair == 0
+
+    def test_other_labels_are_unaffected_by_the_pair_gate(self):
+        """"person + cell phone" says nothing about a car."""
+        watchdog = self._watchdog(
+            pair_requirements=self.PAIR, target_labels={"person", "car"}
+        )
+        self._run_frame(watchdog, [("person", 0.9, _PERSON), ("car", 0.8, _CAR)])
+
+        published = self._published(watchdog)
+        assert [p["label"] for p in published] == ["car"]
+        assert watchdog.stats.detections_filtered_pair == 1
+
+    def test_the_pair_gate_does_not_consume_the_cooldown(self):
+        """Picking a phone up must not be suppressed by an unspent cooldown."""
+        watchdog = self._watchdog(
+            pair_requirements=self.PAIR,
+            target_labels={"person"},
+            cooldown_seconds=999.0,
+        )
+        self._run_frame(watchdog, [("person", 0.9, _PERSON)])
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, _PHONE_HELD)],
+        )
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_cooldown == 0
+
+    def test_a_partial_overlap_below_the_threshold_does_not_pair(self):
+        """Default 0.5: at least half the smaller box must be inside."""
+        watchdog = self._watchdog(pair_requirements=self.PAIR, pair_overlap=0.5)
+        # Two thirds of the phone sits outside the person's right edge.
+        self._run_frame(
+            watchdog,
+            [("person", 0.9, _PERSON), ("cell phone", 0.6, [58.0, 45.0, 64.0, 58.0])],
+        )
+
+        assert watchdog.stats.detections_filtered_pair == 1
+
+    def test_no_pair_configured_changes_nothing(self):
+        """Regression guard for every appliance not using the gate."""
+        watchdog = self._watchdog(pair_requirements=None)
+        self._run_frame(watchdog, [("person", 0.9, _PERSON)])
+
+        assert watchdog.stats.detections_published == 1
+        assert watchdog.stats.detections_filtered_pair == 0
 
 
 class TestMultiInstanceTriggering:

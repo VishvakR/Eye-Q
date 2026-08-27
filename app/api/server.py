@@ -85,6 +85,14 @@ async def sync_rules(app_obj: FastAPI) -> None:
     confidence, minimum cooldown) so it never filters out something a rule
     still wants. Stage 2 then applies each rule's own prompt and ROI, since a
     single watchdog cannot carry N distinct polygons.
+
+    Co-occurrence requirements compose under that same rule, which has a
+    consequence worth knowing: a pair requirement is a *narrowing*, and there
+    is no coarsest narrowing. One plain "person" rule alongside one
+    "person + cell phone" rule means the only composition that keeps the plain
+    rule firing is no gate at all, so the pair requirement is dropped and every
+    person still wakes the VLM. That is correct but invisible, so the drop is
+    logged as a warning naming the rule responsible.
     """
     db: Database = app_obj.state.db
     rules = [r for r in await db.list_rules() if r["enabled"]]
@@ -140,6 +148,52 @@ async def sync_rules(app_obj: FastAPI) -> None:
         min((r["cooldown_s"] for r in rules), default=settings.detection_cooldown_s)
     )
 
+    # ── Co-occurrence requirements ───────────────────────────────
+    # Composed under the same "never filter out something a rule still wants"
+    # rule that governs labels above. A label carries a pair requirement only
+    # if *every* enabled rule targeting it asks for one; a single unpaired rule
+    # on that label drops the gate, because enforcing it would silently blind
+    # that rule. Paying in wasted inference is recoverable, missing the event
+    # the appliance exists to catch is not.
+    pair_req: dict[str, set[str]] = {}
+    unpaired: dict[str, str] = {}
+    paired_by: dict[str, str] = {}
+    wildcard_rule: str | None = None
+
+    for rule in rules:
+        labels = _parse_labels(rule)
+        pair = (rule.get("pair_label") or "").strip()
+        if not labels:
+            # A rule with no label filter must see everything, so it suppresses
+            # every gate for the same reason it forces the label scope open.
+            wildcard_rule = wildcard_rule or rule["name"]
+            continue
+        for label in labels:
+            if pair:
+                pair_req.setdefault(label, set()).add(pair)
+                paired_by.setdefault(label, rule["name"])
+            else:
+                unpaired.setdefault(label, rule["name"])
+
+    if wildcard_rule is not None and pair_req:
+        logger.warning(
+            f"Rule '{wildcard_rule}' has no label filter, so it must see every "
+            f"detection — the pair requirement(s) on {sorted(pair_req)} cannot "
+            f"be enforced at Stage 1 and every detection will still wake the VLM."
+        )
+        pair_req.clear()
+
+    for label in sorted(set(unpaired) & set(pair_req)):
+        partners = " or ".join(sorted(pair_req[label]))
+        logger.warning(
+            f"Rule '{unpaired[label]}' targets '{label}' with no pair_label, so "
+            f"the '{label} + {partners}' gate on rule '{paired_by[label]}' cannot "
+            f"be enforced at Stage 1 — every {label} will still wake the VLM."
+        )
+        pair_req.pop(label)
+
+    watchdog.update_pair_requirements(pair_req or None)
+
     if scope is None:
         scope_desc = "all"
     elif scope:
@@ -147,7 +201,15 @@ async def sync_rules(app_obj: FastAPI) -> None:
     else:
         scope_desc = "none — Stage 2 idle until a rule is enabled"
 
-    logger.info(f"Synced {len(rules)} enabled rule(s) to the pipeline (triggers on: {scope_desc}).")
+    pair_desc = (
+        "; pairs: " + ", ".join(f"{k}+{'/'.join(sorted(v))}" for k, v in sorted(pair_req.items()))
+        if pair_req
+        else ""
+    )
+    logger.info(
+        f"Synced {len(rules)} enabled rule(s) to the pipeline "
+        f"(triggers on: {scope_desc}{pair_desc})."
+    )
 
 
 # ── Lifespan ─────────────────────────────────────────────────────
@@ -267,6 +329,13 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
         track_enabled=settings.track_enabled,
         track_iou_threshold=settings.track_iou_threshold,
         track_max_age_frames=settings.track_max_age_frames,
+        # The same floor Stage 2 applies, moved to where it is cheapest. One
+        # setting for both stages on purpose: they call the same
+        # BoundingBox.pixel_size on the same fixed-shape ring buffer, so the
+        # predicate cannot drift. Expect vlm.instances_too_small to read zero
+        # from here on — that is Stage 1 shedding first, not a broken counter.
+        min_subject_px=settings.vlm_min_subject_px,
+        pair_overlap=settings.yolo_pair_overlap,
     )
     watchdog.start()
     app.state.watchdog = watchdog
@@ -593,6 +662,7 @@ def create_app() -> FastAPI:
             confidence=rule.confidence,
             cooldown_s=rule.cooldown_s,
             enabled=rule.enabled,
+            pair_label=rule.pair_label,
         )
         await sync_rules(request.app)
 
@@ -755,6 +825,23 @@ def create_app() -> FastAPI:
                 ),
                 "tracks_active": watchdog_stats.tracks_active if watchdog_stats else 0,
                 "cooldown_keys": watchdog_stats.cooldown_keys if watchdog_stats else 0,
+                # Detections dropped for carrying too few captured pixels to
+                # answer about. Rising means the camera is too far for the
+                # floor, not that the scene is quiet — lower vlm_min_subject_px
+                # rather than accept the blind spot, since a skipped subject is
+                # never judged at all. Its Stage 2 twin, vlm.instances_too_small,
+                # correctly reads zero while Stage 1 sheds first.
+                "detections_filtered_size": (
+                    watchdog_stats.detections_filtered_size if watchdog_stats else 0
+                ),
+                # Detections held back because a rule's pair_label was absent
+                # from the frame or not overlapping. This is the gate working.
+                # A value that tracks detections_total means the partner class
+                # is never detected at all — check yolo_confidence, which small
+                # classes like 'cell phone' rarely clear at the 0.25 default.
+                "detections_filtered_pair": (
+                    watchdog_stats.detections_filtered_pair if watchdog_stats else 0
+                ),
             },
             "vlm": {
                 "is_running": vlm_stats.is_running if vlm_stats else False,

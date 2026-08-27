@@ -219,17 +219,25 @@ Resilience: EOF triggers an in-session `_rewind()` for seamless looping
 
 ### Stage 1 — Detect, track, gate
 
-[`detector.py:535`](app/pipelines/detector.py#L535) `_process_frame` runs three passes:
+[`_process_frame`](app/pipelines/detector.py) runs four passes:
 
-1. **Decode** YOLO output, filter by confidence, normalize boxes to 0–1.
-2. **Track** — `tracker.update(...)` assigns ids for the whole frame at once
-   ([:625](app/pipelines/detector.py#L625)). Frames with no detections still call `update([])` so
-   tracks age correctly ([:620](app/pipelines/detector.py#L620)).
-3. **Gate** — each detection passes **label → ROI → cooldown**, in that order, each with its own
-   counter so `/api/status` can show *why* things were dropped
-   ([:654-662](app/pipelines/detector.py#L654-L662)).
+1. **Decode** YOLO output, filter by confidence, normalize boxes to 0–1. Deliberately *not* narrowed
+   with Ultralytics' `classes=` argument — both the live overlay and the co-occurrence gate below
+   need every class YOLO scored, and narrowing here would disable the gate with no counter moving.
+2. **Track** — `tracker.update(...)` assigns ids for the whole frame at once. Frames with no
+   detections still call `update([])` so tracks age correctly.
+3. **Resolve co-occurrence** — `_pair_blocked(candidates)`, whole-frame for the same reason tracking
+   is: whether a detection qualifies is a fact about the *other* boxes in its frame. Runs after
+   tracking, so the box that publishes already carries the id Stage 2 keys on.
+4. **Gate** — each detection passes **label → ROI → size → pair → cooldown**, in that order, each
+   with its own counter so `/api/status` can show *why* things were dropped.
 
-Three details are worth understanding before changing anything here:
+Stage 1 now sheds ahead of Stage 2's four layers rather than forwarding everything to them, so
+`triggers_coalesced` and `instances_shed` both read lower than they did before it existed. The
+rationale for the two newer gates — and for their exact position in that ladder — is in
+[docs/STAGE1-LOAD-SHEDDING.md](docs/STAGE1-LOAD-SHEDDING.md).
+
+Five details are worth understanding before changing anything here:
 
 **Cooldown is per instance, not per label.** The key is `f"{label}#{track_id}"`
 ([detector.py:652](app/pipelines/detector.py#L652)). Before tracking existed, the key was just
@@ -241,6 +249,18 @@ appended to a `deque(maxlen=256)` with a `fired` flag, *regardless* of whether i
 ([detector.py:666-667](app/pipelines/detector.py#L666-L667)). The live feed reads that deque
 ([`recent_detections`](app/pipelines/detector.py#L300)), so the operator sees the whole scene while
 only a fraction of it wakes the VLM.
+
+**The ladder order is load-bearing, and the cooldown must stay last.** `should_trigger` *mutates* —
+it records the trigger and returns `True` in the same breath. Any gate placed below it therefore
+spends a subject's cooldown on a detection it then discards, so a person rejected at 30 px would be
+suppressed by a cooldown they never spent when they walk close enough to answer. Stage 2 makes the
+same call one stage later by refusing to memoise a subject it skipped for being too small. Two tests
+in `TestStageOneSizeFloor` and `TestCoOccurrenceGating` exist solely to lock this in.
+
+**The size floor and pair gate live in Pass 4, never Pass 1.** Filtering candidates before
+`tracker.update()` would hand a subject a fresh `track_id` on crossing the floor, and Stage 2's memo
+is keyed `(track_id, rule_id)` — so every approach would become a cache miss and the filter would
+*increase* VLM load. It would also remove the box from the live overlay.
 
 **Repeated frames are skipped.** If the buffer returns a frame with the same timestamp as last time,
 it is dropped without inference and counted as `frames_repeated`
@@ -667,7 +687,10 @@ following `settings.snapshot_dir` rather than a hardcoded path).
 
 `/api/status` is the observability surface and exposes every counter that matters: buffer occupancy,
 watchdog FPS and per-reason filter counts, active tracks, and the worker's
-`triggers_stale` / `triggers_coalesced` / `instances_memoised` / `instances_shed`. `_stats_of`
+`triggers_stale` / `triggers_coalesced` / `instances_memoised` / `instances_shed`. Stage 1's
+per-reason counts include `detections_filtered_size` and `detections_filtered_pair`; note that
+`vlm.instances_too_small` now reads **zero** in normal operation, because Stage 1 applies the same
+floor first. `_stats_of`
 tolerates a dead component by returning `None` rather than throwing
 ([server.py:708](app/api/server.py#L708)) — a status endpoint that 500s when a thread dies is useless
 exactly when you need it.
@@ -893,6 +916,14 @@ names at 31 characters, so buffer ids in tests are short and time-derived.
 - **Timestamps are `time.monotonic()`**, not wall clock. They are frame identity, not a date.
 - **"Yes" means violation.** Inverting a prompt inverts the entire UI.
 - **A high `triggers_stale` is correct**, not a fault. It means load shedding is working.
+- **`vlm.instances_too_small` reading zero is correct**, not a broken counter. Stage 1 applies the
+  same size floor first, so Stage 2's is an unreachable backstop. Watch
+  `watchdog.detections_filtered_size` instead. A *non*-zero value means something other than the
+  watchdog is publishing on the detection endpoint.
+- **A rule's `pair_label` is not always enforceable.** A pair requirement is a narrowing, and
+  `sync_rules` composes the *coarsest* setting across rules — so one unpaired rule on the same label
+  drops the gate for every rule. That is deliberate (enforcing it would silently blind the unpaired
+  rule), and it logs a warning naming the rule responsible.
 - **ZMQ sockets are not thread-safe.** A socket belongs to the thread that created it. Don't share.
 
 **Gaps**

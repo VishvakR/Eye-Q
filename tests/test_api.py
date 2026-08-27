@@ -277,6 +277,136 @@ class TestRuleSync:
         await sync_rules(client.app)  # Must not raise
 
 
+class TestPairRequirementSync:
+    """Co-occurrence requirements compose under the same coarsest-wins rule.
+
+    A pair requirement is a *narrowing*, and there is no coarsest narrowing —
+    so a single unpaired rule on the same label drops the gate. That is the
+    correct outcome (enforcing it would silently blind the unpaired rule) but
+    it is invisible, so it must be logged.
+    """
+
+    PHONE_RULE = {
+        **SAMPLE_RULE,
+        "name": "Phone use",
+        "target_labels": ["person"],
+        "pair_label": "cell phone",
+    }
+
+    async def test_a_pair_label_reaches_the_watchdog(self, client):
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+
+        await client.post("/api/rules", json=self.PHONE_RULE)
+
+        watchdog.update_pair_requirements.assert_called_with(
+            {"person": {"cell phone"}}
+        )
+
+    async def test_a_pair_label_round_trips(self, client):
+        created = (await client.post("/api/rules", json=self.PHONE_RULE)).json()
+        assert created["pair_label"] == "cell phone"
+
+    async def test_a_rule_without_a_pair_label_requires_nothing(self, client):
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+
+        await client.post("/api/rules", json=SAMPLE_RULE)
+
+        watchdog.update_pair_requirements.assert_called_with(None)
+
+    async def test_an_unpaired_rule_on_the_same_label_drops_the_gate(
+        self, client, caplog
+    ):
+        """The load-bearing degradation, and the warning that makes it visible."""
+        await client.post("/api/rules", json=self.PHONE_RULE)
+
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+
+        with caplog.at_level("WARNING"):
+            await client.post(
+                "/api/rules",
+                json={
+                    **SAMPLE_RULE,
+                    "name": "Forklift watch",
+                    "target_labels": ["person"],
+                },
+            )
+
+        watchdog.update_pair_requirements.assert_called_with(None)
+        assert "Forklift watch" in caplog.text
+        assert "Phone use" in caplog.text
+        assert "cell phone" in caplog.text
+
+    async def test_an_unpaired_rule_on_a_different_label_keeps_the_gate(
+        self, client
+    ):
+        """"person + cell phone" says nothing about a forklift."""
+        await client.post("/api/rules", json=self.PHONE_RULE)
+
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+        await client.post(
+            "/api/rules",
+            json={
+                **SAMPLE_RULE,
+                "name": "Forklift watch",
+                "target_labels": ["forklift"],
+            },
+        )
+
+        watchdog.update_pair_requirements.assert_called_with(
+            {"person": {"cell phone"}}
+        )
+
+    async def test_a_wildcard_rule_suppresses_every_gate(self, client, caplog):
+        """A rule with no label filter must see everything, gates included."""
+        await client.post("/api/rules", json=self.PHONE_RULE)
+
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+
+        with caplog.at_level("WARNING"):
+            await client.post(
+                "/api/rules",
+                json={**SAMPLE_RULE, "name": "Scene check", "target_labels": []},
+            )
+
+        watchdog.update_pair_requirements.assert_called_with(None)
+        assert "Scene check" in caplog.text
+
+    async def test_two_paired_rules_on_one_label_accept_either_partner(
+        self, client
+    ):
+        await client.post("/api/rules", json=self.PHONE_RULE)
+
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+        await client.post(
+            "/api/rules",
+            json={
+                **SAMPLE_RULE,
+                "name": "Laptop use",
+                "target_labels": ["person"],
+                "pair_label": "laptop",
+            },
+        )
+
+        watchdog.update_pair_requirements.assert_called_with(
+            {"person": {"cell phone", "laptop"}}
+        )
+
+    async def test_a_disabled_paired_rule_stops_narrowing(self, client):
+        rule_id = (await client.post("/api/rules", json=self.PHONE_RULE)).json()["id"]
+
+        watchdog = MagicMock()
+        client.app.state.watchdog = watchdog
+        await client.put(f"/api/rules/{rule_id}", json={"enabled": False})
+
+        watchdog.update_pair_requirements.assert_called_with(None)
+
+
 class TestClearAllRules:
     """Bulk delete must remove rules without destroying the evidence log."""
 

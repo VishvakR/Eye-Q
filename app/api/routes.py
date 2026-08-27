@@ -33,6 +33,14 @@ class RuleCreate(BaseModel):
     confidence: float = 0.25
     cooldown_s: float = 5.0
     enabled: bool = True
+    pair_label: str = Field(
+        default="",
+        description=(
+            "Require this COCO class to have an overlapping box before "
+            "target_labels trigger — 'cell phone' to ask only about people "
+            "actually holding one. Empty disables the requirement."
+        ),
+    )
 
 
 class RuleUpdate(BaseModel):
@@ -45,6 +53,7 @@ class RuleUpdate(BaseModel):
     confidence: float | None = None
     cooldown_s: float | None = None
     enabled: bool | None = None
+    pair_label: str | None = None
 
 
 class CameraCreate(BaseModel):

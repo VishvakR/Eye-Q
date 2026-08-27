@@ -82,6 +82,54 @@ class BoundingBox(BaseModel):
         union = self.area + other.area - inter
         return inter / union if union > 0.0 else 0.0
 
+    def overlap_ratio(self, other: BoundingBox) -> float:
+        """Intersection over the *smaller* box's area — containment, not similarity.
+
+        :meth:`iou` answers "are these the same object", which is the right
+        question for tracking and the wrong one for co-occurrence. A cell phone
+        fully inside a person's box scores about 0.028 on IoU — not because the
+        phone is barely inside the person, but because the person is roughly
+        thirty-six times larger and IoU divides by the union. Any IoU threshold
+        loose enough to admit that pair is also loose enough to admit two boxes
+        that merely graze at a corner.
+
+        Dividing by the smaller area asks what the operator means — "is the
+        phone in the person?" — and returns ~1.0 for full containment at any
+        size ratio. Symmetric, because ``min`` is, so a rule never depends on
+        which box the caller named first.
+
+        Returns:
+            Ratio in [0, 1]. Zero when the boxes are disjoint, and zero when
+            either box is degenerate — matching :meth:`iou` so callers need no
+            division guard.
+        """
+        ix1 = max(self.x1, other.x1)
+        iy1 = max(self.y1, other.y1)
+        ix2 = min(self.x2, other.x2)
+        iy2 = min(self.y2, other.y2)
+
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter <= 0.0:
+            return 0.0
+
+        smaller = min(self.area, other.area)
+        return inter / smaller if smaller > 0.0 else 0.0
+
+    def pixel_size(self, frame_w: int, frame_h: int) -> tuple[int, int]:
+        """The box's own extent in captured pixels, before any crop padding.
+
+        Both stages need this and neither should own it. Stage 1 asks whether a
+        detection is worth publishing at all; Stage 2 asks whether a subject is
+        worth an inference. Computed separately the two could disagree about
+        the same box by a pixel, and Stage 2's floor would either fire on
+        something Stage 1 passed or go permanently dead — neither of which any
+        counter would reveal.
+
+        Truncating rather than rounding is deliberate: it is what
+        ``subject_pixel_size`` has always done, and a floor is a floor.
+        """
+        return int(self.width * frame_w), int(self.height * frame_h)
+
 
 class DetectionEvent(BaseModel):
     """Published by Stage 1 (YOLO Watchdog) when a relevant object is detected.

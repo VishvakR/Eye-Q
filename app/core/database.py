@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS rules (
     roi_json    TEXT    NOT NULL DEFAULT '[]',
     confidence  REAL    NOT NULL DEFAULT 0.25,
     cooldown_s  REAL    NOT NULL DEFAULT 5.0,
+    pair_label  TEXT    NOT NULL DEFAULT '',
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -99,6 +100,15 @@ _ALERT_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("confidence", "REAL"),
 )
 
+# Columns added to `rules` after the first release, same reasoning as above.
+_RULE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    # Stage 1 co-occurrence gating: the rule only fires when its target label
+    # has a box overlapping one of this label. Empty — the default — means no
+    # pair requirement, which is every rule written before this existed, so an
+    # upgraded appliance keeps behaving exactly as it did.
+    ("pair_label", "TEXT NOT NULL DEFAULT ''"),
+)
+
 
 class Database:
     """Async SQLite database manager for rules, alerts, and cameras.
@@ -142,27 +152,34 @@ class Database:
         """Create tables and indexes if they don't exist, then migrate."""
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
-        await self._migrate_alerts()
+        await self._migrate("alerts", _ALERT_MIGRATIONS)
+        await self._migrate("rules", _RULE_MIGRATIONS)
         logger.info("Database tables initialized.")
 
-    async def _migrate_alerts(self) -> None:
-        """Add any `alerts` columns missing from an older database.
+    async def _migrate(
+        self, table: str, migrations: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Add any columns missing from an older database.
 
         Idempotent: on a fresh database ``SCHEMA_SQL`` already created every
         column and this does nothing. On an appliance upgraded in place it adds
         only what is absent, leaving existing rows intact with their defaults.
+
+        The table name is interpolated rather than bound because SQLite cannot
+        parameterise identifiers; both call sites pass module constants, never
+        anything reaching the request path.
         """
-        cursor = await self._db.execute("PRAGMA table_info(alerts)")
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
         existing = {row["name"] for row in await cursor.fetchall()}
 
-        added = [name for name, _ddl in _ALERT_MIGRATIONS if name not in existing]
-        for name, ddl in _ALERT_MIGRATIONS:
+        added = [name for name, _ddl in migrations if name not in existing]
+        for name, ddl in migrations:
             if name not in existing:
-                await self._db.execute(f"ALTER TABLE alerts ADD COLUMN {name} {ddl}")
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
         if added:
             await self._db.commit()
-            logger.info(f"Migrated alerts table: added {', '.join(added)}.")
+            logger.info(f"Migrated {table} table: added {', '.join(added)}.")
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -235,16 +252,23 @@ class Database:
         confidence: float = 0.25,
         cooldown_s: float = 5.0,
         enabled: bool = True,
+        pair_label: str = "",
     ) -> int:
         """Create a new alert rule.
+
+        Args:
+            pair_label: Require this COCO class to have an overlapping box
+                before the rule's target labels trigger — "cell phone" to ask
+                only about people actually holding one. Empty disables the
+                requirement. See ``sync_rules`` for when it cannot be enforced.
 
         Returns:
             The auto-generated rule ID.
         """
         cursor = await self._db.execute(
             """INSERT INTO rules (camera_id, name, prompt, target_labels, roi_json,
-                                  confidence, cooldown_s, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  confidence, cooldown_s, enabled, pair_label)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 camera_id,
                 name,
@@ -254,6 +278,7 @@ class Database:
                 confidence,
                 cooldown_s,
                 1 if enabled else 0,
+                pair_label,
             ),
         )
         await self._db.commit()
