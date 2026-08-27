@@ -266,10 +266,10 @@
     "cctv_demo.mp4"
   ],
   "crop_settings": {
-    "crop_padding": 0.15,
+    "crop_padding": 0.2,
     "focus_dim": 1.0,
     "square_edge": 378,
-    "max_crop_edge": 511,
+    "max_crop_edge": 378,
     "min_subject_px": 96
   },
   "subjects": 15

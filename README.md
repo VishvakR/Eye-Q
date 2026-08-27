@@ -111,9 +111,10 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20` | Floor between re-judgements of one subject |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Subjects judged per drain cycle |
 | `EYEQ_VLM_FOCUS_DIM` | `1.0` | Dimming outside the subject's box. Off by default; `0.4` restores it |
-| `EYEQ_VLM_SQUARE_EDGE` | `378` | Letterbox crops into this square so a 1:3 person isn't stretched |
+| `EYEQ_VLM_CROP_PADDING` | `0.20` | Context kept around the subject's box, as a fraction of its size |
+| `EYEQ_VLM_SQUARE_EDGE` | `378` | Letterbox crops into this square so a 1:3 person isn't stretched. Also the exact single-tile limit — **379 costs 10 encoder passes** |
 | `EYEQ_VLM_PROBE` | `auto` | Read the verdict from token probabilities instead of parsing text |
-| `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Longest side of the crop shown to the VLM. Keeps Moondream on its single-pass encoder |
+| `EYEQ_VLM_MAX_CROP_EDGE` | `378` | Longest side of the crop, used only when `SQUARE_EDGE=0`. Keeps Moondream single-tile at any aspect ratio |
 | `EYEQ_VLM_MIN_SUBJECT_PX` | `96` | Skip a subject smaller than this on its longer side — too few pixels to answer about |
 | `EYEQ_VLM_BATCH_SIZE` | `1` | Crops answered per forward pass. Raising it is measured, not assumed — see below |
 
@@ -123,9 +124,13 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 `1` because on the hardware this appliance targets the measurement does not
 favour raising it.
 
-Stage 2's shape is unusual. A crop enters the model as **729 image tokens** and
-leaves as a **one-word answer** — so a query is roughly 99% prefill and 1%
-decode. That ratio is what decides whether batching helps:
+Stage 2's shape is unusual. A crop enters the model as **729 image tokens** —
+always 729, whatever the crop size — and leaves as a **one-word answer**. On the
+2024 model that made a query roughly 99% prefill and 1% decode. On the shipped
+4-bit 2025 model the split has moved: measured per stage, it is **88.8% vision
+encoder, 11.1% prefill, and under 1% decode** (see `EVALUATION-4bit.md`). The
+language half is what batching could help with, and it is now the small half.
+That ratio is what decides whether batching helps:
 
 - **Decode** is memory-bound. It reads the entire weight matrix to produce one
   token per sequence, so a batch of four reads those weights once instead of

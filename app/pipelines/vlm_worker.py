@@ -142,10 +142,10 @@ def prepare_vlm_crop(
     frame: np.ndarray,
     bbox: BoundingBox,
     *,
-    crop_padding: float = 0.15,
+    crop_padding: float = 0.20,
     focus_dim: float = 1.0,
     square_edge: int = 378,
-    max_crop_edge: int = 511,
+    max_crop_edge: int = 378,
 ) -> np.ndarray:
     """Turn a frame and a box into the exact array Stage 2 is shown.
 
@@ -173,7 +173,10 @@ def prepare_vlm_crop(
         focus_dim: Brightness multiplier outside the subject's own box. 1.0
             disables dimming.
         square_edge: Letterbox canvas edge. 0 falls back to ``max_crop_edge``.
-        max_crop_edge: Longest-side cap, used only when ``square_edge`` is 0.
+        max_crop_edge: Longest-side cap, used **only** when ``square_edge`` is
+            0. At the shipped default it is unreachable, so a deployment
+            tuning it must set ``EYEQ_VLM_SQUARE_EDGE=0`` as well or the
+            change will silently do nothing.
 
     Returns:
         The crop as it will be handed to the backend, in BGR.
@@ -209,7 +212,7 @@ def subject_pixel_size(
 def crop_bounds(
     frame_shape: tuple[int, ...],
     bbox: BoundingBox,
-    padding_ratio: float = 0.15,
+    padding_ratio: float = 0.20,
 ) -> tuple[int, int, int, int]:
     """Pixel bounds of the padded crop for a detection, as ``(x1, y1, x2, y2)``.
 
@@ -271,7 +274,7 @@ def crop_bounds(
 def crop_detection(
     frame: np.ndarray,
     bbox: BoundingBox,
-    padding_ratio: float = 0.15,
+    padding_ratio: float = 0.20,
 ) -> np.ndarray:
     """Crop the frame to the bounding box with percentage-based padding.
 
@@ -284,11 +287,10 @@ def crop_detection(
         frame: Full-resolution frame as numpy array (H, W, C).
         bbox: Normalized bounding box coordinates.
         padding_ratio: Extra padding as fraction of bbox dimensions.
-                       0.15 = 15% padding on each side.
+                       0.20 = 20% padding on each side.
 
     Returns:
-        Cropped region as a new numpy array. Returns the full frame
-        if the bbox covers most of the frame already.
+        Cropped region as a new numpy array.
     """
     x1, y1, x2, y2 = crop_bounds(frame.shape, bbox, padding_ratio)
     return frame[y1:y2, x1:x2].copy()
@@ -297,7 +299,7 @@ def crop_detection(
 def crop_detection_focused(
     frame: np.ndarray,
     bbox: BoundingBox,
-    padding_ratio: float = 0.15,
+    padding_ratio: float = 0.20,
     dim: float = 0.4,
 ) -> np.ndarray:
     """Crop to the detection, dimming everything outside the subject's own box.
@@ -349,13 +351,26 @@ def crop_detection_focused(
 def downscale_for_vlm(image: np.ndarray, max_edge: int) -> np.ndarray:
     """Shrink a crop so its longest side fits ``max_edge``, or pass it through.
 
-    This exists because of a cliff inside Moondream's preprocessor rather than
-    any generic "smaller is faster" intuition. Below 512 px it resizes the
-    whole image to 378x378 and runs the vision tower **once**. At 512 px or
-    above it switches to a hi-res path: resize to 756 px, split into 378 px
-    tiles, and push the full image *plus* every tile through the encoder — 3 to
-    5 forward passes instead of 1. Measured on an M2: 1.42 s at 360 px against
-    3.16 s at 792 px, for the same one-word answer.
+    This exists because of a tiling cliff inside Moondream's preprocessor
+    rather than any generic "smaller is faster" intuition. The cliff is real,
+    but *which* cliff depends on which model is loaded, and this docstring
+    used to describe the wrong one.
+
+    The **2024** model (``vikhyatk/moondream2``) branched on
+    ``if max_dim < 512``: below that it resized to 378x378 and ran the vision
+    tower once, at or above it resized to 756 px and pushed the image plus
+    every tile through — 3 to 5 passes. Measured on an M2 against *that*
+    model: 1.42 s at 360 px versus 3.16 s at 792 px for the same one-word
+    answer. That is where the old default of 511 (= 512 - 1) came from.
+
+    The **shipped 2025 4-bit** model tiles by ``select_tiling()`` in
+    ``image_crops.py``, which returns a single tile only when
+    ``min(height, width) <= 378`` — a test on the *short* side, not the long
+    one, derived from ``crop_window_size = (378//14 - 2*4) * 14 = 266`` plus
+    ``total_margin_pixels = 112``. Under that rule 511 is single-tile only for
+    very elongated crops: 511x383 tiles (2,4) into 9 encoder passes where 378
+    would take 2. Hence the default moved to 378, which is single-tile at
+    every aspect ratio.
 
     Crops normally land well under the threshold, so this usually does nothing.
     Superseded by :func:`letterbox_square` when ``square_edge`` is set, which
@@ -400,10 +415,19 @@ def letterbox_square(
     Scaling the long side to ``edge`` and padding the short one leaves the
     person the shape they actually are.
 
-    The second effect is the one that shows up in the latency numbers: every
-    crop now arrives at exactly the same dimensions, so the image-token count
-    is **constant**. Prefill is ~99% of a Stage 2 query, and it stops varying
-    with how tall the subject happened to be.
+    The stretch is not hypothetical. ``overlap_crop_image`` resizes the global
+    view with an unconditional ``pil_img.resize((378, 378), LANCZOS)`` that
+    does not preserve aspect ratio, so without this a 1:3 person really does
+    reach the encoder three times too wide.
+
+    That is the whole justification, and it is worth being precise about what
+    is *not*. An earlier version of this note claimed the fixed size also held
+    the image-token count constant and so stabilised prefill. It does not: the
+    count is always 729 whatever the input, because ``vision_projection``
+    adaptive-pools to 27x27 and hard-codes ``.view(729, ...)``. Tiling scales
+    the vision encoder's batch dimension, never the token count — and per
+    EVALUATION-4bit.md the encoder is 88.8% of a query against prefill's
+    11.1%, so the batch is what matters anyway.
 
     Padding with mid-grey rather than black is deliberate — black bars read as
     part of the scene, as unlit floor or a dark doorway, and invite the model
@@ -590,7 +614,7 @@ class VLMWorker:
         model_id: str = "moondream/moondream-2b-2025-04-14-4bit",
         model_revision: str = "a89c59223ef8b5bb7826780728eeec172727ca84",
         staleness_threshold_s: float = 5.0,
-        crop_padding: float = 0.15,
+        crop_padding: float = 0.20,
         inference_timeout_s: float = 30.0,
         snapshot_dir: str | None = "data/snapshots",
         default_prompt: str | None = None,
@@ -599,7 +623,7 @@ class VLMWorker:
         rejudge_iou: float = 0.5,
         min_rejudge_s: float = 20.0,
         max_instances_per_batch: int = 8,
-        max_crop_edge: int = 511,
+        max_crop_edge: int = 378,
         min_subject_px: int = 96,
         batch_size: int = 1,
         square_edge: int = 378,

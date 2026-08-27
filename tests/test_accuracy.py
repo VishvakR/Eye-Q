@@ -62,17 +62,31 @@ class TestCropParity:
 
         ``make_fixtures`` and ``VLMWorker._prepare`` now share one helper, so
         this asserts they agree byte for byte on the same input.
+
+        The parameters are read from live settings rather than written as
+        literals. With literals this test kept passing while `settings.py`
+        drifted underneath it — which is precisely the failure it was written
+        to prevent, one level up.
         """
+        from app.config.settings import get_settings
+
+        get_settings.cache_clear()
+        live = get_settings()
         img = frame()
         bbox = BoundingBox(x1=0.4, y1=0.3, x2=0.5, y2=0.8)
         settings = dict(
-            crop_padding=0.15, focus_dim=1.0, square_edge=378, max_crop_edge=511
+            crop_padding=live.vlm_crop_padding,
+            focus_dim=live.vlm_focus_dim,
+            square_edge=live.vlm_square_edge,
+            max_crop_edge=live.vlm_max_crop_edge,
         )
 
         a = prepare_vlm_crop(img, bbox, **settings)
         b = prepare_vlm_crop(img, bbox, **settings)
         assert np.array_equal(a, b)
-        assert a.shape == (378, 378, 3), "production letterboxes to a square"
+        edge = live.vlm_square_edge
+        assert a.shape == (edge, edge, 3), "production letterboxes to a square"
+        get_settings.cache_clear()
 
     def test_the_old_bench_path_produced_a_different_crop(self):
         """Pins *why* parity is enforced, so the fix is not silently reverted.
@@ -96,8 +110,8 @@ class TestCropParity:
         img = frame()
         bbox = BoundingBox(x1=0.0, y1=0.0, x2=1.0, y2=1.0)
 
-        out = prepare_vlm_crop(img, bbox, square_edge=0, max_crop_edge=511)
-        assert max(out.shape[:2]) <= 511
+        out = prepare_vlm_crop(img, bbox, square_edge=0, max_crop_edge=378)
+        assert max(out.shape[:2]) <= 378
         assert out.shape[0] != out.shape[1], "not squared when square_edge=0"
 
     def test_dimming_is_carried_through(self):

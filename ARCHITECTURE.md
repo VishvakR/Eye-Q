@@ -312,11 +312,11 @@ point: a person who just walked into frame is more informative than a re-check o
 cleared.
 
 **Then the ordering guarantee.** The frame is read **once per group**, and **every crop is taken
-before any inference runs** ([:1124-1146](app/pipelines/vlm_worker.py#L1124-L1146)):
+before any inference runs** (`_prepare`):
 
 ```python
-frame = self._read_frame(first_event)          # once
-crops = [crop_detection_focused(frame, e.bbox) for e in group]   # all of them
+frame = self._read_frame(group[0])             # once
+crops = [prepare_vlm_crop(frame, e.bbox, ...) for e in group]   # all of them
 for crop in crops:                             # only now do we infer
     ...
 ```
@@ -324,6 +324,62 @@ for crop in crops:                             # only now do we infer
 This is a correctness requirement, not an optimisation. Inference takes seconds; the ring buffer
 recycles slots in well under a second. Cropping up front makes the buffer irrelevant by the time the
 slow work starts.
+
+### Crop preparation and the tiling threshold
+
+[`prepare_vlm_crop`](app/pipelines/vlm_worker.py#L141) is the single path from a frame plus a box to
+the array the backend sees: pad the box by `vlm_crop_padding` (0.20) per axis and clamp to the frame,
+optionally dim outside the subject (`vlm_focus_dim`, off), then letterbox to a `vlm_square_edge`
+(378) square padded with mid-grey `114`. There is exactly one implementation because there used to be
+two — `bench/make_fixtures.py` called a helper bare and took its *signature* default — and every
+accuracy number measured before that was fixed described a crop the appliance does not generate.
+
+**Why letterbox at all.** Not for token count. The image-token count is **always 729** regardless of
+input size, because `vision_projection` adaptive-pools to 27×27 and hard-codes `.view(729, …)`.
+The real reason is in `overlap_crop_image`, which resizes the global view with an unconditional
+`pil_img.resize((378, 378), LANCZOS)` that does *not* preserve aspect ratio. Subjects here run about
+1:3, so without letterboxing a standing person reaches the encoder three times too wide.
+
+**Why 378 exactly.** The shipped 2025 model tiles by `select_tiling()` in `image_crops.py`, which
+returns a single tile only when **`min(height, width) ≤ 378`** — a test on the *short* side. The
+number falls out of `crop_window_size = (378//14 − 2×4) × 14 = 266` plus
+`total_margin_pixels = 14×4×2 = 112`. The threshold has **no margin**:
+
+| Crop reaching the model | tiling | encoder passes |
+|---|---|---|
+| 378×378 | (1,1) | **2** |
+| 379×379 | (3,3) | 10 |
+| 392×392 | (3,3) | 10 |
+| 511×511 | (3,3) | 10 |
+| 511×383 | (2,4) | 9 |
+| 378×283 | (1,1) | **2** |
+
+Since the vision encoder is 88.8% of a query, tiling multiplies the expensive half. Two consequences
+worth carrying:
+
+- **Do not raise `vlm_square_edge`.** 379 is a 5× encoder cost. In particular 392 — which this
+  document and the settings once suggested as a Qwen2-VL-friendly alternative — costs 10 passes here.
+  It is correct only if you also change backends.
+- **`vlm_max_crop_edge` was 511 and is now 378.** 511 was `512 − 1`, tracking the *2024* model's
+  `if max_dim < 512` branch; that model is no longer the default. Under the 2025 rule 511 is
+  single-tile only for very elongated crops — a 511×383 crop, a person barely off square, cost 9
+  passes. This path is reached only when `vlm_square_edge=0`, so the bug was latent, but it was a
+  4.5× cost sitting in the documented opt-out. Pinned by `TestTilingInvariant`.
+
+**The redundant encode — the largest remaining lever, not yet taken.** `overlap_crop_image` returns
+`tiling[0] × tiling[1] + 1` crops, so `n_crops` is **never 1**. Even at tiling `(1,1)` the global
+view and its single tile are the *same* 378×378 image, encoded twice. At 1,664 ms of vision encoder
+per verdict that is roughly 800 ms of pure duplication. Collapsing it means patching around vendored
+model code and would need its own accuracy validation, so it is recorded here rather than done.
+`EVALUATION-4bit.md` reaches the same conclusion independently.
+
+**Why cropping stays in Stage 2.** Moving it to Stage 1 was considered and declined. It would kill
+one real failure mode — a trigger whose frame has already been overwritten is currently lost, and a
+Stage 1 crop would make the ring buffer irrelevant end to end. But it delivers **no accuracy or
+latency change**, because the model sees identical pixels either way, and it would put image bytes on
+a wire that today carries ~200 bytes of JSON: ~428 KB raw or ~25 KB as JPEG, against a 1000-deep
+high-water mark, on top of the 415 MB ring buffer. The invariant that a slow VLM must never drop a
+frame is protected by keeping that hop small.
 
 **Judging** ([`_judge_instance`](app/pipelines/vlm_worker.py#L1236)): convert the crop once
 (BGR → RGB → PIL), append `" Answer with only Yes or No."` to the prompt, infer under the deadline,
@@ -459,9 +515,9 @@ off, a helmeted neighbour standing inside the padding routinely flipped a bare-h
 verdict. Set `EYEQ_VLM_FOCUS_DIM=0.4` to restore it if crowded scenes start answering about the
 wrong person.
 
-**Frame recovery** ([`_read_frame`](app/pipelines/vlm_worker.py#L1011)). Primary lookup is by
+**Frame recovery** ([`_read_frame`](app/pipelines/vlm_worker.py#L1344)). Primary lookup is by
 timestamp with a 500 ms tolerance. The fallback by `frame_index` **re-validates the timestamp** and
-returns `None` on mismatch ([:1017-1028](app/pipelines/vlm_worker.py#L1017-L1028)) — see §12, because
+returns `None` on mismatch ([:1017-1028](app/pipelines/vlm_worker.py#L1352-L1362)) — see §12, because
 `frame_index` is a ring slot, not a frame number.
 
 ### `app/pipelines/vlm_backends.py` — Three swappable backends
@@ -833,7 +889,7 @@ authoritative configuration documentation.
 | `EYEQ_VLM_REJUDGE_IOU` | `0.5` | Below this counts as "moved" |
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20.0` | Floor on movement-triggered re-judging |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Hard cap on inferences per batch |
-| `EYEQ_VLM_MAX_CROP_EDGE` | `511` | Below Moondream's 512 px hi-res cliff; `0` disables. Tuned for the 2024 encoder — the 2025 one always emits a global view plus a tile |
+| `EYEQ_VLM_MAX_CROP_EDGE` | `378` | Single-tile at any aspect ratio on the 2025 encoder; `0` disables. Reached only when `SQUARE_EDGE=0`. Was 511, which tracked the *2024* model's threshold — see “Crop preparation and the tiling threshold” |
 | `EYEQ_VLM_MIN_SUBJECT_PX` | `96` | Skip subjects with too little pixel evidence, measured on the longer side; `0` disables |
 | `EYEQ_VLM_BATCH_SIZE` | `1` | Crops per forward pass. `1` dispatches singly |
 | `EYEQ_VLM_SQUARE_EDGE` | `378` | Letterbox canvas edge. `0` falls back to max-edge downscaling |
@@ -910,7 +966,7 @@ names at 31 characters, so buffer ids in tests are short and time-derived.
 
 - **`frame_index` is a ring slot, not a frame number.** Slots are reused every `capacity` frames.
   Always look frames up by timestamp; the index fallback in `_read_frame` re-validates the timestamp
-  precisely because of this ([vlm_worker.py:1017-1028](app/pipelines/vlm_worker.py#L1017-L1028)).
+  precisely because of this ([vlm_worker.py:1017-1028](app/pipelines/vlm_worker.py#L1352-L1362)).
 - **`get_settings()` is cached.** The first call freezes configuration. Overrides go into the
   environment before anything reads settings; tests must call `get_settings.cache_clear()`.
 - **Timestamps are `time.monotonic()`**, not wall clock. They are frame identity, not a date.

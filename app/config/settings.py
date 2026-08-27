@@ -314,10 +314,26 @@ class Settings(BaseSettings):
         ),
     )
     vlm_crop_padding: float = Field(
-        default=0.15,
+        default=0.20,
         ge=0.0,
         le=1.0,
-        description="Extra padding around bounding box as fraction of bbox size.",
+        description=(
+            "Context kept around the subject's box, as a fraction of that "
+            "box's own size. Applied per axis — the width fraction to left "
+            "and right, the height fraction to top and bottom — and clamped "
+            "to the frame, so a subject at the edge simply gets less on that "
+            "side rather than an out-of-bounds slice. A box too small after "
+            "padding is widened to a 64 px floor around its own centre.\n\n"
+            "Costs no latency. The crop is letterboxed to a fixed "
+            "vlm_square_edge canvas afterwards, so more padding buys context "
+            "at the price of resolution on the subject, not of time.\n\n"
+            "That price is real in a crowd. Padding drags in whoever is "
+            "standing nearby, and a helmeted neighbour inside the crop can "
+            "flip the verdict on a bare-headed subject — the failure "
+            "vlm_focus_dim exists to fix. If accuracy drops in crowded "
+            "scenes after raising this, set vlm_focus_dim to 0.4 rather than "
+            "surrendering the context."
+        ),
     )
     vlm_focus_dim: float = Field(
         default=1.0,
@@ -381,17 +397,28 @@ class Settings(BaseSettings):
     )
 
     vlm_max_crop_edge: int = Field(
-        default=511,
+        default=378,
         ge=0,
         description=(
-            "Longest side, in pixels, of the crop handed to the VLM. This "
-            "tracks a cliff in Moondream's preprocessor, not a quality dial: "
-            "at 512 px and above it stops encoding one 378 px image and starts "
-            "encoding the image plus 2-4 tiles, which measured 3.16 s against "
-            "1.42 s for the same one-word answer. Most crops are already well "
-            "under it; the case it catches is vlm_crop_padding falling back to "
-            "the whole frame for a subject filling most of it. Raise it only if "
-            "you switch to a backend with no such threshold, and 0 disables."
+            "Longest side, in pixels, of the crop handed to the VLM. Tracks a "
+            "tiling cliff in Moondream's preprocessor, not a quality dial.\n\n"
+            "Was 511 — i.e. 512-1, the largest value satisfying the 2024 "
+            "encoder's `if max_dim < 512` branch in vision_encoder.py. That "
+            "model is no longer the default backend and that threshold no "
+            "longer applies. The shipped 2025 model tiles by select_tiling() "
+            "in image_crops.py, which returns a single tile only when "
+            "min(height, width) <= 378. The number falls out of "
+            "crop_window_size = (378//14 - 2*4) * 14 = 266 plus "
+            "total_margin_pixels = 112.\n\n"
+            "The difference is not academic. 511 is single-tile only for very "
+            "tall or very wide crops; a 511x383 crop — a person barely off "
+            "square — tiles (2,4) into 9 encoder passes against 2 at 378. "
+            "Since the vision encoder is 88.8% of a query "
+            "(see EVALUATION-4bit.md), that is roughly 4.5x the cost of the "
+            "expensive half. 378 is single-tile at every aspect ratio.\n\n"
+            "Note this path is only reached when vlm_square_edge is 0; "
+            "otherwise letterboxing already fixes the long side and "
+            "short-circuits it. 0 disables."
         ),
     )
 
@@ -459,13 +486,26 @@ class Settings(BaseSettings):
             "square input stretches them, so a person arrives roughly three "
             "times too wide. Letterboxing scales the long side to fit and pads "
             "the short one, preserving the shape the model was trained on. "
-            "Because every crop then lands at the same size, the image-token "
-            "count is constant and prefill cost stops varying with subject "
-            "geometry. 378 is Moondream's native SigLIP edge and stays under "
-            "the 512 px tiling cliff described on vlm_max_crop_edge; 392 "
-            "(14x28) lands exactly on Qwen2-VL's 28 px grid and avoids its "
-            "smart_resize rounding. 0 disables letterboxing and falls back to "
-            "vlm_max_crop_edge downscaling."
+            "The stretch is real and confirmed in the model code: "
+            "overlap_crop_image resizes the global view with an unconditional "
+            "pil_img.resize((378, 378), LANCZOS) that does not preserve "
+            "aspect ratio, so a 1:3 person really does arrive three times too "
+            "wide without this.\n\n"
+            "That is now the whole justification. An earlier version of this "
+            "note also claimed letterboxing holds the image-token count "
+            "constant; it does not, because the count is *always* 729 "
+            "regardless of input size — vision_projection adaptive-pools to "
+            "27x27 and hard-codes .view(729, ...). Tiling scales the vision "
+            "encoder's batch dimension, never the token count.\n\n"
+            "378 is Moondream's native SigLIP edge and the exact value at "
+            "which select_tiling still returns a single tile. It has no "
+            "margin: 379 tiles (3,3) into 10 encoder passes. Do not raise it "
+            "on this backend. In particular 392 — suggested here previously "
+            "because 14x28 lands on Qwen2-VL's grid and avoids its "
+            "smart_resize rounding — costs 10 passes on Moondream. It is the "
+            "right value only if you also switch backends. "
+            "0 disables letterboxing and falls back to vlm_max_crop_edge "
+            "downscaling."
         ),
     )
 

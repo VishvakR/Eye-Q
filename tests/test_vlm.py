@@ -42,6 +42,7 @@ from app.pipelines.vlm_worker import (
     crop_detection_focused,
     downscale_for_vlm,
     letterbox_square,
+    prepare_vlm_crop,
     subject_pixel_size,
 )
 from app.schemas.events import BoundingBox, DetectionEvent
@@ -2039,19 +2040,137 @@ class TestEncodeHoisting:
         backend.request_stop.assert_called()
 
 
+def _moondream_crop_count(width: int, height: int) -> int:
+    """How many vision-encoder passes Moondream would spend on this crop.
+
+    Reimplements `select_tiling` from the shipped model's `image_crops.py`
+    rather than importing it: the model directory is a large optional download
+    and the fast suite must not depend on it. The constants come from
+    `VisionConfig` — crop_size 378, patch 14, max_crops 12, overlap_margin 4 —
+    which give crop_window_size = (378//14 - 2*4) * 14 = 266 and
+    total_margin_pixels = 14 * 4 * 2 = 112.
+
+    Verified against the real function for every case asserted below.
+    """
+    import math
+
+    crop_window, total_margin, max_crops = 266, 112, 12
+    h, w = height - total_margin, width - total_margin
+
+    if h <= crop_window or w <= crop_window:
+        tiling = (1, 1)
+    else:
+        min_h, min_w = math.ceil(h / crop_window), math.ceil(w / crop_window)
+        if min_h * min_w > max_crops:
+            ratio = math.sqrt(max_crops / (min_h * min_w))
+            tiling = (max(1, math.floor(min_h * ratio)), max(1, math.floor(min_w * ratio)))
+        else:
+            h_tiles = max(math.floor(math.sqrt(max_crops * h / w)), min_h)
+            w_tiles = max(math.floor(math.sqrt(max_crops * w / h)), min_w)
+            if h_tiles * w_tiles > max_crops:
+                if w_tiles > h_tiles:
+                    w_tiles = math.floor(max_crops / h_tiles)
+                else:
+                    h_tiles = math.floor(max_crops / w_tiles)
+            tiling = (max(1, h_tiles), max(1, w_tiles))
+
+    # The global view is always encoded alongside the tiles, so this is never 1.
+    return tiling[0] * tiling[1] + 1
+
+
+class TestTilingInvariant:
+    """Every crop this pipeline emits must stay on Moondream's single-tile path.
+
+    The vision encoder is 88.8% of a Stage 2 query, and tiling multiplies its
+    batch. The threshold is a test on the crop's *short* side — single-tile
+    only when min(h, w) <= 378 — and it has no margin whatsoever: 379 jumps
+    straight to ten passes. That makes it exactly the kind of constant someone
+    rounds up to 400 without noticing, so it is pinned here.
+    """
+
+    # The near-square LARGE shapes are the ones that matter. Everything
+    # elongated stays single-tile even at the old 511 cap, because the test is
+    # on the short side — so a suite without these passed happily while the
+    # 4.5x cost sat there unexercised.
+    SHAPES = [
+        (100, 300),   # 1:3, a standing person — the common case
+        (300, 100),   # 3:1
+        (400, 300),   # 4:3, small enough to pass through any cap
+        (200, 200),   # 1:1
+        (1280, 720),  # 16:9, the whole-frame fallback
+        (720, 1280),
+        (800, 600),   # 4:3 at size — 511x383 under the old cap, which tiles
+        (900, 800),   # 9:8, the worst case: barely off square and large
+    ]
+
+    def test_the_helper_agrees_with_the_documented_cliff(self):
+        """Guards the reimplementation itself, so the rest of the class means something."""
+        assert _moondream_crop_count(378, 378) == 2
+        assert _moondream_crop_count(379, 379) == 10
+        assert _moondream_crop_count(511, 511) == 10
+
+    @pytest.mark.parametrize("w,h", SHAPES)
+    def test_a_letterboxed_crop_is_always_single_tile(self, w, h):
+        out = letterbox_square(np.zeros((h, w, 3), dtype=np.uint8), 378)
+        assert _moondream_crop_count(out.shape[1], out.shape[0]) == 2
+
+    @pytest.mark.parametrize("w,h", SHAPES)
+    def test_the_square_edge_zero_path_is_also_single_tile(self, w, h):
+        """The opt-out must not be a trap. At the old 511 default it was."""
+        out = downscale_for_vlm(np.zeros((h, w, 3), dtype=np.uint8), 378)
+        assert _moondream_crop_count(out.shape[1], out.shape[0]) == 2
+
+    def test_the_old_default_of_511_would_have_tiled(self):
+        """Why the default moved. A person barely off square cost 9 passes.
+
+        The source must be big enough to actually reach the cap: a crop that
+        already fits passes through untouched and proves nothing either way.
+        """
+        source = np.zeros((600, 800, 3), dtype=np.uint8)
+        old = downscale_for_vlm(source, 511)
+        assert max(old.shape[:2]) == 511, "precondition: the cap was applied"
+        assert _moondream_crop_count(old.shape[1], old.shape[0]) == 9
+
+        new = downscale_for_vlm(source, 378)
+        assert _moondream_crop_count(new.shape[1], new.shape[0]) == 2
+
+    def test_392_would_tile_on_this_backend(self):
+        """The settings docs used to suggest 392 as a Qwen-friendly alternative."""
+        assert _moondream_crop_count(392, 392) == 10
+
+    def test_the_shipped_settings_stay_single_tile(self):
+        """The end-to-end assertion, read from live settings rather than literals."""
+        from app.config.settings import get_settings
+
+        get_settings.cache_clear()
+        live = get_settings()
+        for w, h in self.SHAPES:
+            crop = prepare_vlm_crop(
+                np.full((h, w, 3), 200, dtype=np.uint8),
+                BoundingBox(x1=0.0, y1=0.0, x2=1.0, y2=1.0),
+                crop_padding=live.vlm_crop_padding,
+                focus_dim=live.vlm_focus_dim,
+                square_edge=live.vlm_square_edge,
+                max_crop_edge=live.vlm_max_crop_edge,
+            )
+            passes = _moondream_crop_count(crop.shape[1], crop.shape[0])
+            assert passes == 2, f"{w}x{h} -> {crop.shape[:2]} costs {passes} passes"
+        get_settings.cache_clear()
+
+
 class TestCropDownscaling:
-    """Moondream switches to a 3-5x costlier path at 512 px. Stay under it."""
+    """Moondream tiles once the crop's *short* side passes 378. Stay under it."""
 
     def test_a_crop_that_already_fits_is_not_copied(self):
         crop = np.zeros((360, 118, 3), dtype=np.uint8)
-        assert downscale_for_vlm(crop, 511) is crop
+        assert downscale_for_vlm(crop, 378) is crop
 
     def test_an_oversized_crop_is_capped(self):
-        out = downscale_for_vlm(np.zeros((720, 1280, 3), dtype=np.uint8), 511)
-        assert max(out.shape[:2]) == 511
+        out = downscale_for_vlm(np.zeros((720, 1280, 3), dtype=np.uint8), 378)
+        assert max(out.shape[:2]) == 378
 
     def test_aspect_ratio_survives(self):
-        out = downscale_for_vlm(np.zeros((720, 1280, 3), dtype=np.uint8), 511)
+        out = downscale_for_vlm(np.zeros((720, 1280, 3), dtype=np.uint8), 378)
         assert abs(out.shape[1] / out.shape[0] - 1280 / 720) < 0.01
 
     def test_zero_disables_the_cap(self):
@@ -2065,8 +2184,8 @@ class TestCropDownscaling:
         assert huge.area > 0.8
 
         cropped = crop_detection(frame, huge)
-        assert max(cropped.shape[:2]) >= 512, "the un-capped crop takes the slow path"
-        assert max(downscale_for_vlm(cropped, 511).shape[:2]) < 512
+        assert min(cropped.shape[:2]) > 378, "the un-capped crop takes the slow path"
+        assert max(downscale_for_vlm(cropped, 378).shape[:2]) <= 378
 
 
 class TestLatencyAccounting:
@@ -3026,7 +3145,7 @@ class TestCropPipelineWiring:
         """The opt-out keeps the previous geometry exactly."""
         crop = self._crops(square_edge=0)
         assert crop.shape[0] != crop.shape[1]
-        assert max(crop.shape[:2]) <= 511
+        assert max(crop.shape[:2]) <= 378
 
     def test_dimming_is_off_by_default(self):
         """A uniform frame stays uniform apart from the letterbox bars."""
