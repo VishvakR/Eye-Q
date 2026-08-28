@@ -109,6 +109,8 @@ All settings can be overridden via environment variables (prefix: `EYEQ_`) or a 
 | `EYEQ_TRACK_IOU_THRESHOLD` | `0.2` | Minimum overlap to treat two boxes as the same subject |
 | `EYEQ_VLM_VERDICT_TTL_S` | `300` | Seconds a subject's verdict is reused before re-judging |
 | `EYEQ_VLM_MIN_REJUDGE_S` | `20` | Floor between re-judgements of one subject |
+| `EYEQ_VLM_CROSSID_REUSE_S` | `45` | Reuse a verdict across a **different** track id, matched by position. `0` disables. The fix for identity churn — see below |
+| `EYEQ_VLM_CROSSID_IOU` | `0.7` | Overlap required for that reuse. Deliberately far above `TRACK_IOU_THRESHOLD` (`0.2`) |
 | `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Subjects judged per drain cycle |
 | `EYEQ_VLM_FOCUS_DIM` | `1.0` | Dimming outside the subject's box. Off by default; `0.4` restores it |
 | `EYEQ_VLM_CROP_PADDING` | `0.20` | Context kept around the subject's box, as a fraction of its size |

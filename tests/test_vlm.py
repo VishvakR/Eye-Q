@@ -1399,6 +1399,184 @@ class TestMultiInstanceJudging:
         assert worker.stats.triggers_stale == 3
 
 
+class TestSpatialVerdictMemo:
+    """Verdict reuse must survive an id change, or load control does nothing.
+
+    Measured on the bundled clip: the tracker minted 80 ids for ~6 real people
+    over one 300s TTL window, and 122 of 124 memo misses were a new id rather
+    than an expired verdict. Every gate is keyed on track_id, so an id change
+    reset the Stage 1 cooldown and the memo at once.
+    """
+
+    def _worker(self, **kwargs):
+        kwargs.setdefault("verdict_ttl_s", 300.0)
+        worker = VLMWorker(buffer=MagicMock(), backend=mock_backend(), **kwargs)
+        worker.add_rule("person", "Is this person missing a hard hat?", rule_id=1)
+        return worker
+
+    def _event(self, track_id=1, x=0.1, width=0.1, label="person"):
+        return DetectionEvent(
+            timestamp=time.monotonic(),
+            camera_id="test",
+            label=label,
+            confidence=0.9,
+            bbox=BoundingBox(x1=x, y1=0.1, x2=x + width, y2=0.5),
+            frame_index=0,
+            track_id=track_id,
+        )
+
+    def test_a_new_id_at_the_same_place_reuses_the_verdict(self):
+        """The whole point: 98.4% of misses were exactly this case."""
+        worker = self._worker()
+        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=True)
+
+        assert worker._rules_to_judge(self._event(track_id=2)) == []
+        assert worker.stats.instances_memoised_spatial == 1
+        assert worker.stats.memo_miss_new_track == 0
+
+    def test_a_new_id_far_away_is_still_judged(self):
+        worker = self._worker()
+        worker._remember_verdict(self._event(track_id=1, x=0.1), rule_id=1, verdict=True)
+
+        assert len(worker._rules_to_judge(self._event(track_id=2, x=0.7))) == 1
+        assert worker.stats.instances_memoised_spatial == 0
+        assert worker.stats.memo_miss_new_track == 1
+
+    def test_just_below_the_iou_floor_is_judged(self):
+        """The safety boundary. Everything above rests on this being tight."""
+        worker = self._worker(crossid_iou=0.7)
+        worker._remember_verdict(self._event(track_id=1, x=0.10), rule_id=1, verdict=False)
+
+        # Shifted far enough that IoU lands under 0.7 but well over the
+        # tracker's own 0.2 — i.e. the tracker would have called this the same
+        # object and this gate deliberately does not.
+        candidate = self._event(track_id=2, x=0.12)
+        iou = candidate.bbox.iou(self._event(x=0.10).bbox)
+        assert 0.2 < iou < 0.7, f"fixture must sit between the thresholds, got {iou}"
+
+        assert len(worker._rules_to_judge(candidate)) == 1
+        assert worker.stats.instances_memoised_spatial == 0
+
+    def test_a_different_label_never_inherits(self):
+        """Position alone would hand a forklift's verdict to its driver."""
+        worker = self._worker()
+        worker.add_rule("forklift", "Is this forklift unattended?", rule_id=1)
+        worker._remember_verdict(
+            self._event(track_id=1, label="forklift"), rule_id=1, verdict=False
+        )
+
+        assert len(worker._rules_to_judge(self._event(track_id=2, label="person"))) == 1
+        assert worker.stats.instances_memoised_spatial == 0
+
+    def test_past_the_window_it_is_judged_again(self):
+        worker = self._worker(crossid_reuse_s=0.05)
+        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=False)
+        time.sleep(0.1)
+
+        assert len(worker._rules_to_judge(self._event(track_id=2))) == 1
+
+    def test_the_two_windows_are_independent(self):
+        """Cross-id reuse expiring must not expire same-subject reuse.
+
+        This is what makes the shorter cross-id window a safety bound rather
+        than a blanket reduction of the TTL.
+        """
+        worker = self._worker(verdict_ttl_s=300.0, crossid_reuse_s=0.05)
+        event = self._event(track_id=1)
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+        time.sleep(0.1)
+
+        assert worker._rules_to_judge(event) == []           # same id: still held
+        assert len(worker._rules_to_judge(self._event(track_id=2))) == 1  # new id: not
+
+    def test_zero_disables_the_fallback(self):
+        """The kill switch must restore the previous behaviour exactly."""
+        worker = self._worker(crossid_reuse_s=0.0)
+        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=True)
+
+        assert len(worker._rules_to_judge(self._event(track_id=2))) == 1
+        assert worker.stats.instances_memoised_spatial == 0
+        assert worker.stats.memo_miss_new_track == 1
+
+    def test_a_spatial_hit_writes_through(self):
+        """The second lookup must take the O(1) path, not rescan."""
+        worker = self._worker()
+        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=True)
+
+        assert worker._rules_to_judge(self._event(track_id=2)) == []
+        assert worker.stats.instances_memoised_spatial == 1
+
+        assert worker._rules_to_judge(self._event(track_id=2)) == []
+        assert worker.stats.instances_memoised_spatial == 1, "rescanned instead of hitting"
+        assert worker.stats.instances_memoised == 1
+
+    def test_the_best_overlap_wins(self):
+        """With several candidates the closest must supply the verdict."""
+        worker = self._worker()
+        # A poorer match says False, a near-exact one says True.
+        worker._remember_verdict(self._event(track_id=1, x=0.115), rule_id=1, verdict=False)
+        worker._remember_verdict(self._event(track_id=2, x=0.100), rule_id=1, verdict=True)
+
+        assert worker._rules_to_judge(self._event(track_id=3, x=0.100)) == []
+        verdict, _at, _bbox, _label = worker._memo[(3, 1)]
+        assert verdict is True, "inherited from the poorer overlap"
+
+    def test_an_untracked_subject_never_participates(self):
+        """track_id -1 is nobody in particular, in both directions."""
+        worker = self._worker()
+        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=True)
+
+        assert len(worker._rules_to_judge(self._event(track_id=-1))) == 1
+        assert worker.stats.instances_memoised_spatial == 0
+
+
+class TestMemoMissAttribution:
+    """Each miss branch must be distinguishable, or a saturated VLM is a mystery."""
+
+    def _worker(self, **kwargs):
+        kwargs.setdefault("crossid_reuse_s", 0.0)  # isolate the exact tier
+        worker = VLMWorker(buffer=MagicMock(), backend=mock_backend(), **kwargs)
+        worker.add_rule("person", "Is this person missing a hard hat?", rule_id=1)
+        return worker
+
+    def _event(self, track_id=1, x=0.1):
+        return DetectionEvent(
+            timestamp=time.monotonic(),
+            camera_id="test",
+            label="person",
+            confidence=0.9,
+            bbox=BoundingBox(x1=x, y1=0.1, x2=x + 0.1, y2=0.5),
+            frame_index=0,
+            track_id=track_id,
+        )
+
+    def test_an_unseen_id_counts_as_new_track(self):
+        worker = self._worker(verdict_ttl_s=300.0)
+        worker._rules_to_judge(self._event(track_id=7))
+
+        assert worker.stats.memo_miss_new_track == 1
+        assert worker.stats.memo_miss_ttl == 0
+        assert worker.stats.memo_miss_moved == 0
+
+    def test_an_expired_verdict_counts_as_ttl(self):
+        worker = self._worker(verdict_ttl_s=0.05)
+        event = self._event()
+        worker._remember_verdict(event, rule_id=1, verdict=False)
+        time.sleep(0.1)
+        worker._rules_to_judge(event)
+
+        assert worker.stats.memo_miss_ttl == 1
+        assert worker.stats.memo_miss_new_track == 0
+
+    def test_a_moved_subject_counts_as_moved(self):
+        worker = self._worker(verdict_ttl_s=300.0, rejudge_iou=0.9, min_rejudge_s=0.0)
+        worker._remember_verdict(self._event(track_id=1, x=0.10), rule_id=1, verdict=False)
+        worker._rules_to_judge(self._event(track_id=1, x=0.16))
+
+        assert worker.stats.memo_miss_moved == 1
+        assert worker.stats.memo_miss_new_track == 0
+
+
 class TestVerdictMemo:
     """Reusing a verdict is what keeps per-subject judging affordable."""
 
@@ -1430,11 +1608,19 @@ class TestVerdictMemo:
         assert worker._rules_to_judge(event) == []
 
     def test_a_different_subject_is_still_asked(self):
-        """The memo must be per person, or one worker would mask the rest."""
-        worker = self._worker(verdict_ttl_s=300.0)
-        worker._remember_verdict(self._event(track_id=1), rule_id=1, verdict=False)
+        """The memo must be per person, or one worker would mask the rest.
 
-        assert len(worker._rules_to_judge(self._event(track_id=2))) == 1
+        "A different subject" means a different *place*. This used to pass the
+        same box under a new id, which the spatial fallback now correctly reads
+        as one subject re-detected — two people cannot occupy one box. Keeping
+        the old fixture would have asserted that the fallback does not work.
+        """
+        worker = self._worker(verdict_ttl_s=300.0)
+        worker._remember_verdict(self._event(track_id=1, x=0.1), rule_id=1, verdict=False)
+
+        elsewhere = self._event(track_id=2, x=0.6)
+        assert elsewhere.bbox.iou(self._event(x=0.1).bbox) == 0.0
+        assert len(worker._rules_to_judge(elsewhere)) == 1
 
     def test_the_memo_expires(self):
         worker = self._worker(verdict_ttl_s=0.05)
@@ -2283,12 +2469,27 @@ class TestBatchPreemption:
         return worker
 
     def _payload(self, track_id, timestamp=None):
+        """One subject. Distinct ids get distinct positions, deliberately.
+
+        These used to share one box, which was harmless while every gate was
+        keyed on track_id. The spatial memo reads two ids at one box as one
+        subject re-detected — correctly, since four people cannot occupy the
+        same box — so a shared box would have made this class assert that the
+        fallback does not work.
+
+        The golden-ratio spread is a low-discrepancy sequence, so it separates
+        arbitrary ids without collisions — a plain modulus put 4 and 99 at the
+        same x, and the suite passed anyway because nothing asserted on 99.
+        Worst pairwise IoU across the ids this class uses is 0.27, comfortably
+        under vlm_crossid_iou (0.7).
+        """
+        x = round(((track_id * 0.6180339887) % 1.0) * 0.90, 4)
         return {
             "timestamp": timestamp if timestamp is not None else time.monotonic(),
             "camera_id": "test",
             "label": "person",
             "confidence": 0.9,
-            "bbox": {"x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.6},
+            "bbox": {"x1": x, "y1": 0.1, "x2": x + 0.08, "y2": 0.6},
             "frame_index": 0,
             "track_id": track_id,
         }

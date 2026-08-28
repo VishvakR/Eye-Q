@@ -386,6 +386,46 @@ class Settings(BaseSettings):
             "saturate an edge CPU."
         ),
     )
+    vlm_crossid_reuse_s: float = Field(
+        default=45.0,
+        ge=0.0,
+        description=(
+            "Seconds a verdict may be reused for a subject carrying a "
+            "DIFFERENT track id, matched by position. 0 disables.\n\n"
+            "This exists because the exact memo was measurably not working. "
+            "Every gate in the pipeline is keyed on track_id, and track_id is "
+            "not stable: over a 300s replay of the bundled clip the tracker "
+            "minted 80 ids for about six real people, and 122 of 124 memo "
+            "misses were a new id rather than an expired verdict — zero were "
+            "TTL expiries. An id change resets the Stage 1 cooldown and this "
+            "memo in the same instant, so inference demand ran roughly ten "
+            "times what stable identity would need. Raising "
+            "vlm_verdict_ttl_s does nothing about that; this does.\n\n"
+            "Deliberately a separate, much shorter window than the TTL, "
+            "because it trades correctness for load where the TTL does not: "
+            "reusing across identities can hand one subject the verdict "
+            "earned by another, and a wrongly reused 'No' is a missed alert. "
+            "45s is chosen to span a short looping clip while staying far "
+            "under the 300s TTL. Watch instances_memoised_spatial on "
+            "/api/status — if it dominates instances_memoised, your identity "
+            "is churning and this is carrying the appliance."
+        ),
+    )
+    vlm_crossid_iou: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum overlap between a new subject's box and a previously "
+            "judged one before vlm_crossid_reuse_s will reuse that verdict.\n\n"
+            "Deliberately far above track_iou_threshold (0.2), which is what "
+            "the tracker itself uses to assert two boxes are the same object. "
+            "That gap is the safety argument: this gate never claims an "
+            "identity the tracker would have rejected, only recovers one it "
+            "lost. Lowering it toward 0.2 makes the two equivalent and will "
+            "start merging people who cross paths."
+        ),
+    )
     vlm_max_instances_per_batch: int = Field(
         default=8,
         ge=1,

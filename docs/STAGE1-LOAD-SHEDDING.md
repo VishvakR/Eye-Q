@@ -214,7 +214,7 @@ real event, and for filing a verdict against a 6×13 px phone that the size floo
 discards anyway.
 
 The consequence to know: the gate answers *"does this co-occurrence exist"*, and
-the crop is still of the primary. `vlm_crop_padding = 0.15` around a person
+the crop is still of the primary. `vlm_crop_padding` (0.20) around a person
 already contains a phone that is by definition ≥50% inside them. If a future
 pair needs both objects visible (`person + truck`, where the partner is not
 contained), `vlm_crop_padding` is the lever — not a union box.

@@ -60,7 +60,11 @@ class GreedyIoUTracker:
             track. Below this it is treated as a new object.
         max_age_frames: Frames a track survives unmatched before it is retired.
             This is what bounds memory: an object that leaves the frame stops
-            costing anything within roughly half a second at 30 FPS.
+            costing anything within 2 seconds at 30 FPS, or 10 seconds at the
+            6 FPS the bundled clip runs at. That second figure is the one that
+            matters — it is long enough that a track surviving a video seek
+            still holds a box from before the seek, which cannot match and so
+            mints a fresh id anyway.
     """
 
     def __init__(

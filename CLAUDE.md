@@ -56,5 +56,9 @@ These cost real debugging time. The full list is ARCHITECTURE.md §12.
 - **"Yes" means violation.** Inverting a prompt inverts the whole UI.
 - **A high `triggers_stale` is correct**, not a fault. It means load shedding is working. Likewise
   `vlm.instances_too_small` reading zero — Stage 1 applies the same floor first.
+- **If the VLM fires too often, read `memo_miss_new_track` before touching any knob.** Every gate is
+  keyed on `track_id`, and it churns — measured 80 ids for ~6 people. When that counter dominates,
+  raising `vlm_verdict_ttl_s` does nothing, because nothing lives long enough to expire. See
+  [docs/VLM-IDENTITY-CHURN.md](docs/VLM-IDENTITY-CHURN.md).
 - **Do not pass `classes=` to `model.predict()`.** Both the live overlay and the co-occurrence gate
   need every class YOLO scored; narrowing there breaks them with no counter moving.

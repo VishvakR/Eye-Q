@@ -284,9 +284,12 @@ timestamp — one timestamp is one source frame — and discard whole groups old
 `vlm_staleness_s`. This happens *before* any frame is fetched or pixel touched, so shedding is
 essentially free. **A high `triggers_stale` count is correct load shedding, not a fault.**
 
-**Layer 3 — Memoise verdicts** ([`_rules_to_judge`](app/pipelines/vlm_worker.py#L610)). This is the
-main load-control mechanism. A `(track_id, rule_id)` pair is skipped when its answer is still
-expected to hold — all of:
+**Layer 3 — Memoise verdicts** (`_rules_to_judge`). This is the main load-control mechanism, and
+it has **two tiers** — an exact lookup on `(track_id, rule_id)`, then a spatial fallback when the id
+is new. The second tier exists because the first was measurably not working; see
+[Identity churn](#identity-churn-is-the-dominant-load-driver) below and
+[docs/VLM-IDENTITY-CHURN.md](docs/VLM-IDENTITY-CHURN.md). The exact tier skips a
+`(track_id, rule_id)` pair when its answer is still expected to hold — all of:
 
 - the subject has a stable track id (an untracked detection is nobody in particular);
 - the verdict is younger than `vlm_verdict_ttl_s`;
@@ -295,8 +298,7 @@ expected to hold — all of:
 
 That last floor matters. Movement is detected as `bbox.iou(judged_bbox) < rejudge_iou`, and without a
 time floor a person simply walking across frame would demand a fresh inference roughly every 0.6
-seconds. The governing arithmetic, stated in the settings themselves
-([settings.py:274-281](app/config/settings.py#L274-L281)):
+seconds. The governing arithmetic, stated in the settings themselves (`vlm_verdict_ttl_s`):
 
 ```
 duty_cycle = subjects × inference_seconds ÷ verdict_ttl_seconds
@@ -304,6 +306,46 @@ duty_cycle = subjects × inference_seconds ÷ verdict_ttl_seconds
 
 Five subjects at 8 s/inference with a 300 s TTL is a duty cycle of 0.13 — comfortable. Drop the TTL
 to 30 s and it is 1.33, and the worker is permanently behind.
+
+**Read `subjects` as *track ids*, not people — that distinction is the whole of the next section.**
+Substituting the measured value rather than the intuitive one changes the answer completely: six
+people at 1.9 s with a 300 s TTL is 0.038, but the 80 track ids those six people actually produced,
+across two rules, is 1.01 — saturated.
+
+### Identity churn is the dominant load driver
+
+Every gate in this pipeline is keyed on `track_id`, and `track_id` is not stable. Measured over a
+300 s replay of `cctv_demo.mp4` (`bench/replay_load.py`):
+
+| | |
+|---|---|
+| distinct track ids | **80**, for ~6 real people |
+| memo misses: **new id** | **122 (98.4%)** |
+| memo misses: TTL expired | **0** |
+| memo misses: subject moved | 2 |
+
+Zero TTL expiries in five minutes. `vlm_verdict_ttl_s`, `vlm_rejudge_iou` and `vlm_min_rejudge_s`
+were doing nothing — and they are the three knobs an operator reaches for first.
+
+The two gates that look independent fail *together*, because both read the same unstable value: a
+fresh id hits `last is None` in `CooldownGate.should_trigger` and `entry is None` in
+`_rules_to_judge` in the same instant, and `_is_new_subject` then sorts it *ahead* of genuine
+re-checks. Nothing in the pipeline was a gate a new id did not walk straight through.
+
+**The spatial tier.** On an exact miss the memo scans for a verdict from the same rule and the same
+label, within `vlm_crossid_reuse_s` (45 s), whose box overlaps this one by at least
+`vlm_crossid_iou` (0.7). Measured effect on the same replay: hit rate 67.4% → **87.4%**, inferences
+**124 → 48** (0.413/s → 0.16/s), duty cycle at 1.9 s/query 0.78 → **0.30**. `memo_miss_new_track`
+fell by exactly the number of spatial hits gained, which is what makes it the diagnosed fix rather
+than a coincidence.
+
+**The 0.7 threshold is the safety argument.** It is far above the 0.2 the tracker itself uses to
+assert two boxes are the same object, so this tier never claims an identity the tracker would have
+rejected — it only recovers one the tracker lost. It is still a real trade: reusing across
+identities can hand one subject the verdict earned by another, and a wrongly reused "No" is a missed
+alert. Bounded by the tight IoU, by a window far shorter than the TTL, by a `0` kill switch, and by
+being counted separately as `instances_memoised_spatial`. **The accuracy cost is unmeasured** — see
+Gaps.
 
 **Layer 4 — Prioritise and truncate** ([:1178-1186](app/pipelines/vlm_worker.py#L1178-L1186)).
 Never-before-judged subjects sort ahead of re-checks, then newest first. Anything past
@@ -992,8 +1034,16 @@ names at 31 characters, so buffer ids in tests are short and time-derived.
 - **Single-camera in practice.** The schema, the camera registry, and `app.state.captures` are all
   multi-camera-shaped, but exactly one `VideoCapture` and one buffer are created.
 - **Webhooks are fire-and-forget.** No retry, no queue, and the task handle isn't retained.
-- **The tracker has no motion model** — roughly 2 ids per real person at 6 FPS. Costs redundant
-  inferences, never missed alerts.
+- **The tracker has no motion model** — roughly 2 ids per real person at 6 FPS on continuous
+  footage, and **13 per person over a 300 s loop of the bundled clip**, where every rewind mints a
+  fresh set. The spatial memo tier now absorbs most of the cost, but it absorbs it rather than
+  removing it: `bench/replay_load.py` still reports 80 distinct ids for ~6 people. A constant-
+  velocity predictor would cut it at source for fast movers, though not for detection flicker,
+  occlusion past `max_age_frames`, or a video seek — which is most of it here.
+- **Cross-identity verdict reuse is unvalidated for accuracy.** The spatial memo tier trades
+  correctness for load by design, and with no `labels.json` (below) the size of that trade has never
+  been measured. It is bounded — IoU 0.7, a 45 s window, `EYEQ_VLM_CROSSID_REUSE_S=0` to disable —
+  but bounded is not the same as verified.
 - **Probing is unavailable on two of the four backends.** The pinned `2024-08-26` Moondream exposes no logits and Ollama
   serves no `logprobs`, so both fall back to generate-and-parse — including its conservative default,
   which turns an unrecognised answer into a silent "no alert". Measured on this project's own

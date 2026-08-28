@@ -358,6 +358,8 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
             verdict_ttl_s=settings.vlm_verdict_ttl_s,
             rejudge_iou=settings.vlm_rejudge_iou,
             min_rejudge_s=settings.vlm_min_rejudge_s,
+            crossid_reuse_s=settings.vlm_crossid_reuse_s,
+            crossid_iou=settings.vlm_crossid_iou,
             max_instances_per_batch=settings.vlm_max_instances_per_batch,
             max_crop_edge=settings.vlm_max_crop_edge,
             min_subject_px=settings.vlm_min_subject_px,
@@ -842,6 +844,33 @@ def create_app() -> FastAPI:
                 "detections_filtered_pair": (
                     watchdog_stats.detections_filtered_pair if watchdog_stats else 0
                 ),
+                # The six below were populated all along and never returned,
+                # which is why a saturated VLM could not be diagnosed from this
+                # endpoint. detections_filtered_cooldown is the important one:
+                # if it dwarfs every other drop reason, the cooldown is
+                # carrying the whole load and nothing else contributes.
+                "detections_total": (
+                    watchdog_stats.detections_total if watchdog_stats else 0
+                ),
+                "detections_filtered_confidence": (
+                    watchdog_stats.detections_filtered_confidence
+                    if watchdog_stats
+                    else 0
+                ),
+                "detections_filtered_label": (
+                    watchdog_stats.detections_filtered_label if watchdog_stats else 0
+                ),
+                "detections_filtered_roi": (
+                    watchdog_stats.detections_filtered_roi if watchdog_stats else 0
+                ),
+                "detections_filtered_cooldown": (
+                    watchdog_stats.detections_filtered_cooldown if watchdog_stats else 0
+                ),
+                # Frames the buffer handed back twice. A high value means the
+                # watchdog is paced above the camera's real frame rate.
+                "frames_repeated": (
+                    watchdog_stats.frames_repeated if watchdog_stats else 0
+                ),
             },
             "vlm": {
                 "is_running": vlm_stats.is_running if vlm_stats else False,
@@ -855,7 +884,27 @@ def create_app() -> FastAPI:
                 # should climb far faster than judged once a scene settles, and
                 # a rising shed count means the crowd outpaces the VLM.
                 "instances_judged": vlm_stats.instances_judged if vlm_stats else 0,
+                # Counts *rules*, where instances_judged counts *subjects*.
+                # Two enabled rules make one judged subject two forward passes,
+                # so these two numbers are not directly comparable.
                 "instances_memoised": vlm_stats.instances_memoised if vlm_stats else 0,
+                # Reuse recovered by position after the track id changed. If
+                # this dominates instances_memoised, identity is churning and
+                # the exact memo is carrying almost none of the load.
+                "instances_memoised_spatial": (
+                    vlm_stats.instances_memoised_spatial if vlm_stats else 0
+                ),
+                # Why the memo missed. new_track dominating means the TTL is
+                # irrelevant however high it is set — nothing is living long
+                # enough to expire, so raising it cannot help.
+                "memo_miss_new_track": (
+                    vlm_stats.memo_miss_new_track if vlm_stats else 0
+                ),
+                "memo_miss_ttl": vlm_stats.memo_miss_ttl if vlm_stats else 0,
+                "memo_miss_moved": vlm_stats.memo_miss_moved if vlm_stats else 0,
+                # Raw triggers off the wire, before coalescing. Populated since
+                # the worker was written and never returned until now.
+                "triggers_received": vlm_stats.triggers_received if vlm_stats else 0,
                 "instances_shed": vlm_stats.instances_shed if vlm_stats else 0,
                 "instances_too_small": (
                     vlm_stats.instances_too_small if vlm_stats else 0

@@ -527,6 +527,9 @@ class VLMWorkerStats:
     triggers_timed_out: int
     verdicts_positive: int
     verdicts_negative: int
+    # Units differ, deliberately: instances_judged counts *subjects* while
+    # instances_memoised counts *rules*. Two enabled rules make one judged
+    # subject two forward passes, so the two are not directly comparable.
     instances_judged: int
     instances_memoised: int
     instances_shed: int
@@ -545,6 +548,15 @@ class VLMWorkerStats:
     latency_p50_ms: float
     latency_p95_ms: float
     uptime_seconds: float
+    # Reuse recovered by position after the id changed. Defaulted so the
+    # dataclass keeps its positional contract for existing callers.
+    instances_memoised_spatial: int = 0
+    # Why the memo missed. new_track dominating means identity is churning and
+    # the TTL is irrelevant however high it is set — that was the measured
+    # state of this appliance before the spatial fallback existed.
+    memo_miss_new_track: int = 0
+    memo_miss_ttl: int = 0
+    memo_miss_moved: int = 0
 
 
 # ── VLM Worker ───────────────────────────────────────────────────
@@ -585,6 +597,10 @@ class VLMWorker:
             subject is judged again. The load control; see the memo below.
         rejudge_iou: Re-judge early below this IoU against the judged box.
         min_rejudge_s: Floor between re-judgements of one subject.
+        crossid_reuse_s: Window for reusing a verdict across a *different*
+            track id, by position. 0 disables the spatial fallback.
+        crossid_iou: Minimum overlap for that reuse. Deliberately far above
+            ``track_iou_threshold`` — see :meth:`_spatial_verdict`.
         max_instances_per_batch: Cap on subjects inferred per drained batch.
         max_crop_edge: Longest side a crop may have when handed to the VLM.
         min_subject_px: Skip a subject whose own box is smaller than this on
@@ -622,6 +638,8 @@ class VLMWorker:
         verdict_ttl_s: float = 300.0,
         rejudge_iou: float = 0.5,
         min_rejudge_s: float = 20.0,
+        crossid_reuse_s: float = 45.0,
+        crossid_iou: float = 0.7,
         max_instances_per_batch: int = 8,
         max_crop_edge: int = 378,
         min_subject_px: int = 96,
@@ -642,6 +660,8 @@ class VLMWorker:
         self._verdict_ttl_s = verdict_ttl_s
         self._rejudge_iou = rejudge_iou
         self._min_rejudge_s = min_rejudge_s
+        self._crossid_reuse_s = crossid_reuse_s
+        self._crossid_iou = crossid_iou
         self._max_instances_per_batch = max_instances_per_batch
         self._max_crop_edge = max_crop_edge
         self._min_subject_px = min_subject_px
@@ -656,14 +676,20 @@ class VLMWorker:
         # before every single generate, doubling its request count forever.
         self._probe_supported: bool | None = None
 
-        # Verdict memo: (track_id, rule_id) -> (verdict, judged_at, judged_bbox).
+        # Verdict memo:
+        #   (track_id, rule_id) -> (verdict, judged_at, judged_bbox, label)
+        #
         # This is the appliance's load control. Judging every tracked subject on
         # every cooldown would multiply inference demand by the size of the
         # crowd; reusing a verdict until the subject moves or the TTL expires
         # spends the same budget covering everyone instead of re-asking about
         # one person. Guarded by a lock because the batch loop reads and writes
         # it while rules are synced from the API thread.
-        self._memo: dict[tuple[int, int], tuple[bool, float, BoundingBox]] = {}
+        #
+        # The label is carried in the entry rather than the key because the
+        # spatial fallback below matches on position, and position alone would
+        # happily hand a forklift's verdict to the person driving it.
+        self._memo: dict[tuple[int, int], tuple[bool, float, BoundingBox, str]] = {}
         self._judged_tracks: set[int] = set()
         self._memo_lock = threading.Lock()
 
@@ -708,6 +734,17 @@ class VLMWorker:
         self._verdicts_probed = 0
         self._instances_judged = 0
         self._instances_memoised = 0
+        # Reuse that only happened because of the spatial fallback. If this
+        # dominates _instances_memoised, identity is churning badly and the
+        # exact memo is carrying almost none of the load.
+        self._instances_memoised_spatial = 0
+        # Why the memo missed. Before these existed the three branches were
+        # indistinguishable, and diagnosing a saturated VLM meant patching the
+        # code by hand: new_track dominating means the TTL is irrelevant no
+        # matter how high it is set.
+        self._memo_miss_new_track = 0
+        self._memo_miss_ttl = 0
+        self._memo_miss_moved = 0
         self._instances_shed = 0
         self._instances_too_small = 0
         # How many batches were abandoned because the backend's endpoint was
@@ -822,17 +859,28 @@ class VLMWorker:
         stays a pure function of the rule table while the memo — which is
         stateful and time-dependent — is layered on top and testable alone.
 
-        A rule is skipped when this exact subject was judged for it recently
-        enough that the answer is still expected to hold. "Recently enough"
-        means all of:
+        Two tiers, tried in order.
 
-            - the subject has a stable id (an untracked detection is nobody in
-              particular, and treating it as somebody would blind the appliance
-              to everyone after the first person it ever saw);
-            - the verdict is younger than the TTL; and
-            - the subject has not moved far from where it was judged — unless
-              it moved within the re-judge floor, which stops a walking subject
-              from demanding a fresh inference every stride.
+        **Exact**, on ``(track_id, rule_id)``. A rule is skipped when this exact
+        subject was judged for it recently enough that the answer is still
+        expected to hold — the verdict is younger than the TTL, and the subject
+        has not moved far from where it was judged unless it moved within the
+        re-judge floor, which stops a walking subject from demanding a fresh
+        inference every stride.
+
+        **Spatial**, on position, when the exact lookup misses because the id is
+        new. This exists because the exact tier alone was measurably not
+        working: over a 300 s replay of the bundled clip the tracker minted 80
+        ids for about six real people, and 122 of 124 memo misses were a new id
+        rather than an expired verdict — zero were TTL expiries. Every gate in
+        the pipeline is keyed on ``track_id``, so an id change resets the Stage
+        1 cooldown and this memo in the same instant, and inference demand ran
+        roughly ten times what stable identity would need. See
+        :meth:`_spatial_verdict` for the safety argument.
+
+        An untracked detection (``track_id < 0``) is nobody in particular and
+        is never memoised — treating it as somebody would blind the appliance
+        to everyone after the first person it ever saw.
         """
         matched = self._match_rules(event)
         if not matched or event.track_id < 0 or self._verdict_ttl_s <= 0:
@@ -843,26 +891,102 @@ class VLMWorker:
 
         with self._memo_lock:
             for rule in matched:
-                entry = self._memo.get((event.track_id, rule["rule_id"]))
+                rule_id = rule["rule_id"]
+                entry = self._memo.get((event.track_id, rule_id))
+
                 if entry is None:
+                    # The dominant miss. Before paying for an inference, ask
+                    # whether this box is somewhere we already have an answer.
+                    if self._spatial_verdict(event, rule_id, now):
+                        continue
+                    self._memo_miss_new_track += 1
                     unjudged.append(rule)
                     continue
 
-                _verdict, judged_at, judged_bbox = entry
+                _verdict, judged_at, judged_bbox, _label = entry
                 age = now - judged_at
 
                 if age >= self._verdict_ttl_s:
+                    self._memo_miss_ttl += 1
                     unjudged.append(rule)
                     continue
 
                 moved = event.bbox.iou(judged_bbox) < self._rejudge_iou
                 if moved and age >= self._min_rejudge_s:
+                    self._memo_miss_moved += 1
                     unjudged.append(rule)
                     continue
 
                 self._instances_memoised += 1
 
         return unjudged
+
+    def _spatial_verdict(
+        self, event: DetectionEvent, rule_id: int, now: float
+    ) -> bool:
+        """Reuse a recent verdict from a *different* id at the same position.
+
+        Caller holds ``_memo_lock``.
+
+        The exact memo is keyed on identity, and identity is the thing that
+        breaks: a subject re-detected after an occlusion, a greedy id swap when
+        two people cross, or a seek in the source video all mint a fresh id for
+        a person the appliance already has an answer about. This recovers that
+        answer from geometry instead.
+
+        The safety argument, because this is the one place the appliance
+        trades correctness for load. Reusing a verdict across identities can
+        hand person B the answer earned by person A, and a wrongly reused "No"
+        is a missed alert — the bad direction. Three things bound it:
+
+            - ``vlm_crossid_iou`` (0.7) is far stricter than the 0.2 the
+              tracker itself uses to assert two boxes are the same object, so
+              this never claims an identity the tracker would have rejected;
+            - ``vlm_crossid_reuse_s`` (45 s) is a separate, much shorter window
+              than the TTL, so cross-identity reuse can be shortened or turned
+              off without touching same-subject reuse;
+            - hits are counted separately, so an operator can see how much of
+              their shedding rests on this.
+
+        Returns:
+            True when a verdict was reused. The match is also written through
+            under the new key, so the next frame takes the O(1) exact path
+            rather than scanning again.
+        """
+        if self._crossid_reuse_s <= 0:
+            return False
+
+        best_iou = self._crossid_iou
+        best: tuple[bool, float, BoundingBox, str] | None = None
+
+        for (_tid, entry_rule_id), entry in self._memo.items():
+            if entry_rule_id != rule_id:
+                continue
+            verdict, judged_at, judged_bbox, label = entry
+            # Cheap rejections first, so IoU is only computed on candidates
+            # that could actually match.
+            if label != event.label:
+                continue
+            if now - judged_at >= self._crossid_reuse_s:
+                continue
+            iou = event.bbox.iou(judged_bbox)
+            if iou >= best_iou:
+                best_iou = iou
+                best = entry
+
+        if best is None:
+            return False
+
+        verdict, judged_at, judged_bbox, label = best
+        self._memo[(event.track_id, rule_id)] = (verdict, judged_at, event.bbox, label)
+        self._judged_tracks.add(event.track_id)
+        self._instances_memoised_spatial += 1
+        logger.debug(
+            f"Reusing verdict for [{event.label}#{event.track_id}] rule {rule_id} "
+            f"from a prior subject at IoU {best_iou:.2f}, "
+            f"{now - judged_at:.1f}s old."
+        )
+        return True
 
     def _remember_verdict(
         self, event: DetectionEvent, rule_id: int, verdict: bool
@@ -876,6 +1000,7 @@ class VLMWorker:
                 verdict,
                 time.monotonic(),
                 event.bbox,
+                event.label,
             )
             self._judged_tracks.add(event.track_id)
 
@@ -1011,6 +1136,10 @@ class VLMWorker:
             instances_memoised=self._instances_memoised,
             instances_shed=self._instances_shed,
             instances_too_small=self._instances_too_small,
+            instances_memoised_spatial=self._instances_memoised_spatial,
+            memo_miss_new_track=self._memo_miss_new_track,
+            memo_miss_ttl=self._memo_miss_ttl,
+            memo_miss_moved=self._memo_miss_moved,
             batches_dropped_unavailable=self._batches_dropped_unavailable,
             backend_unavailable=self._backend_unavailable,
             avg_inference_ms=avg_ms,
