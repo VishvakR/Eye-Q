@@ -59,6 +59,7 @@ These cost real debugging time. The full list is ARCHITECTURE.md §12.
 - **If the VLM fires too often, read `memo_miss_new_track` before touching any knob.** Every gate is
   keyed on `track_id`, and it churns — measured 80 ids for ~6 people. When that counter dominates,
   raising `vlm_verdict_ttl_s` does nothing, because nothing lives long enough to expire. See
-  [docs/VLM-IDENTITY-CHURN.md](docs/VLM-IDENTITY-CHURN.md).
+  ARCHITECTURE.md §"Identity churn is the dominant load driver", and measure with
+  `uv run python bench/replay_load.py --duration 300 --loop`.
 - **Do not pass `classes=` to `model.predict()`.** Both the live overlay and the co-occurrence gate
   need every class YOLO scored; narrowing there breaks them with no counter moving.

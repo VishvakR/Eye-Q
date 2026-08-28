@@ -232,10 +232,10 @@ Resilience: EOF triggers an in-session `_rewind()` for seamless looping
 4. **Gate** — each detection passes **label → ROI → size → pair → cooldown**, in that order, each
    with its own counter so `/api/status` can show *why* things were dropped.
 
-Stage 1 now sheds ahead of Stage 2's four layers rather than forwarding everything to them, so
-`triggers_coalesced` and `instances_shed` both read lower than they did before it existed. The
-rationale for the two newer gates — and for their exact position in that ladder — is in
-[docs/STAGE1-LOAD-SHEDDING.md](docs/STAGE1-LOAD-SHEDDING.md).
+Stage 1 sheds ahead of Stage 2's four layers rather than forwarding everything to them, so
+`triggers_coalesced` and `instances_shed` both read lower than they did before it existed. Measured
+over 300 s of `cctv_demo.mp4` at the demo's settings, the ladder removes **97.4%** of detections
+before ZMQ: 24.1% on the size floor, 73.2% on the cooldown, leaving 190 of 7,352 published.
 
 Five details are worth understanding before changing anything here:
 
@@ -267,6 +267,73 @@ it is dropped without inference and counted as `frames_repeated`
 ([detector.py:468-472](app/pipelines/detector.py#L468-L472)). Without this, a 6 FPS clip under a
 30 FPS watchdog would run YOLO five times on identical pixels.
 
+#### The size floor, and why it moved from Stage 2
+
+Stage 2 had this floor first, and it was correct there but paid for too late. A 30 px subject that
+`_too_small` was always going to reject had already cost a ZMQ publish, a ring-buffer read, and a
+slot in the batch `vlm_max_instances_per_batch` truncates — meaning it could **displace a legible
+subject** from the priority sort. That last point is what made it worth moving rather than leaving.
+
+Both floors are kept. Stage 2's remains a backstop against anything else publishing on `:5557` and
+against `_prepare` being driven directly, which every test in `TestUnreadableSubjectsAreSkipped`
+does. Both read `vlm_min_subject_px` and both call `BoundingBox.pixel_size`, so the predicate is
+literally the same function and cannot drift by a pixel.
+
+> **Reading the counters:** `vlm.instances_too_small` should read **zero**. That is the healthy
+> steady state, not a regression — Stage 1 sheds first. A non-zero value means the floors were
+> deliberately set apart, or something other than this watchdog is publishing on the detection
+> endpoint. Watch `watchdog.detections_filtered_size` instead.
+
+#### Co-occurrence gating — `overlap_ratio`, not IoU
+
+A rule may carry a `pair_label`: its targets only trigger when a partner class has an overlapping
+box in the same frame — "a person **holding a phone**", not "a person".
+
+**The predicate is deliberately not IoU.** A cell phone fully inside a person's box scores
+**IoU ≈ 0.028** — not because the phone is barely inside, but because the person is roughly
+thirty-six times larger and IoU divides by the *union*. Any IoU threshold loose enough to admit that
+pair also admits two boxes that merely graze at a corner. `BoundingBox.overlap_ratio` divides by the
+**smaller** box instead, returning ~1.0 for full containment at any size ratio, and
+`yolo_pair_overlap` (0.5) reads as "at least half the smaller object is inside the larger". Bare
+`intersection > 0` was rejected as the opposite failure: YOLO boxes are generous and axis-aligned,
+so a phone on a desk two metres behind someone clips their box by a pixel.
+
+**The partner is exempt from two gates, and both fail silently if that changes.** The pair search
+runs over the raw Pass-1 candidate list, which has had only the confidence filter applied:
+
+- *Exempt from the label allowlist* — a rule watching only `person` narrows `target_labels` to that
+  one label, so the phone would already be gone. This works only because `model.predict()` is given
+  no `classes=` argument. Adding one is the obvious future "optimisation" and would disable the gate
+  with no counter moving.
+- *Exempt from the size floor* — a phone is **always** under a 96 px floor. Testing partners against
+  it means the gate can never fire, and it fails **closed**, so Stage 2 simply goes quiet while every
+  counter looks like a peaceful scene.
+
+**The primary's own box publishes** — not a union, not both. A union box has no identity of its own;
+synthesising one breaks `_coalesce`'s key, the `(track_id, rule_id)` memo, `_is_new_subject` and
+`_remember_verdict` at once, and its *shape changes every frame* as the phone moves in the hand, so
+even a stable synthetic id would fail `rejudge_iou` constantly. That would disable Stage 2's main
+load control in the name of a load-shedding feature.
+
+#### Why `pair_label` is per-rule, and when it does nothing
+
+`sync_rules` hands Stage 1 the **coarsest** setting across rules, because Stage 1 must never filter
+out something a rule still wants. A pair requirement is a *narrowing*, and there is no coarsest
+narrowing. With one plain `person` rule alongside one `person + cell phone` rule, the only
+composition that keeps the plain rule firing is **no gate at all** — so the requirement is dropped
+and every person wakes the VLM.
+
+That is correct but invisible, so `sync_rules` logs a warning naming the rule responsible:
+
+```
+Rule 'Forklift watch' targets 'person' with no pair_label, so the 'person + cell phone'
+gate on rule 'Phone use' cannot be enforced at Stage 1 — every person will still wake the VLM.
+```
+
+A global setting would always shed, but the failure directions are not symmetric. Per-rule fails
+toward **over-triggering** — wasted inference, recoverable. Global fails toward **silently blinding a
+rule** the operator never meant to narrow — a missed violation, which is not.
+
 ### Stage 2 — The VLM worker
 
 This is where most of the engineering is. The problem: triggers arrive faster than 8-second
@@ -286,10 +353,9 @@ essentially free. **A high `triggers_stale` count is correct load shedding, not 
 
 **Layer 3 — Memoise verdicts** (`_rules_to_judge`). This is the main load-control mechanism, and
 it has **two tiers** — an exact lookup on `(track_id, rule_id)`, then a spatial fallback when the id
-is new. The second tier exists because the first was measurably not working; see
-[Identity churn](#identity-churn-is-the-dominant-load-driver) below and
-[docs/VLM-IDENTITY-CHURN.md](docs/VLM-IDENTITY-CHURN.md). The exact tier skips a
-`(track_id, rule_id)` pair when its answer is still expected to hold — all of:
+is new. The second exists because the first was measurably not working; see *Identity churn* below.
+The exact tier skips a `(track_id, rule_id)` pair when its answer is still expected to hold — all
+of:
 
 - the subject has a stable track id (an untracked detection is nobody in particular);
 - the verdict is younger than `vlm_verdict_ttl_s`;
@@ -339,13 +405,51 @@ label, within `vlm_crossid_reuse_s` (45 s), whose box overlaps this one by at le
 fell by exactly the number of spatial hits gained, which is what makes it the diagnosed fix rather
 than a coincidence.
 
+The label is carried in the memo *entry* rather than the key precisely because this tier matches on
+geometry, and geometry alone would hand a forklift's verdict to the person driving it. A hit is
+written through under the new key, so the next frame takes the O(1) exact path instead of rescanning.
+
+**Where the ids come from.** Two sources, and the first is not a bug:
+
+- *Looping playback.* The demo clip is 17 s and `VideoCapture` seeks to frame 0 on EOF. On rewind the
+  previous pass's tracks are still alive — `max_age_frames=60` is 10 s at 6 FPS — but the frame-1
+  boxes are 17 s of motion away, so nothing matches and ~14 fresh ids mint every loop, forever.
+  About 85% of the 80 ids are this. **The tracker is behaving correctly**; the boxes genuinely do not
+  overlap, and resetting it on seek would not change the count.
+- *Continuous footage.* Smaller but real. On `demo1.mp4` (37 s, no loop) a person visible in 105 of
+  555 frames still produced 8 distinct ids from detection flicker alone — a gap longer than
+  `max_age_frames` retires a track that then returns as a stranger. Add greedy id swaps when two
+  people cross, and occlusions past 10 s.
+
 **The 0.7 threshold is the safety argument.** It is far above the 0.2 the tracker itself uses to
 assert two boxes are the same object, so this tier never claims an identity the tracker would have
 rejected — it only recovers one the tracker lost. It is still a real trade: reusing across
 identities can hand one subject the verdict earned by another, and a wrongly reused "No" is a missed
-alert. Bounded by the tight IoU, by a window far shorter than the TTL, by a `0` kill switch, and by
-being counted separately as `instances_memoised_spatial`. **The accuracy cost is unmeasured** — see
-Gaps.
+alert. Bounded by the tight IoU, by a window far shorter than the TTL, by a `0` kill switch
+(`EYEQ_VLM_CROSSID_REUSE_S=0`), and by being counted separately as `instances_memoised_spatial`.
+**The accuracy cost is unmeasured** — see Gaps.
+
+**Diagnosing this on a live appliance.** `/api/status` exposes the miss reasons, which is what makes
+the difference between tuning and guessing:
+
+| Signal | What it means | What to do |
+|---|---|---|
+| `memo_miss_new_track` dominates | Identity is churning | The TTL is irrelevant however high you set it. This tier is the lever. |
+| `memo_miss_ttl` dominates | Verdicts really are ageing out | Raise `vlm_verdict_ttl_s` — here it will actually help |
+| `memo_miss_moved` dominates | Subjects walk out of their own boxes | Raise `vlm_min_rejudge_s` |
+| `instances_memoised_spatial` ≫ `instances_memoised` | Nearly all shedding rests on cross-identity reuse | Tighten `vlm_crossid_iou`; check for a fixable cause (frame rate, dropped frames) |
+| `detections_filtered_cooldown` dwarfs every other Stage 1 drop | The cooldown is carrying the whole load | Nothing else is contributing; look upstream |
+
+At Stage 1 the churn signature is **`cooldown_keys` ≫ `tracks_active`** — keys are `label#id` and
+prune on age, so ids minting faster than the cooldown ages them out shows as a growing ratio while
+`tracks_active` stays flat.
+
+**Considered and not done.** A *motion model* in the tracker would cut churn at source and help fast
+movers, but does nothing for detection flicker, occlusion past `max_age_frames`, or a video seek —
+which is most of it here. *Appearance hashing* is the only approach that would recognise a person who
+moved **and** changed id, but it is net-new machinery, fragile under lighting and pose change, and no
+such utility exists in the repo. *Raising the TTL* is measured to be useless: zero expiries in 300 s.
+*Changing Stage 1's cooldown* misses the point — Stage 1 already sheds 73%; the leak was at Stage 2.
 
 **Layer 4 — Prioritise and truncate** ([:1178-1186](app/pipelines/vlm_worker.py#L1178-L1186)).
 Never-before-judged subjects sort ahead of re-checks, then newest first. Anything past
