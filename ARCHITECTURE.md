@@ -1004,3 +1004,23 @@ names at 31 characters, so buffer ids in tests are short and time-derived.
 - **No ROI editor in the UI.** `roi_json` is accepted by the API but can't be drawn from the
   dashboard.
 - **`SystemStatus` in `schemas/events.py` is dead code** — `/api/status` builds its dict by hand.
+- **Verdict accuracy has never been measured.** `bench/fixtures/labels.json` does not exist and never
+  has, so `bench/eval_accuracy.py` refuses to run — correctly; it will not invent ground truth. The
+  fixtures, the harness, the Wilson intervals and the PR curve are all in place; the only missing
+  piece is a human labelling pass, one run of `bench/label_fixtures.py` over 29 crops × 3 rules.
+  The consequence is worth stating without hedging: **`vlm_crop_padding` was raised from 0.15 to
+  0.20 without validation**, and this repo currently holds no accuracy number for any setting. Two
+  things make the pass cheaper than it looks — fixture regeneration preserves filenames and
+  `track_id`s, so one set of labels stays valid across crop-parameter changes and can measure a
+  before/after; and the harness prints its own sample-size warning, because 15 distinct subjects
+  carries roughly ±25 points at 95% confidence. A number from this footage settles a large
+  difference, not a small one.
+- **The vision encoder does redundant work on every verdict.** `overlap_crop_image` returns
+  `tiling[0] × tiling[1] + 1` crops, so `n_crops` is never 1: even on the single-tile path the global
+  view and its one tile are the same 378×378 image, encoded twice. That is roughly 800 ms of the
+  1,664 ms encoder cost, on the stage that is 88.8% of a query. See “Crop preparation and the tiling
+  threshold”. Unfixed because it means patching around vendored model code, which needs its own
+  accuracy validation — and see the gap immediately above for why that is not currently possible.
+- **Two feature branches are unmerged.** `feat/stage1-load-shedding` (Stage 1 size floor and
+  co-occurrence gating) and `feat/crop-retune` (stacked on it) carry the behaviour this document
+  describes. `main` does not. Anyone reading `main` is not looking at this code.
