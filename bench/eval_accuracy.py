@@ -60,7 +60,11 @@ from app.pipelines.vlm_backends import (  # noqa: E402
 )
 from app.pipelines.vlm_judge import BinaryVerdictParser  # noqa: E402
 from bench.benchmark_vlm import PROMPTS, VERDICT_SUFFIX  # noqa: E402
-from bench.label_fixtures import LABELS_NAME, load_labels  # noqa: E402
+from bench.label_fixtures import (  # noqa: E402
+    LABELS_NAME,
+    load_labels,
+    load_provenance,
+)
 from bench.make_fixtures import MANIFEST_NAME  # noqa: E402
 from bench.probe import system_info  # noqa: E402
 
@@ -261,6 +265,28 @@ def summarise(judgements: list[Judgement]) -> dict[str, RuleMetrics]:
     return metrics
 
 
+def _print_provenance(provenance: dict | None) -> None:
+    """Say who produced the labels, loudly, above and below the numbers.
+
+    An accuracy figure is only as good as its ground truth, and this project
+    has already been burned once by measuring the wrong thing and believing it.
+    A caveat that scrolls off the top of a long report is a caveat nobody
+    reads, so it is printed twice.
+    """
+    if provenance is None:
+        print(
+            "\n  LABEL PROVENANCE: unknown — this labels.json records no "
+            "provenance. Treat every number below as unattributed."
+        )
+        return
+
+    print(f"\n  LABEL PROVENANCE: {provenance.get('labeller', 'unrecorded')}")
+    if provenance.get("labelled_at"):
+        print(f"  labelled: {provenance['labelled_at']}")
+    if provenance.get("caveat"):
+        print(f"  {provenance['caveat']}")
+
+
 def main() -> None:
     """CLI entry point."""
     ap = argparse.ArgumentParser(description=__doc__)
@@ -285,8 +311,10 @@ def main() -> None:
     if args.device:
         settings = settings.model_copy(update={"vlm_device": args.device})
 
+    provenance = load_provenance(labels_path)
     backend = build_backend(settings)
     print(f"\n{'=' * 70}\n{backend!r}\n{'=' * 70}")
+    _print_provenance(provenance)
     backend.load()
 
     judgements = evaluate(backend, args.fixtures, args.rule)
@@ -331,11 +359,26 @@ def main() -> None:
             f"{settings.vlm_probe_threshold}"
         )
 
+    for rule, m in metrics.items():
+        if rule == "overall":
+            continue
+        positives = m.tp + m.fn
+        if positives < 5:
+            print(
+                f"\n  WARNING: rule '{rule}' has only {positives} positive "
+                f"example(s) in the label set. Recall is computed over that "
+                f"handful, so it can only take a few discrete values and its "
+                f"interval spans most of [0, 1]. This is not a measurement of "
+                f"recall; it is a placeholder for one. Add footage containing "
+                f"the condition before drawing any conclusion."
+            )
+
     subjects = len({j.track_id for j in judgements})
     print(
         f"\n  {len(judgements)} judgement(s) over {subjects} independent "
         f"subject(s). Intervals are computed on subjects, not crops."
     )
+    _print_provenance(provenance)
     if subjects < 100:
         print(
             "  This sample cannot separate two close options. Add more varied "
@@ -349,6 +392,10 @@ def main() -> None:
         json.dumps(
             {
                 "backend": tag,
+                # First key after the backend, deliberately: anyone reading
+                # this file or pasting a number out of it sees where the
+                # ground truth came from before they see the number.
+                "label_provenance": provenance,
                 "device": backend.device,
                 "system": system_info(),
                 "probe_threshold": settings.vlm_probe_threshold,

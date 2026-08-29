@@ -534,9 +534,10 @@ class VLMWorkerStats:
     instances_memoised: int
     instances_shed: int
     instances_too_small: int
-    # Batches abandoned because the endpoint was down. A non-zero value here
-    # with a flat triggers_failed means the outage was caught early, which is
-    # the whole point of dropping rather than grinding.
+    # Batches abandoned because the endpoint was down. This is now the only
+    # place an outage is counted — the failure counters below deliberately
+    # ignore VLMUnavailableError, so a dead endpoint reads as one problem
+    # rather than as many.
     batches_dropped_unavailable: int
     backend_unavailable: bool
     avg_inference_ms: float
@@ -557,6 +558,13 @@ class VLMWorkerStats:
     memo_miss_new_track: int = 0
     memo_miss_ttl: int = 0
     memo_miss_moved: int = 0
+    # triggers_failed split by cause. It was incremented from ten sites, so a
+    # wrapped ring buffer, a malformed payload and a crashed model were one
+    # number; it now stays at zero and these carry the meaning.
+    triggers_malformed: int = 0
+    triggers_frame_lost: int = 0
+    triggers_backend_error: int = 0
+    triggers_internal_error: int = 0
 
 
 # ── VLM Worker ───────────────────────────────────────────────────
@@ -724,7 +732,23 @@ class VLMWorker:
         self._triggers_processed = 0
         self._triggers_stale = 0
         self._triggers_coalesced = 0
+        # Retired in favour of the four below. Kept at zero and still
+        # reported so an existing dashboard does not break; it was ten
+        # unrelated causes wearing one name, which made a wrapped ring buffer
+        # indistinguishable from a crashed model.
         self._triggers_failed = 0
+        # Stage 1 published something that will not parse. Schema drift or a
+        # foreign publisher — nothing to do with the VLM.
+        self._triggers_malformed = 0
+        # The source frame was gone before Stage 2 reached it. A CAPACITY
+        # signal, not an error: raise buffer_capacity or cut VLM latency.
+        self._triggers_frame_lost = 0
+        # The model call raised, or returned a different number of answers
+        # than it was asked for. Check device, dtype and memory.
+        self._triggers_backend_error = 0
+        # A bug in Eye-Q. Both sites log exc_info=True. The only two of the
+        # original ten that should ever wake a developer.
+        self._triggers_internal_error = 0
         self._triggers_timed_out = 0
         self._verdicts_positive = 0
         self._verdicts_negative = 0
@@ -1129,6 +1153,10 @@ class VLMWorker:
             triggers_stale=self._triggers_stale,
             triggers_coalesced=self._triggers_coalesced,
             triggers_failed=self._triggers_failed,
+            triggers_malformed=self._triggers_malformed,
+            triggers_frame_lost=self._triggers_frame_lost,
+            triggers_backend_error=self._triggers_backend_error,
+            triggers_internal_error=self._triggers_internal_error,
             triggers_timed_out=self._triggers_timed_out,
             verdicts_positive=self._verdicts_positive,
             verdicts_negative=self._verdicts_negative,
@@ -1177,7 +1205,7 @@ class VLMWorker:
                 try:
                     self._process_batch(batch, publisher, subscriber)
                 except Exception as exc:
-                    self._triggers_failed += 1
+                    self._triggers_internal_error += 1
                     logger.error(
                         f"VLMWorker: batch processing failed: {exc}",
                         exc_info=True,
@@ -1566,7 +1594,7 @@ class VLMWorker:
             try:
                 events.append(DetectionEvent(**payload))
             except Exception as exc:
-                self._triggers_failed += 1
+                self._triggers_malformed += 1
                 logger.warning(f"Discarding malformed detection payload: {exc}")
 
         if not events:
@@ -1600,7 +1628,7 @@ class VLMWorker:
 
             frame = self._read_frame(group[0])
             if frame is None:
-                self._triggers_failed += len(pending)
+                self._triggers_frame_lost += len(pending)
                 logger.warning(
                     f"Frame not found for {len(pending)} trigger(s) at "
                     f"t={timestamp:.3f}. Buffer has wrapped."
@@ -1696,7 +1724,7 @@ class VLMWorker:
                         )
                     return
             except Exception as exc:
-                self._triggers_failed += 1
+                self._triggers_internal_error += 1
                 logger.error(f"VLMWorker: judging failed: {exc}", exc_info=True)
             finally:
                 # Always release accelerator memory back to YOLO
@@ -1769,7 +1797,7 @@ class VLMWorker:
             )
             return False
         except Exception as exc:
-            self._triggers_failed += 1
+            self._triggers_backend_error += 1
             logger.error(f"VLM image encoding failed: {exc}")
             return True
 
@@ -1812,11 +1840,14 @@ class VLMWorker:
                 # The endpoint is down, not this query. Every rule and every
                 # subject behind this one would pay its own doomed round-trip
                 # to discover the same thing, so stop here.
-                self._triggers_failed += 1
+                # Deliberately not counted as a failure: an outage is already
+                # described by backend_unavailable and
+                # batches_dropped_unavailable. Counting it here as well made
+                # a single dead endpoint read as many unrelated faults.
                 self._note_unavailable(exc)
                 return False
             except Exception as exc:
-                self._triggers_failed += 1
+                self._triggers_backend_error += 1
                 logger.error(f"VLM inference failed: {exc}")
                 continue
             # The encode is billed to whichever rule triggered it, so a
@@ -1901,11 +1932,14 @@ class VLMWorker:
                 )
                 return False
             except VLMUnavailableError as exc:
-                self._triggers_failed += len(units)
+                # Deliberately not counted as a failure: an outage is already
+                # described by backend_unavailable and
+                # batches_dropped_unavailable. Counting it here as well made
+                # a single dead endpoint read as many unrelated faults.
                 self._note_unavailable(exc)
                 return False
             except Exception as exc:
-                self._triggers_failed += len(units)
+                self._triggers_backend_error += len(units)
                 logger.error(f"VLM batch inference failed: {exc}")
                 continue
 
@@ -1916,7 +1950,7 @@ class VLMWorker:
             per_unit_ms = batch_ms / len(units)
 
             if len(answers) != len(units):
-                self._triggers_failed += len(units)
+                self._triggers_backend_error += len(units)
                 logger.error(
                     f"VLM batch returned {len(answers)} answer(s) for "
                     f"{len(units)} question(s); discarding the group rather "

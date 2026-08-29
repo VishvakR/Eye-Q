@@ -536,6 +536,42 @@ function updateStats(status) {
     // Rules
     document.getElementById('stat-rules').textContent = status.database?.active_rules || 0;
 
+    // Memo hit rate — whether load control is actually working. Hits are
+    // counted per rule and judged subjects per subject, so this is a ratio of
+    // reuse to total demand rather than a like-for-like percentage.
+    const vlm = status.vlm || {};
+    const hits = (vlm.instances_memoised || 0) + (vlm.instances_memoised_spatial || 0);
+    const misses = (vlm.memo_miss_new_track || 0) + (vlm.memo_miss_ttl || 0)
+        + (vlm.memo_miss_moved || 0);
+    const looked = hits + misses;
+    const rate = looked ? hits / looked : 0;
+    document.getElementById('stat-memo').textContent = looked
+        ? `${(rate * 100).toFixed(0)}%` : '--';
+    document.getElementById('stat-memo-bar').style.width = `${rate * 100}%`;
+
+    // Capture-to-verdict, which is what an operator actually waits through.
+    const p95 = vlm.latency_p95_ms || 0;
+    document.getElementById('stat-latency').textContent = p95
+        ? `${(p95 / 1000).toFixed(1)}s` : '--';
+
+    // Timeouts and failures. Without these a total VLM outage looks exactly
+    // like a quiet scene: triggers simply stop incrementing, with no reason.
+    const timeouts = vlm.triggers_timed_out || 0;
+    const failures = (vlm.triggers_malformed || 0) + (vlm.triggers_frame_lost || 0)
+        + (vlm.triggers_backend_error || 0) + (vlm.triggers_internal_error || 0);
+    const timeoutEl = document.getElementById('stat-timeouts');
+    timeoutEl.textContent = timeouts;
+    timeoutEl.className = timeouts ? 'stat-value text-accent-red' : 'stat-value';
+    const failEl = document.getElementById('stat-failures');
+    failEl.textContent = failures;
+    failEl.className = failures ? 'stat-value text-accent-red' : 'stat-value';
+
+    // The one field that explains a silent dashboard.
+    const down = vlm.backend_unavailable;
+    const backendEl = document.getElementById('stat-backend');
+    backendEl.textContent = down ? 'DOWN' : (vlm.is_running ? 'OK' : 'off');
+    backendEl.className = down ? 'stat-value text-accent-red' : 'stat-value';
+
     // Device
     document.getElementById('device-badge').textContent = (status.inference_device || 'CPU').toUpperCase();
 

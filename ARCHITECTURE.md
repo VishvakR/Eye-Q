@@ -512,12 +512,22 @@ worth carrying:
   passes. This path is reached only when `vlm_square_edge=0`, so the bug was latent, but it was a
   4.5× cost sitting in the documented opt-out. Pinned by `TestTilingInvariant`.
 
-**The redundant encode — the largest remaining lever, not yet taken.** `overlap_crop_image` returns
+**The redundant encode — taken, and smaller than predicted.** `overlap_crop_image` returns
 `tiling[0] × tiling[1] + 1` crops, so `n_crops` is **never 1**. Even at tiling `(1,1)` the global
-view and its single tile are the *same* 378×378 image, encoded twice. At 1,664 ms of vision encoder
-per verdict that is roughly 800 ms of pure duplication. Collapsing it means patching around vendored
-model code and would need its own accuracy validation, so it is recorded here rather than done.
-`EVALUATION-4bit.md` reaches the same conclusion independently.
+view and its single tile come from the same `pil_img.resize((378, 378), LANCZOS)` call and are
+pixel-identical, and the encoder ran on both. `vlm_dedupe_encode` (default on) patches
+`MoondreamModel._vis_enc` as an instance attribute — the mechanism `_align_remote_code` already
+uses for two other fixes, so no vendored file is edited — encoding one row when
+`torch.equal(x[0], x[1])` holds and repeating it back, since `reconstruct_from_crops` requires
+`n_crops` rows and `.view` rejects an expanded tensor.
+
+The guard is a full tensor comparison rather than a tiling assumption, so if a future revision or
+a different `vlm_square_edge` makes the crops genuinely differ it falls through to encoding both
+rather than answering about the wrong pixels.
+
+Measured on the 29 bundled fixtures at MPS: the encode step falls from 1,874 ms to 1,491 ms (20.4%), and a full three-rule query from 2,229 ms to 1,985 ms (11%). All 87 probes came back bit-identical — zero verdict flips, max p_yes delta 0.000000, including the six probes sitting within 0.1 of the threshold. **The first estimate was ~800 ms, or 44%, and it was wrong.** Halving the batch does
+not halve the time: a batch of two costs well under twice a batch of one on a GPU saturated by
+neither. The win is real and free, but it is a fifth of the encode, not half.
 
 **Why cropping stays in Stage 2.** Moving it to Stage 1 was considered and declined. It would kill
 one real failure mode — a trigger whose frame has already been overwritten is currently lost, and a
@@ -526,6 +536,29 @@ latency change**, because the model sees identical pixels either way, and it wou
 a wire that today carries ~200 bytes of JSON: ~428 KB raw or ~25 KB as JPEG, against a 1000-deep
 high-water mark, on top of the 415 MB ring buffer. The invariant that a slow VLM must never drop a
 frame is protected by keeping that hop small.
+
+#### What a timeout actually bounds
+
+`vlm_timeout_s` bounds **the batch, not the work.** `future.result(timeout=...)` abandons the
+*caller's* wait; the inference itself keeps running on the executor's single worker, and its result
+is discarded when it finishes. The next batch may queue behind it and pay a fresh full timeout.
+
+`request_stop()` exists for this and is a **no-op on three of the four backends**, including the
+shipped default. That is not an oversight:
+
+- The dominant cost is `encode_image` — one uninterruptible sequence of torch ops, ~1,491 ms of a
+  ~1,750 ms query.
+- The default verdict path is `probe_binary`, a single prefill with **no decode loop to interrupt**.
+- `vlm_max_tokens` is 2, so even interrupting generation would save at most one token.
+- A second executor would be worse than the stall: every `query()` and `probe_binary()` writes the
+  model's shared K/V cache, and there is **no model-level lock anywhere in `vlm_backends.py`** — two
+  concurrent inferences would interleave into the same tensors and produce *silently wrong verdicts*.
+
+The only real fix is running inference in a subprocess that can be killed, which was considered and
+not taken: it costs an IPC hop per encode and a second copy of model memory. Reducing how often the
+budget is blown — see the encoder dedupe above — was preferred. `triggers_timed_out` is on
+`/api/status`; a rising value with a flat verdict rate means the appliance is spending its budget on
+work it throws away.
 
 **Judging** ([`_judge_instance`](app/pipelines/vlm_worker.py#L1236)): convert the crop once
 (BGR → RGB → PIL), append `" Answer with only Yes or No."` to the prompt, infer under the deadline,
@@ -1154,27 +1187,41 @@ names at 31 characters, so buffer ids in tests are short and time-derived.
   fixtures, Moondream answers `"Crouching"` to "is this person bending over or crouching?" on 1 of
   every 3 queries, and every one of those is filed as no-alert.
 - **`request_stop()` is a no-op** on the Moondream and HTTP backends; a timed-out inference runs to
-  completion and its result is discarded.
+  completion and its result is discarded. See "What a timeout actually bounds" — this is a property
+  of the model's API, not a missing feature, and the honest fix is a killable subprocess.
 - **No ROI editor in the UI.** `roi_json` is accepted by the API but can't be drawn from the
   dashboard.
 - **`SystemStatus` in `schemas/events.py` is dead code** — `/api/status` builds its dict by hand.
-- **Verdict accuracy has never been measured.** `bench/fixtures/labels.json` does not exist and never
-  has, so `bench/eval_accuracy.py` refuses to run — correctly; it will not invent ground truth. The
-  fixtures, the harness, the Wilson intervals and the PR curve are all in place; the only missing
-  piece is a human labelling pass, one run of `bench/label_fixtures.py` over 29 crops × 3 rules.
-  The consequence is worth stating without hedging: **`vlm_crop_padding` was raised from 0.15 to
-  0.20 without validation**, and this repo currently holds no accuracy number for any setting. Two
-  things make the pass cheaper than it looks — fixture regeneration preserves filenames and
-  `track_id`s, so one set of labels stays valid across crop-parameter changes and can measure a
-  before/after; and the harness prints its own sample-size warning, because 15 distinct subjects
-  carries roughly ±25 points at 95% confidence. A number from this footage settles a large
-  difference, not a small one.
-- **The vision encoder does redundant work on every verdict.** `overlap_crop_image` returns
-  `tiling[0] × tiling[1] + 1` crops, so `n_crops` is never 1: even on the single-tile path the global
-  view and its one tile are the same 378×378 image, encoded twice. That is roughly 800 ms of the
-  1,664 ms encoder cost, on the stage that is 88.8% of a query. See “Crop preparation and the tiling
-  threshold”. Unfixed because it means patching around vendored model code, which needs its own
-  accuracy validation — and see the gap immediately above for why that is not currently possible.
+- **Verdict accuracy is now measured once, provisionally, and the result is bad.** The first run
+  ever made on this repo — `bench/results/accuracy-moondream4bit-arm64.json`, 84 judgements over 15
+  subjects — gives **overall precision 0.14 at the shipped `vlm_probe_threshold=0.5`**:
+
+  | rule | precision | recall | TP / FP / TN / FN |
+  |---|---|---|---|
+  | `bending` | **0.20** | 1.00 | 5 / 24 / **0** / 0 |
+  | `carrying` | 0.17 | 1.00 | 1 / 9 / 17 / 0 |
+  | `ppe` | 1.00 | 1.00 | 2 / 0 / 26 / 0 |
+
+  **`bending` answers "yes" to all 29 crops** — a true-negative count of zero — with p(yes) above
+  0.9 for people standing upright at a bench. It is not discriminating at all, and it is the rule
+  `demo_cctv.py` enables and describes as "the rule that puts red on the dashboard". `ppe` is the
+  only rule that works. The PR curve puts best F1 at threshold **0.95**, not 0.5.
+
+  Three caveats, all load-bearing. **The labels are machine-generated** (`_provenance` in
+  `labels.json`), so this measures agreement between two models, not correctness — a human pass with
+  `bench/label_fixtures.py` should overwrite it. **The class balance is too thin for two of the three
+  rules**: `ppe` has 2 positives and `carrying` has 1, so their recall can take only a few discrete
+  values and their intervals span most of [0, 1]. And 15 subjects carries roughly ±25 points at 95%
+  confidence, so this settles a large difference and not a small one. What survives all three
+  caveats is `bending`'s 24 false positives against 0 true negatives: that is not a labelling
+  disagreement, it is a rule that does not work.
+
+- **The size floor, the padding change and cross-identity reuse remain unvalidated.** All three can
+  only lose recall, and none has been measured against the floor-64 alternative or against human
+  labels.
+- ~~The vision encoder does redundant work on every verdict.~~ **Fixed** by `vlm_dedupe_encode`
+  — see “Crop preparation and the tiling threshold”. Worth recording that the estimate was 44% and
+  the measured result is 20% of the encode step and 11% of a three-rule query.
 - **Two feature branches are unmerged.** `feat/stage1-load-shedding` (Stage 1 size floor and
   co-occurrence gating) and `feat/crop-retune` (stacked on it) carry the behaviour this document
   describes. `main` does not. Anyone reading `main` is not looking at this code.

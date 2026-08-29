@@ -55,10 +55,28 @@ _BACK = {ord("b")}
 
 
 def load_labels(path: Path) -> dict[str, str]:
-    """Existing labels, keyed ``"<crop>|<rule>"``. Missing file is empty."""
+    """Existing labels, keyed ``"<crop>|<rule>"``. Missing file is empty.
+
+    Keys beginning with ``_`` are metadata, not judgements, and are skipped —
+    see :func:`load_provenance`. Without this a provenance block would be
+    counted as a labelled crop and quietly corrupt every denominator.
+    """
     if not path.exists():
         return {}
-    return json.loads(path.read_text())
+    raw = json.loads(path.read_text())
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
+def load_provenance(path: Path) -> dict | None:
+    """Who produced these labels, if the file says.
+
+    Exists so a number can never be quoted without its caveat travelling
+    alongside it. A file with no provenance predates this and is treated as
+    unknown rather than as trusted.
+    """
+    if not path.exists():
+        return None
+    return json.loads(path.read_text()).get("_provenance")
 
 
 def save_labels(path: Path, labels: dict[str, str]) -> None:

@@ -905,6 +905,37 @@ def create_app() -> FastAPI:
                 # Raw triggers off the wire, before coalescing. Populated since
                 # the worker was written and never returned until now.
                 "triggers_received": vlm_stats.triggers_received if vlm_stats else 0,
+                # Inferences that blew vlm_timeout_s. Note what this does NOT
+                # mean on the default backend: the batch is abandoned, but the
+                # wedged inference runs to completion on the executor's single
+                # worker and the next batch may queue behind it.
+                "triggers_timed_out": (
+                    vlm_stats.triggers_timed_out if vlm_stats else 0
+                ),
+                # Kept at zero and reported so old dashboards do not break. It
+                # was ten unrelated causes under one name; read the four below.
+                "triggers_failed": vlm_stats.triggers_failed if vlm_stats else 0,
+                # Stage 1 published something that will not parse — schema
+                # drift, or a foreign publisher on the detection endpoint.
+                "triggers_malformed": (
+                    vlm_stats.triggers_malformed if vlm_stats else 0
+                ),
+                # The source frame was overwritten before Stage 2 reached it.
+                # A CAPACITY signal, not an error: raise buffer_capacity or
+                # reduce VLM latency. Previously indistinguishable from a crash.
+                "triggers_frame_lost": (
+                    vlm_stats.triggers_frame_lost if vlm_stats else 0
+                ),
+                # The model call raised, or answered a different number of
+                # questions than it was asked. Check device, dtype, memory.
+                "triggers_backend_error": (
+                    vlm_stats.triggers_backend_error if vlm_stats else 0
+                ),
+                # A bug in Eye-Q. Both sites log a traceback. The only one of
+                # these five that should wake a developer.
+                "triggers_internal_error": (
+                    vlm_stats.triggers_internal_error if vlm_stats else 0
+                ),
                 "instances_shed": vlm_stats.instances_shed if vlm_stats else 0,
                 "instances_too_small": (
                     vlm_stats.instances_too_small if vlm_stats else 0

@@ -778,7 +778,68 @@ class _TraceHolder:
         self.last_trace = _InferenceTrace()
 
 
-def _align_remote_code(model, compute_dtype) -> None:
+def _dedupe_vision_encoder(model) -> None:
+    """Stop the vision tower encoding the same image twice per query.
+
+    ``overlap_crop_image`` returns ``tiling[0] * tiling[1] + 1`` crops — a
+    global view plus one per tile — so it never returns fewer than two. At
+    tiling ``(1, 1)``, which is what production *always* hits because
+    ``prepare_vlm_crop`` letterboxes every crop to 378 and ``select_tiling``
+    short-circuits on ``height <= crop_size or width <= crop_size``, the global
+    view and the single tile come out of the *same*
+    ``pil_img.resize((378, 378), LANCZOS)`` call. They are pixel-identical, and
+    the encoder runs on both.
+
+    Measured on the 29 bundled fixtures at MPS: the encode step falls from
+    1,874 ms to 1,491 ms (20.4%), and a full three-rule query from 2,229 ms to
+    1,985 ms (11%), all 87 probes bit-identical. The arithmetic does NOT
+    predict this — halving the batch does not halve the time, because a batch
+    of two costs well under twice a batch of one.
+
+    The guard is ``torch.equal`` rather than a tiling check, deliberately. It
+    makes the optimisation self-verifying: if a future revision, a different
+    ``vlm_square_edge``, or a non-square input ever makes the crops genuinely
+    differ, this falls through to the original call instead of returning an
+    embedding for the wrong pixels. A full-tensor comparison of 428k elements
+    costs microseconds against the ~380 ms it protects.
+
+    Two constraints on the return value, both discovered the hard way by
+    reading the remote code rather than by running it:
+
+    - **It must be ``n_crops`` rows, not one.** ``_run_vision_encoder`` slices
+      ``outputs[1:]`` and ``reconstruct_from_crops`` then indexes ``crops[0]``,
+      so a single-row return makes that empty and raises.
+    - **It must be ``.repeat``, not ``.expand``.** The caller does
+      ``outputs[1:].view(...)``, and ``.view`` on a stride-0 expanded tensor
+      raises. The copy is 729x1152 and irrelevant beside what it saves.
+
+    Patched as an instance attribute, which is how upstream itself rebinds this
+    method (``self._vis_enc = torch.compile(self._vis_enc, ...)``). This project
+    never calls ``compile()``, so nothing competes for the slot.
+    """
+    import torch  # deferred, like every other torch use in this module
+
+    inner = getattr(model, "model", None)
+    if inner is None or not hasattr(inner, "_vis_enc"):
+        logger.warning(
+            "Vision-encoder dedupe skipped: no _vis_enc to patch. The model's "
+            "remote code has changed shape; every query will encode its crop "
+            "twice, which is correct but twice the necessary cost."
+        )
+        return
+
+    original_vis_enc = inner._vis_enc
+
+    def _vis_enc(x):
+        if x.shape[0] == 2 and torch.equal(x[0], x[1]):
+            return original_vis_enc(x[:1]).repeat(2, 1, 1)
+        return original_vis_enc(x)
+
+    inner._vis_enc = _vis_enc
+    logger.info("Vision-encoder dedupe active: identical crops encode once.")
+
+
+def _align_remote_code(model, compute_dtype, dedupe_encode: bool = True) -> None:
     """Reconcile two things the remote code hardcodes with where it is running.
 
     **The pooling shim targets MPS by machine, not by model.** ``vision.py``
@@ -844,6 +905,9 @@ def _align_remote_code(model, compute_dtype) -> None:
     moondream.prepare_crops = prepare_crops
     vision.prepare_crops = prepare_crops
 
+    if dedupe_encode:
+        _dedupe_vision_encoder(model)
+
     # Must precede _setup_caches(): the KV caches take their dtype from
     # ``self.vision.pos_emb.dtype``, so allocating them first would pin the
     # checkpoint's bf16 for the rest of the session.
@@ -881,8 +945,10 @@ class Moondream4BitBackend:
         max_new_tokens: int = 2,
         probe_threshold: float = 0.5,
         compute_dtype: str | None = None,
+        dedupe_encode: bool = True,
     ) -> None:
         self._device = device
+        self._dedupe_encode = dedupe_encode
         self._model_id = model_id
         self._revision = revision
         self._cache_dir = cache_dir
@@ -959,7 +1025,7 @@ class Moondream4BitBackend:
             cache_dir=self._cache_dir,
         )
         patched = _patch_quantized_linear(self._model, compute_dtype, use_int4)
-        _align_remote_code(self._model, compute_dtype)
+        _align_remote_code(self._model, compute_dtype, self._dedupe_encode)
         self._is_int4 = use_int4
         logger.info(
             f"Unpacked {patched} quantized layers to {compute_dtype} "
@@ -2052,4 +2118,5 @@ def build_backend(settings: Settings) -> VLMBackend:
         max_new_tokens=settings.vlm_max_tokens,
         probe_threshold=settings.vlm_probe_threshold,
         compute_dtype=settings.vlm_compute_dtype or None,
+        dedupe_encode=settings.vlm_dedupe_encode,
     )

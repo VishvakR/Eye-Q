@@ -507,15 +507,44 @@ class Settings(BaseSettings):
             "Raised from 24 to 96 to discard crops no model can solve — but "
             "note what it trades: a skipped subject is never judged at all, so "
             "this buys precision with recall. It is also measured in "
-            "*captured* pixels, so it interacts with frame resolution: over "
-            "cctv_demo.mp4 a floor of 96 skips 6.5% of detections at 1920x1080 "
-            "but 38.7% at the 960x540 .env.pi5 profile, where 64 is the right "
-            "value. Watch instances_too_small on /api/status after changing "
-            "it; if it swallows most detections at your camera distance, lower "
-            "it rather than accepting the blind spot."
+            "*captured* pixels, so it interacts with frame resolution more "
+            "sharply than it looks. Measured over cctv_demo.mp4, a floor of 96 "
+            "skips 8.9% of person detections at 1920x1080 — but 24.1% at "
+            "1280x720, which is what demo_cctv.py actually captures, and 38.7% "
+            "at the 960x540 .env.pi5 profile, where 64 is the right value. "
+            "An earlier version of this note claimed 6.5% and quoted only the "
+            "1080p figure; the shipped demo runs at 720p and therefore "
+            "discards roughly a quarter of the people it detects. Recompute "
+            "for your own resolution rather than inheriting a number measured "
+            "at someone else's. "
+            "Watch watchdog.detections_filtered_size on /api/status after "
+            "changing it (NOT vlm.instances_too_small, which correctly reads "
+            "zero because Stage 1 sheds first); if it swallows most detections "
+            "at your camera distance, lower it rather than accepting the blind "
+            "spot."
         ),
     )
 
+    vlm_dedupe_encode: bool = Field(
+        default=True,
+        description=(
+            "Encode a crop once when Moondream's preprocessor hands the vision "
+            "tower the same image twice.\n\n"
+            "overlap_crop_image returns tiling[0]*tiling[1] + 1 crops — a "
+            "global view plus one per tile — so it never returns fewer than "
+            "two. At tiling (1,1), which production always hits because every "
+            "crop is letterboxed to vlm_square_edge, the global view and the "
+            "single tile come from the same LANCZOS resize and are "
+            "pixel-identical. The encoder ran on both: roughly 832ms of a "
+            "1,873ms query, on the stage that is 88.8% of Stage 2's cost.\n\n"
+            "Guarded by a full torch.equal comparison rather than a tiling "
+            "assumption, so if the crops ever genuinely differ it falls back "
+            "to encoding both rather than answering about the wrong pixels. "
+            "Set false to disable if you suspect the dedupe is changing "
+            "verdicts — batch-1 and batch-2 GEMM kernels can differ in the "
+            "last bits, and vlm_probe_threshold is a hard cut at 0.5."
+        ),
+    )
     vlm_square_edge: int = Field(
         default=378,
         ge=0,
