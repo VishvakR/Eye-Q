@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS rules (
     roi_json    TEXT    NOT NULL DEFAULT '[]',
     confidence  REAL    NOT NULL DEFAULT 0.25,
     cooldown_s  REAL    NOT NULL DEFAULT 5.0,
+    pair_label  TEXT    NOT NULL DEFAULT '',
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -60,7 +61,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     inference_ms    REAL    NOT NULL,
     bbox_json       TEXT    NOT NULL,
     frame_snapshot  TEXT,
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    track_id        INTEGER NOT NULL DEFAULT -1,
+    label           TEXT    NOT NULL DEFAULT '',
+    confidence      REAL
 );
 
 -- Cameras: Registered video sources
@@ -77,8 +81,36 @@ CREATE TABLE IF NOT EXISTS cameras (
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_alerts_rule_id ON alerts(rule_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC);
+-- History filtered by rule, newest first, without sorting every row the rule
+-- ever produced.
+CREATE INDEX IF NOT EXISTS idx_alerts_rule_id_id ON alerts(rule_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_rules_camera_id ON rules(camera_id);
 """
+
+# Columns added to `alerts` after the first release. `CREATE TABLE IF NOT EXISTS`
+# is a no-op on an existing database, so a deployed appliance would never see
+# them without an explicit ALTER. SQLite allows ADD COLUMN with NOT NULL as long
+# as the DEFAULT is a constant, which is why both defaults are literals.
+_ALERT_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("track_id", "INTEGER NOT NULL DEFAULT -1"),
+    ("label", "TEXT NOT NULL DEFAULT ''"),
+    # Nullable on purpose. Only the probe path produces a confidence; a verdict
+    # generated as text and parsed carries no strength, and NULL says that
+    # honestly where 0.0 would read as "the model was certain it was not a
+    # violation". Without this column the number is computed on every probed
+    # verdict and then discarded, which makes it impossible to ask what a
+    # different vlm_probe_threshold would have done to alerts already filed.
+    ("confidence", "REAL"),
+)
+
+# Columns added to `rules` after the first release, same reasoning as above.
+_RULE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    # Stage 1 co-occurrence gating: the rule only fires when its target label
+    # has a box overlapping one of this label. Empty — the default — means no
+    # pair requirement, which is every rule written before this existed, so an
+    # upgraded appliance keeps behaving exactly as it did.
+    ("pair_label", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 class Database:
@@ -115,15 +147,50 @@ class Database:
         # Enable WAL mode for concurrent reads
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA foreign_keys=ON")
+        # Every verdict is its own commit, so FULL paid an fsync per verdict.
+        # Under WAL, NORMAL is still crash-consistent — a power cut can lose
+        # the last few commits, never corrupt the file — which is the right
+        # trade for an alert log whose newest row is also on the WebSocket.
+        await db.execute("PRAGMA synchronous=NORMAL")
+        # A second connection (a backup, a sqlite3 shell) waits briefly for
+        # the write lock instead of failing the insert outright.
+        await db.execute("PRAGMA busy_timeout=5000")
 
         logger.info(f"Database connected: {db_path}")
         return cls(db, db_path)
 
     async def initialize_tables(self) -> None:
-        """Create tables and indexes if they don't exist."""
+        """Create tables and indexes if they don't exist, then migrate."""
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
+        await self._migrate("alerts", _ALERT_MIGRATIONS)
+        await self._migrate("rules", _RULE_MIGRATIONS)
         logger.info("Database tables initialized.")
+
+    async def _migrate(
+        self, table: str, migrations: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Add any columns missing from an older database.
+
+        Idempotent: on a fresh database ``SCHEMA_SQL`` already created every
+        column and this does nothing. On an appliance upgraded in place it adds
+        only what is absent, leaving existing rows intact with their defaults.
+
+        The table name is interpolated rather than bound because SQLite cannot
+        parameterise identifiers; both call sites pass module constants, never
+        anything reaching the request path.
+        """
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
+        existing = {row["name"] for row in await cursor.fetchall()}
+
+        added = [name for name, _ddl in migrations if name not in existing]
+        for name, ddl in migrations:
+            if name not in existing:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+        if added:
+            await self._db.commit()
+            logger.info(f"Migrated {table} table: added {', '.join(added)}.")
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -196,16 +263,23 @@ class Database:
         confidence: float = 0.25,
         cooldown_s: float = 5.0,
         enabled: bool = True,
+        pair_label: str = "",
     ) -> int:
         """Create a new alert rule.
+
+        Args:
+            pair_label: Require this COCO class to have an overlapping box
+                before the rule's target labels trigger — "cell phone" to ask
+                only about people actually holding one. Empty disables the
+                requirement. See ``sync_rules`` for when it cannot be enforced.
 
         Returns:
             The auto-generated rule ID.
         """
         cursor = await self._db.execute(
             """INSERT INTO rules (camera_id, name, prompt, target_labels, roi_json,
-                                  confidence, cooldown_s, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  confidence, cooldown_s, enabled, pair_label)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 camera_id,
                 name,
@@ -215,6 +289,7 @@ class Database:
                 confidence,
                 cooldown_s,
                 1 if enabled else 0,
+                pair_label,
             ),
         )
         await self._db.commit()
@@ -268,7 +343,20 @@ class Database:
         return await self.get_rule(rule_id)
 
     async def delete_rule(self, rule_id: int) -> bool:
-        """Delete a rule by ID. Returns True if deleted."""
+        """Delete a rule by ID, keeping its alert history. Returns True if deleted.
+
+        Same as :meth:`delete_all_rules`: the alerts are reassigned to the
+        sentinel rule first, because ``ON DELETE CASCADE`` would otherwise erase
+        the rule's whole evidence log — while clearing *every* rule preserved
+        it, which made deleting one rule the more destructive action.
+        """
+        if rule_id == DEFAULT_RULE_ID:
+            return False
+
+        await self.ensure_default_rule()
+        await self._db.execute(
+            "UPDATE alerts SET rule_id = ? WHERE rule_id = ?", (DEFAULT_RULE_ID, rule_id)
+        )
         cursor = await self._db.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
         await self._db.commit()
         deleted = cursor.rowcount > 0
@@ -288,12 +376,64 @@ class Database:
         inference_ms: float,
         bbox_json: dict,
         frame_snapshot: str | None = None,
+        track_id: int = -1,
+        label: str = "",
+        confidence: float | None = None,
     ) -> int:
-        """Record a VLM verdict as an alert."""
+        """Record a VLM verdict as an alert and return its id.
+
+        See :meth:`record_alert`, which this wraps.
+        """
+        row = await self.record_alert(
+            rule_id=rule_id,
+            camera_id=camera_id,
+            timestamp=timestamp,
+            verdict=verdict,
+            raw_response=raw_response,
+            inference_ms=inference_ms,
+            bbox_json=bbox_json,
+            frame_snapshot=frame_snapshot,
+            track_id=track_id,
+            label=label,
+            confidence=confidence,
+        )
+        return row["id"]
+
+    async def record_alert(
+        self,
+        rule_id: int,
+        camera_id: str,
+        timestamp: float,
+        verdict: bool,
+        raw_response: str,
+        inference_ms: float,
+        bbox_json: dict,
+        frame_snapshot: str | None = None,
+        track_id: int = -1,
+        label: str = "",
+        confidence: float | None = None,
+    ) -> dict:
+        """Record a VLM verdict as an alert and return the stored row.
+
+        ``RETURNING *`` hands back exactly what was written — including the
+        database-side ``created_at`` default — in the same statement, so the
+        alert sink no longer re-reads a row it inserted a moment earlier.
+
+        ``track_id`` distinguishes alerts raised about different subjects in the
+        same frame; ``label`` is stored rather than re-attached in memory so it
+        survives into history reads, not just live broadcasts.
+
+        ``confidence`` is the VLM's own p(yes) from the probe path, **not** the
+        detector's box score. It is ``None`` when the verdict came from
+        generate-and-parse, which produces no strength. Storing it is what
+        makes a threshold question answerable against alerts already filed.
+        """
         cursor = await self._db.execute(
             """INSERT INTO alerts (rule_id, camera_id, timestamp, verdict,
-                                   raw_response, inference_ms, bbox_json, frame_snapshot)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   raw_response, inference_ms, bbox_json, frame_snapshot,
+                                   track_id, label, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING *""",
             (
                 rule_id,
                 camera_id,
@@ -303,10 +443,14 @@ class Database:
                 inference_ms,
                 json.dumps(bbox_json),
                 frame_snapshot,
+                track_id,
+                label,
+                confidence,
             ),
         )
+        row = await cursor.fetchone()
         await self._db.commit()
-        return cursor.lastrowid
+        return dict(row)
 
     async def get_alert(self, alert_id: int) -> dict | None:
         """Get a single alert by ID."""
@@ -326,17 +470,27 @@ class Database:
         params: list = []
 
         if rule_id is not None:
-            conditions.append("rule_id = ?")
+            conditions.append("a.rule_id = ?")
             params.append(rule_id)
         if verdict is not None:
-            conditions.append("verdict = ?")
+            conditions.append("a.verdict = ?")
             params.append(1 if verdict else 0)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.extend([limit, offset])
 
+        # Ordered by id, not created_at: created_at has one-second resolution
+        # and several verdicts land in the same second, so ties made the order
+        # across LIMIT/OFFSET pages undefined and pages repeated or skipped
+        # rows. ids are monotonic with insertion, which is the order wanted.
+        #
+        # rule_name is joined in so history renders the way live alerts do —
+        # the sink attaches it to broadcasts, and history cards otherwise fell
+        # back to "Rule #N".
         cursor = await self._db.execute(
-            f"SELECT * FROM alerts {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"""SELECT a.*, r.name AS rule_name
+                FROM alerts a LEFT JOIN rules r ON r.id = a.rule_id
+                {where} ORDER BY a.id DESC LIMIT ? OFFSET ?""",
             params,
         )
         rows = await cursor.fetchall()
@@ -401,9 +555,14 @@ class Database:
             return row[0] if row else 0
 
         rules_count = await _scalar("SELECT COUNT(*) FROM rules WHERE enabled = 1")
-        alerts_count = await _scalar("SELECT COUNT(*) FROM alerts")
-        violations_count = await _scalar("SELECT COUNT(*) FROM alerts WHERE verdict = 1")
         cameras_count = await _scalar("SELECT COUNT(*) FROM cameras WHERE enabled = 1")
+        # One pass over alerts, the table that grows without bound, rather
+        # than two. The dashboard polls this every few seconds.
+        cursor = await self._db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(verdict), 0) FROM alerts"
+        )
+        row = await cursor.fetchone()
+        alerts_count, violations_count = (row[0], row[1]) if row else (0, 0)
 
         return {
             "active_rules": rules_count,

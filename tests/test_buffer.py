@@ -197,6 +197,79 @@ class TestTimestampLookup:
         assert result is None
 
 
+class TestTornReads:
+    """A slot overwritten during a read must never be returned as that frame."""
+
+    class _OverwritingFrames:
+        """Stands in for the pixel array: rewrites the slot as it is copied."""
+
+        def __init__(self, buffer: RollingFrameBuffer, new_ts: float) -> None:
+            self._buffer = buffer
+            self._frames = buffer._frames
+            self._new_ts = new_ts
+
+        def __getitem__(self, idx):
+            slot = self._frames[idx]
+            buffer, new_ts = self._buffer, self._new_ts
+
+            class _Slot:
+                def copy(self):
+                    pixels = slot.copy()
+                    buffer._timestamps[idx] = new_ts  # the writer got there first
+                    return pixels
+
+            return _Slot()
+
+    def test_read_by_timestamp_discards_a_slot_rewritten_mid_copy(
+        self, small_buffer: RollingFrameBuffer
+    ):
+        for i in range(3):
+            small_buffer.write(_make_frame(fill=i), timestamp=100.0 + i)
+        real_frames = small_buffer._frames
+        small_buffer._frames = self._OverwritingFrames(small_buffer, new_ts=500.0)
+        try:
+            assert small_buffer.read_by_timestamp(100.0, tolerance_ms=1.0) is None
+        finally:
+            small_buffer._frames = real_frames
+
+    def test_read_by_timestamp_discards_a_slot_whose_write_is_in_progress(
+        self, small_buffer: RollingFrameBuffer
+    ):
+        small_buffer.write(_make_frame(fill=7), timestamp=100.0)
+        real_frames = small_buffer._frames
+        # The writer zeroes the timestamp before touching pixels.
+        small_buffer._frames = self._OverwritingFrames(small_buffer, new_ts=0.0)
+        try:
+            assert small_buffer.read_by_timestamp(100.0, tolerance_ms=1.0) is None
+        finally:
+            small_buffer._frames = real_frames
+
+    def test_read_at_index_reports_a_rewritten_slot_as_unwritten(
+        self, small_buffer: RollingFrameBuffer
+    ):
+        small_buffer.write(_make_frame(fill=7), timestamp=100.0)
+        real_frames = small_buffer._frames
+        small_buffer._frames = self._OverwritingFrames(small_buffer, new_ts=200.0)
+        try:
+            _frame, ts = small_buffer.read_at_index(0)
+        finally:
+            small_buffer._frames = real_frames
+        assert ts == 0.0
+
+    def test_latest_timestamp_reads_without_copying(self, small_buffer: RollingFrameBuffer):
+        assert small_buffer.latest_timestamp() is None
+        small_buffer.write(_make_frame(fill=1), timestamp=100.0)
+        small_buffer.write(_make_frame(fill=2), timestamp=101.0)
+        assert small_buffer.latest_timestamp() == 101.0
+
+    def test_mismatched_frame_is_resized_into_the_slot(self, small_buffer: RollingFrameBuffer):
+        small_buffer.write(_make_frame(height=128, width=96, fill=42), timestamp=1.0)
+        frame, ts, _idx = small_buffer.read_latest()
+        assert frame.shape == (64, 64, 3)
+        assert int(frame[10, 10, 0]) == 42
+        assert ts == 1.0
+
+
 # ── Index-Based Access ───────────────────────────────────────────
 
 class TestIndexAccess:

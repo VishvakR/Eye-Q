@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -25,13 +26,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import CameraCreate, RuleCreate, RuleUpdate, ws_manager
-from app.core.database import Database
+from app.core.database import DEFAULT_RULE_ID, Database
+from app.core.labels import COCO_CLASSES, labels_in_prompt, scope_warning
 from app.core.roi import RegionOfInterest
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,43 @@ DEFAULT_CAMERA_ID = "default"
 
 
 # ── Rule Synchronisation ─────────────────────────────────────────
+
+
+def _refuse_sentinel(rule_id: int) -> None:
+    """Keep the API's hands off the sentinel rule that orphaned alerts live under.
+
+    Deleting it cascaded that whole history away and left the alert sink
+    failing its foreign key on every later orphan; enabling it made a rule with
+    no labels, so every COCO class woke the VLM with the fallback prompt.
+    """
+    if rule_id == DEFAULT_RULE_ID:
+        raise HTTPException(403, "Rule 0 is the built-in sentinel rule and cannot be changed.")
+
+
+def _rule_warning(prompt: str, target_labels: list[str], pair_label: str) -> str | None:
+    """Everything worth telling an operator about a rule they just saved.
+
+    Unknown labels are warned about, not refused: a custom YOLO model can
+    legitimately score classes COCO does not have. But against the stock model
+    a typo such as "persons" narrows Stage 1 to a class that never fires, and
+    the rule goes silently blind.
+    """
+    warnings = []
+    scope = scope_warning(prompt, target_labels)
+    if scope:
+        warnings.append(scope)
+
+    known = set(COCO_CLASSES)
+    unknown = [label for label in [*target_labels, pair_label] if label and label not in known]
+    if unknown:
+        names = ", ".join(f"'{label}'" for label in unknown)
+        warnings.append(
+            f"{names} is not a class the stock YOLO model detects, so this rule "
+            f"will never trigger on it unless a custom model provides it."
+        )
+
+    return " ".join(warnings) or None
+
 
 
 def _parse_labels(rule: dict) -> list[str]:
@@ -82,6 +122,14 @@ async def sync_rules(app_obj: FastAPI) -> None:
     confidence, minimum cooldown) so it never filters out something a rule
     still wants. Stage 2 then applies each rule's own prompt and ROI, since a
     single watchdog cannot carry N distinct polygons.
+
+    Co-occurrence requirements compose under that same rule, which has a
+    consequence worth knowing: a pair requirement is a *narrowing*, and there
+    is no coarsest narrowing. One plain "person" rule alongside one
+    "person + cell phone" rule means the only composition that keeps the plain
+    rule firing is no gate at all, so the pair requirement is dropped and every
+    person still wakes the VLM. That is correct but invisible, so the drop is
+    logged as a warning naming the rule responsible.
     """
     db: Database = app_obj.state.db
     rules = [r for r in await db.list_rules() if r["enabled"]]
@@ -89,17 +137,22 @@ async def sync_rules(app_obj: FastAPI) -> None:
     # ── Stage 2: per-rule prompts and ROIs ───────────────────────
     vlm_worker = getattr(app_obj.state, "vlm_worker", None)
     if vlm_worker is not None:
-        vlm_worker.clear_rules()
+        # One atomic swap. Clearing and re-adding rule by rule left a window in
+        # which Stage 2 saw no rules at all and dropped subjects silently.
+        registrations = []
         for rule in rules:
             roi = _parse_roi(rule)
             for label in _parse_labels(rule) or ["*"]:
-                vlm_worker.add_rule(
-                    label=label,
-                    prompt=rule["prompt"],
-                    rule_id=rule["id"],
-                    rule_name=rule["name"],
-                    roi=roi,
+                registrations.append(
+                    {
+                        "label": label,
+                        "prompt": rule["prompt"],
+                        "rule_id": rule["id"],
+                        "rule_name": rule["name"],
+                        "roi": roi,
+                    }
                 )
+        vlm_worker.replace_rules(registrations)
 
     # ── Stage 1: coarsest filter that satisfies every rule ───────
     watchdog = getattr(app_obj.state, "watchdog", None)
@@ -137,6 +190,52 @@ async def sync_rules(app_obj: FastAPI) -> None:
         min((r["cooldown_s"] for r in rules), default=settings.detection_cooldown_s)
     )
 
+    # ── Co-occurrence requirements ───────────────────────────────
+    # Composed under the same "never filter out something a rule still wants"
+    # rule that governs labels above. A label carries a pair requirement only
+    # if *every* enabled rule targeting it asks for one; a single unpaired rule
+    # on that label drops the gate, because enforcing it would silently blind
+    # that rule. Paying in wasted inference is recoverable, missing the event
+    # the appliance exists to catch is not.
+    pair_req: dict[str, set[str]] = {}
+    unpaired: dict[str, str] = {}
+    paired_by: dict[str, str] = {}
+    wildcard_rule: str | None = None
+
+    for rule in rules:
+        labels = _parse_labels(rule)
+        pair = (rule.get("pair_label") or "").strip()
+        if not labels:
+            # A rule with no label filter must see everything, so it suppresses
+            # every gate for the same reason it forces the label scope open.
+            wildcard_rule = wildcard_rule or rule["name"]
+            continue
+        for label in labels:
+            if pair:
+                pair_req.setdefault(label, set()).add(pair)
+                paired_by.setdefault(label, rule["name"])
+            else:
+                unpaired.setdefault(label, rule["name"])
+
+    if wildcard_rule is not None and pair_req:
+        logger.warning(
+            f"Rule '{wildcard_rule}' has no label filter, so it must see every "
+            f"detection — the pair requirement(s) on {sorted(pair_req)} cannot "
+            f"be enforced at Stage 1 and every detection will still wake the VLM."
+        )
+        pair_req.clear()
+
+    for label in sorted(set(unpaired) & set(pair_req)):
+        partners = " or ".join(sorted(pair_req[label]))
+        logger.warning(
+            f"Rule '{unpaired[label]}' targets '{label}' with no pair_label, so "
+            f"the '{label} + {partners}' gate on rule '{paired_by[label]}' cannot "
+            f"be enforced at Stage 1 — every {label} will still wake the VLM."
+        )
+        pair_req.pop(label)
+
+    watchdog.update_pair_requirements(pair_req or None)
+
     if scope is None:
         scope_desc = "all"
     elif scope:
@@ -144,7 +243,15 @@ async def sync_rules(app_obj: FastAPI) -> None:
     else:
         scope_desc = "none — Stage 2 idle until a rule is enabled"
 
-    logger.info(f"Synced {len(rules)} enabled rule(s) to the pipeline (triggers on: {scope_desc}).")
+    pair_desc = (
+        "; pairs: " + ", ".join(f"{k}+{'/'.join(sorted(v))}" for k, v in sorted(pair_req.items()))
+        if pair_req
+        else ""
+    )
+    logger.info(
+        f"Synced {len(rules)} enabled rule(s) to the pipeline "
+        f"(triggers on: {scope_desc}{pair_desc})."
+    )
 
 
 # ── Lifespan ─────────────────────────────────────────────────────
@@ -168,37 +275,70 @@ async def lifespan(app: FastAPI):
 
     # ── Database ─────────────────────────────────────────────────
     db = await Database.create(settings.database_path)
-    await db.initialize_tables()
     app.state.db = db
 
-    if settings.enable_pipeline:
-        await _start_pipeline(app, settings, db)
+    try:
+        await db.initialize_tables()
 
-    # Rules must reach the workers before the first frame is judged.
-    await sync_rules(app)
+        if settings.enable_pipeline:
+            await _start_pipeline(app, settings, db)
+
+        # Rules must reach the workers before the first frame is judged.
+        await sync_rules(app)
+    except BaseException:
+        # Nothing after `yield` runs when startup raises, so a model that
+        # failed to load used to leave the capture thread running, the shared
+        # memory mapped, and the database open.
+        logger.error("Eye-Q startup failed; stopping what had already started.")
+        await _shutdown_components(app)
+        raise
 
     logger.info("Eye-Q control plane ready.")
 
     yield
 
-    # ── Shutdown (reverse order) ─────────────────────────────────
+    await _shutdown_components(app)
+
+
+async def _shutdown_components(app: FastAPI) -> None:
+    """Stop every component that was started, in reverse order.
+
+    Safe on a partial startup: each component is checked before it is stopped.
+    The thread joins run off the event loop — they can take the watchdog's and
+    the worker's whole timeouts, and the loop is what keeps the rest of
+    shutdown moving.
+    """
     logger.info("Shutting down Eye-Q components...")
+    state = app.state
 
-    if app.state.alert_sink is not None:
-        await app.state.alert_sink.stop()
-    if app.state.vlm_worker is not None:
-        app.state.vlm_worker.stop()
-    if app.state.watchdog is not None:
-        app.state.watchdog.stop()
-    for capture in app.state.captures:
-        capture.stop()
-    if app.state.publisher is not None:
-        app.state.publisher.close()
-    if app.state.buffer is not None:
-        app.state.buffer.close()
-        app.state.buffer.unlink()
+    preview = getattr(state, "preview", None)
+    if preview is not None:
+        preview.close()
 
-    await db.close()
+    if getattr(state, "alert_sink", None) is not None:
+        await state.alert_sink.stop()
+    if getattr(state, "vlm_worker", None) is not None:
+        await asyncio.to_thread(state.vlm_worker.stop)
+    if getattr(state, "watchdog", None) is not None:
+        await asyncio.to_thread(state.watchdog.stop)
+    for capture in getattr(state, "captures", []):
+        await asyncio.to_thread(capture.stop)
+    if getattr(state, "publisher", None) is not None:
+        watchdog = getattr(state, "watchdog", None)
+        if watchdog is not None and watchdog.is_running:
+            # ZMQ sockets are not thread-safe: closing this one under a
+            # watchdog still mid-publish risks a libzmq assert. The process is
+            # exiting, so leaving it to the OS is the safe choice.
+            logger.warning("YOLOWatchdog still running; leaving its publisher open.")
+        else:
+            state.publisher.close()
+    if getattr(state, "buffer", None) is not None:
+        state.buffer.close()
+        state.buffer.unlink()
+
+    db = getattr(state, "db", None)
+    if db is not None:
+        await db.close()
     logger.info("Eye-Q shut down cleanly.")
 
 
@@ -260,6 +400,17 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
         imgsz=settings.yolo_imgsz,
         cooldown_seconds=settings.detection_cooldown_s,
         camera_id=DEFAULT_CAMERA_ID,
+        target_fps=settings.watchdog_fps,
+        track_enabled=settings.track_enabled,
+        track_iou_threshold=settings.track_iou_threshold,
+        track_max_age_frames=settings.track_max_age_frames,
+        # The same floor Stage 2 applies, moved to where it is cheapest. One
+        # setting for both stages on purpose: they call the same
+        # BoundingBox.pixel_size on the same fixed-shape ring buffer, so the
+        # predicate cannot drift. Expect vlm.instances_too_small to read zero
+        # from here on — that is Stage 1 shedding first, not a broken counter.
+        min_subject_px=settings.vlm_min_subject_px,
+        pair_overlap=settings.yolo_pair_overlap,
     )
     watchdog.start()
     app.state.watchdog = watchdog
@@ -278,6 +429,19 @@ async def _start_pipeline(app: FastAPI, settings, db: Database) -> None:
             inference_timeout_s=settings.vlm_timeout_s,
             snapshot_dir=settings.snapshot_dir,
             default_prompt=settings.vlm_default_prompt,
+            focus_dim=settings.vlm_focus_dim,
+            verdict_ttl_s=settings.vlm_verdict_ttl_s,
+            rejudge_iou=settings.vlm_rejudge_iou,
+            min_rejudge_s=settings.vlm_min_rejudge_s,
+            crossid_reuse_s=settings.vlm_crossid_reuse_s,
+            crossid_iou=settings.vlm_crossid_iou,
+            max_instances_per_batch=settings.vlm_max_instances_per_batch,
+            max_crop_edge=settings.vlm_max_crop_edge,
+            min_subject_px=settings.vlm_min_subject_px,
+            batch_size=settings.vlm_batch_size,
+            square_edge=settings.vlm_square_edge,
+            probe=settings.vlm_probe,
+            probe_threshold=settings.vlm_probe_threshold,
         )
         vlm_worker.start()
         app.state.vlm_worker = vlm_worker
@@ -317,10 +481,28 @@ def _render_preview_frame(app: FastAPI, quality: int, max_width: int) -> bytes |
     watchdog = getattr(app.state, "watchdog", None)
     if watchdog is not None:
         roi = watchdog.roi
-        if len(roi.vertices) > 3 or roi.vertices != [(0, 0), (1, 0), (1, 1), (0, 1)]:
+        # Only a real region is drawn. This used to also test len > 3, which
+        # the four-vertex full frame satisfies, so every preview frame paid a
+        # full-resolution blend to tint the entire picture and label it.
+        if roi.vertices != [(0, 0), (1, 0), (1, 1), (0, 1)]:
             draw_roi(frame, roi)
+        # Keep only the newest box per subject. recent_detections() returns
+        # every frame from the last second, so without this a stationary person
+        # is drawn ~30 times over — and the smearing gets worse the busier the
+        # scene, which is exactly when the operator needs to read it.
+        latest: dict[tuple[str, int], tuple] = {}
         for event, triggered in watchdog.recent_detections(max_age_s=1.0):
-            draw_detection(frame, event.bbox, event.label, event.confidence, triggered)
+            latest[(event.label, event.track_id)] = (event, triggered)
+
+        for event, triggered in latest.values():
+            draw_detection(
+                frame,
+                event.bbox,
+                event.label,
+                event.confidence,
+                triggered,
+                track_id=event.track_id,
+            )
 
     height, width = frame.shape[:2]
     if width > max_width:
@@ -331,33 +513,248 @@ def _render_preview_frame(app: FastAPI, quality: int, max_width: int) -> bytes |
     return encoded.tobytes() if ok else None
 
 
+@functools.lru_cache(maxsize=8)
+def _placeholder_jpeg(width: int, quality: int, message: str) -> bytes:
+    """A dark card carrying ``message``, encoded once and reused.
+
+    The stream must always have something to send. See
+    :func:`_mjpeg_generator` for why silence is worse than a placeholder.
+    """
+    height = max(90, int(width * 9 / 16))
+    frame = np.full((height, width, 3), 15, dtype=np.uint8)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, width / 1280)
+    thickness = max(1, int(scale * 1.5))
+    (text_w, text_h), _ = cv2.getTextSize(message, font, scale, thickness)
+
+    cv2.putText(
+        frame,
+        message,
+        ((width - text_w) // 2, (height + text_h) // 2),
+        font,
+        scale,
+        (120, 120, 130),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return encoded.tobytes() if ok else b""
+
+
+class _PreviewBroadcaster:
+    """Renders the live preview once and shares it with every viewer.
+
+    Each connected stream used to run its own loop: copy the full frame, draw,
+    resize, JPEG-encode, at ``stream_fps`` — so N dashboard tabs cost N times
+    the CPU, on a device where JPEG encoding competes directly with YOLO. And
+    each re-encoded frames that had not changed, whenever capture ran slower
+    than the preview.
+
+    One producer task now renders only when there is something new — a new
+    frame, or a new set of detections — and wakes every client with the same
+    bytes. It starts with the first viewer and stops with the last, so an
+    appliance nobody is watching encodes nothing.
+
+    Both rules :func:`_mjpeg_generator` documents still hold: the producer
+    publishes a placeholder rather than nothing, and a rendering failure is
+    logged and survived.
+    """
+
+    # Re-render at least this often even when nothing changed, so overlay
+    # boxes age out on a stalled camera and a client always hears something.
+    _REFRESH_S = 1.0
+
+    def __init__(self, app: FastAPI) -> None:
+        self._app = app
+        self._jpeg: bytes | None = None
+        self._live = False  # whether _jpeg is a real frame, not a placeholder
+        self._version = 0
+        self._published_at = 0.0
+        self._changed = asyncio.Condition()
+        self._clients = 0
+        self._task: asyncio.Task | None = None
+
+    def acquire(self) -> None:
+        self._clients += 1
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._produce(), name="PreviewEncoder")
+
+    def release(self) -> None:
+        self._clients = max(0, self._clients - 1)
+        if self._clients == 0 and self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def close(self) -> None:
+        """Stop rendering regardless of how many viewers are still attached."""
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def fresh_frame(self) -> bytes | None:
+        """The current rendered frame, if it is live and recent."""
+        if self._live and time.monotonic() - self._published_at < self._REFRESH_S:
+            return self._jpeg
+        return None
+
+    async def next_frame(self, seen_version: int) -> tuple[bytes, int]:
+        """Wait for a frame newer than ``seen_version``."""
+        async with self._changed:
+            await self._changed.wait_for(lambda: self._version != seen_version)
+            return self._jpeg or b"", self._version
+
+    def _frame_key(self) -> tuple:
+        """What the rendered picture depends on, read without copying pixels."""
+        state = self._app.state
+        buffer = getattr(state, "buffer", None)
+        watchdog = getattr(state, "watchdog", None)
+        try:
+            frame_ts = buffer.latest_timestamp() if buffer is not None else None
+        except Exception:
+            frame_ts = None
+        processed = watchdog.frames_processed if watchdog is not None else None
+        return (frame_ts, processed)
+
+    async def _produce(self) -> None:
+        settings = self._app.state.settings
+        interval = 1.0 / settings.stream_fps
+        consecutive_failures = 0
+        last_key: tuple | None = None
+        rendered_at = 0.0
+
+        while True:
+            started = time.monotonic()
+            key = self._frame_key()
+
+            stale = started - rendered_at >= self._REFRESH_S
+            if key != last_key or not self._live or stale:
+                last_key, rendered_at = key, started
+                try:
+                    jpeg = await asyncio.to_thread(
+                        _render_preview_frame,
+                        self._app,
+                        settings.stream_quality,
+                        settings.stream_width,
+                    )
+                    consecutive_failures = 0
+                except Exception as exc:
+                    consecutive_failures += 1
+                    jpeg = None
+                    # Log the first failure in a run at full volume, then back
+                    # off: a persistently broken camera should not fill the disk.
+                    if consecutive_failures == 1 or consecutive_failures % 100 == 0:
+                        logger.error(
+                            f"Preview render failed ({consecutive_failures}x): {exc}",
+                            exc_info=consecutive_failures == 1,
+                        )
+
+                live = jpeg is not None
+                if jpeg is None:
+                    jpeg = _placeholder_jpeg(
+                        settings.stream_width,
+                        settings.stream_quality,
+                        "Camera unavailable" if consecutive_failures else "Waiting for camera...",
+                    )
+
+                # A placeholder retried every tick is the same bytes; publish
+                # it again only as a keepalive.
+                if jpeg != self._jpeg or started - self._published_at >= self._REFRESH_S:
+                    async with self._changed:
+                        self._jpeg, self._live = jpeg, live
+                        self._version += 1
+                        self._published_at = started
+                        self._changed.notify_all()
+
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0.0, interval - elapsed))
+
+
+def _preview_of(app: FastAPI) -> _PreviewBroadcaster:
+    """The app's shared preview encoder, created on first use."""
+    preview = getattr(app.state, "preview", None)
+    if preview is None:
+        preview = _PreviewBroadcaster(app)
+        app.state.preview = preview
+    return preview
+
+
 async def _mjpeg_generator(app: FastAPI):
-    """Yield ``multipart/x-mixed-replace`` parts at the configured frame rate.
+    """Yield ``multipart/x-mixed-replace`` parts as the shared preview renders them.
 
     Each part is preceded by CRLF because RFC 2046 defines the delimiter as
     ``CRLF--boundary``. Emitting the first boundary without it is tolerated by
     Chrome and Firefox but leaves Safari unable to parse the stream at all.
+
+    Two rules keep the panel alive, both learned from it going blank:
+
+    **Never go silent.** A stream carrying no parts is not an error — the HTTP
+    response is open and healthy, it simply has nothing in it. The browser's
+    ``<img>`` therefore never fires ``onerror``, the snapshot fallback never
+    engages, and the operator gets an empty box with no indication anything is
+    wrong. That happens routinely: for the seconds before the first frame is
+    captured, and again whenever a camera drops and ``read_latest`` has nothing
+    to hand back. So when there is no frame, say so in a placeholder rather
+    than sending nothing.
+
+    **Never die.** A single exception here ends the response for good, and an
+    ``<img>`` that has already started rendering will not reconnect. One
+    corrupt frame must not cost the operator their camera feed until they
+    happen to reload the page.
+
+    The rendering itself is shared — see :class:`_PreviewBroadcaster`.
     """
-    settings = app.state.settings
-    interval = 1.0 / settings.stream_fps
-
-    while True:
-        started = time.monotonic()
-
-        jpeg = await asyncio.to_thread(
-            _render_preview_frame, app, settings.stream_quality, settings.stream_width
-        )
-
-        if jpeg is not None:
+    preview = _preview_of(app)
+    preview.acquire()
+    try:
+        version = 0  # nothing published yet
+        while True:
+            jpeg, version = await preview.next_frame(version)
             yield (
                 b"\r\n--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
                 b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
                 + jpeg
             )
+    finally:
+        preview.release()
 
-        elapsed = time.monotonic() - started
-        await asyncio.sleep(max(0.0, interval - elapsed))
+
+class _NoCacheDashboardAssets:
+    """Serve the dashboard's HTML/JS/CSS uncached.
+
+    A cached ``app.js`` paired with a freshly served ``index.html`` puts the
+    page in a state neither version was written for — which is exactly how the
+    live feed once rendered as an empty element. The dashboard is a handful of
+    KB served from localhost, so caching buys nothing and costs a whole class
+    of "works after a hard reload" bugs.
+
+    Plain ASGI rather than ``@app.middleware("http")``. That decorator wraps
+    every response — the endless MJPEG stream included — in an extra
+    in-memory stream per chunk; this touches only the response-start message,
+    and only on the paths it applies to.
+    """
+
+    def __init__(self, app) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "") if scope["type"] == "http" else ""
+        if not (path == "/" or path.startswith("/static/")):
+            await self._app(scope, receive, send)
+            return
+
+        async def send_uncached(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (k, v) for k, v in message.get("headers", []) if k.lower() != b"cache-control"
+                ]
+                headers.append((b"cache-control", b"no-store, no-cache, must-revalidate"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self._app(scope, receive, send_uncached)
 
 
 def create_app() -> FastAPI:
@@ -383,25 +780,17 @@ def create_app() -> FastAPI:
     if frontend_dir.exists():
         app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
-    @app.middleware("http")
-    async def no_cache_dashboard_assets(request: Request, call_next):
-        """Serve the dashboard's HTML/JS/CSS uncached.
+    app.add_middleware(_NoCacheDashboardAssets)
 
-        A cached ``app.js`` paired with a freshly served ``index.html`` puts the
-        page in a state neither version was written for — which is exactly how
-        the live feed once rendered as an empty element. The dashboard is a
-        handful of KB served from localhost, so caching buys nothing and costs
-        a whole class of "works after a hard reload" bugs.
-        """
-        response = await call_next(request)
-        path = request.url.path
-        if path == "/" or path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-        return response
-
-    # Alert evidence JPEGs. Created eagerly so the mount never 500s on a
+    # Alert evidence JPEGs, served from wherever the VLM worker writes them.
+    # This has to follow ``snapshot_dir`` rather than hardcode the default:
+    # the worker honours the setting, so a mount pinned to "data/snapshots"
+    # silently serves 404s to every thumbnail the moment EYEQ_SNAPSHOT_DIR
+    # points somewhere else. Created eagerly so the mount never 500s on a
     # fresh checkout that has not yet produced an alert.
-    snapshot_dir = Path("data/snapshots")
+    from app.config.settings import get_settings
+
+    snapshot_dir = Path(get_settings().snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/snapshots", StaticFiles(directory=str(snapshot_dir)), name="snapshots")
 
@@ -445,9 +834,12 @@ def create_app() -> FastAPI:
             raise HTTPException(503, "Video pipeline is not running")
 
         settings = state.settings
-        jpeg = await asyncio.to_thread(
-            _render_preview_frame, request.app, settings.stream_quality, settings.stream_width
-        )
+        # While anyone is streaming, the shared encoder already has this frame.
+        jpeg = _preview_of(request.app).fresh_frame()
+        if jpeg is None:
+            jpeg = await asyncio.to_thread(
+                _render_preview_frame, request.app, settings.stream_quality, settings.stream_width
+            )
         if jpeg is None:
             raise HTTPException(503, "No frame available yet")
 
@@ -464,6 +856,19 @@ def create_app() -> FastAPI:
         db: Database = request.app.state.db
         return await db.list_rules(camera_id=camera_id)
 
+    @app.get("/api/labels")
+    async def list_labels(prompt: str | None = Query(None)):
+        """The classes Stage 1 can detect, and which ones a prompt is about.
+
+        The dashboard uses ``suggested`` to catch the common misconfiguration
+        where a rule asks about people but watches all eighty classes, and so
+        spends its inference budget on pallets and trucks.
+        """
+        return {
+            "labels": list(COCO_CLASSES),
+            "suggested": labels_in_prompt(prompt) if prompt else [],
+        }
+
     @app.post("/api/rules", status_code=201)
     async def create_rule(request: Request, rule: RuleCreate):
         db: Database = request.app.state.db
@@ -476,9 +881,18 @@ def create_app() -> FastAPI:
             confidence=rule.confidence,
             cooldown_s=rule.cooldown_s,
             enabled=rule.enabled,
+            pair_label=rule.pair_label,
         )
         await sync_rules(request.app)
-        return await db.get_rule(rule_id)
+
+        created = await db.get_rule(rule_id)
+        # Non-blocking: an unscoped rule is legitimate for scene-level
+        # questions, so this informs rather than refuses.
+        warning = _rule_warning(rule.prompt, rule.target_labels, rule.pair_label)
+        if warning:
+            logger.warning(f"Rule {rule_id} ('{rule.name}'): {warning}")
+            created = {**created, "warning": warning}
+        return created
 
     @app.delete("/api/rules")
     async def delete_all_rules(request: Request):
@@ -502,6 +916,7 @@ def create_app() -> FastAPI:
 
     @app.put("/api/rules/{rule_id}")
     async def update_rule(request: Request, rule_id: int, rule: RuleUpdate):
+        _refuse_sentinel(rule_id)
         db: Database = request.app.state.db
         existing = await db.get_rule(rule_id)
         if existing is None:
@@ -509,10 +924,20 @@ def create_app() -> FastAPI:
         fields = rule.model_dump(exclude_unset=True)
         updated = await db.update_rule(rule_id, **fields)
         await sync_rules(request.app)
+
+        warning = _rule_warning(
+            updated.get("prompt", ""),
+            json.loads(updated.get("target_labels") or "[]"),
+            updated.get("pair_label", ""),
+        )
+        if warning:
+            logger.warning(f"Rule {rule_id}: {warning}")
+            updated = {**updated, "warning": warning}
         return updated
 
     @app.delete("/api/rules/{rule_id}", status_code=204)
     async def delete_rule(request: Request, rule_id: int):
+        _refuse_sentinel(rule_id)
         db: Database = request.app.state.db
         deleted = await db.delete_rule(rule_id)
         if not deleted:
@@ -620,6 +1045,52 @@ def create_app() -> FastAPI:
                 "detections_published": (
                     watchdog_stats.detections_published if watchdog_stats else 0
                 ),
+                "tracks_active": watchdog_stats.tracks_active if watchdog_stats else 0,
+                "cooldown_keys": watchdog_stats.cooldown_keys if watchdog_stats else 0,
+                # Detections dropped for carrying too few captured pixels to
+                # answer about. Rising means the camera is too far for the
+                # floor, not that the scene is quiet — lower vlm_min_subject_px
+                # rather than accept the blind spot, since a skipped subject is
+                # never judged at all. Its Stage 2 twin, vlm.instances_too_small,
+                # correctly reads zero while Stage 1 sheds first.
+                "detections_filtered_size": (
+                    watchdog_stats.detections_filtered_size if watchdog_stats else 0
+                ),
+                # Detections held back because a rule's pair_label was absent
+                # from the frame or not overlapping. This is the gate working.
+                # A value that tracks detections_total means the partner class
+                # is never detected at all — check yolo_confidence, which small
+                # classes like 'cell phone' rarely clear at the 0.25 default.
+                "detections_filtered_pair": (
+                    watchdog_stats.detections_filtered_pair if watchdog_stats else 0
+                ),
+                # The six below were populated all along and never returned,
+                # which is why a saturated VLM could not be diagnosed from this
+                # endpoint. detections_filtered_cooldown is the important one:
+                # if it dwarfs every other drop reason, the cooldown is
+                # carrying the whole load and nothing else contributes.
+                "detections_total": (
+                    watchdog_stats.detections_total if watchdog_stats else 0
+                ),
+                "detections_filtered_confidence": (
+                    watchdog_stats.detections_filtered_confidence
+                    if watchdog_stats
+                    else 0
+                ),
+                "detections_filtered_label": (
+                    watchdog_stats.detections_filtered_label if watchdog_stats else 0
+                ),
+                "detections_filtered_roi": (
+                    watchdog_stats.detections_filtered_roi if watchdog_stats else 0
+                ),
+                "detections_filtered_cooldown": (
+                    watchdog_stats.detections_filtered_cooldown if watchdog_stats else 0
+                ),
+                # Frames the buffer handed back twice. A high value means the
+                # watchdog is paced above the camera's real frame rate.
+                "frames_repeated": (
+                    watchdog_stats.frames_repeated if watchdog_stats else 0
+                ),
             },
             "vlm": {
                 "is_running": vlm_stats.is_running if vlm_stats else False,
@@ -629,10 +1100,98 @@ def create_app() -> FastAPI:
                 "triggers_stale": vlm_stats.triggers_stale if vlm_stats else 0,
                 "triggers_coalesced": vlm_stats.triggers_coalesced if vlm_stats else 0,
                 "verdicts_positive": vlm_stats.verdicts_positive if vlm_stats else 0,
+                # Whether per-subject judging is paying for itself: memoised
+                # should climb far faster than judged once a scene settles, and
+                # a rising shed count means the crowd outpaces the VLM.
+                "instances_judged": vlm_stats.instances_judged if vlm_stats else 0,
+                # Counts *rules*, where instances_judged counts *subjects*.
+                # Two enabled rules make one judged subject two forward passes,
+                # so these two numbers are not directly comparable.
+                "instances_memoised": vlm_stats.instances_memoised if vlm_stats else 0,
+                # Reuse recovered by position after the track id changed. If
+                # this dominates instances_memoised, identity is churning and
+                # the exact memo is carrying almost none of the load.
+                "instances_memoised_spatial": (
+                    vlm_stats.instances_memoised_spatial if vlm_stats else 0
+                ),
+                # Why the memo missed. new_track dominating means the TTL is
+                # irrelevant however high it is set — nothing is living long
+                # enough to expire, so raising it cannot help.
+                "memo_miss_new_track": (
+                    vlm_stats.memo_miss_new_track if vlm_stats else 0
+                ),
+                "memo_miss_ttl": vlm_stats.memo_miss_ttl if vlm_stats else 0,
+                "memo_miss_moved": vlm_stats.memo_miss_moved if vlm_stats else 0,
+                # Raw triggers off the wire, before coalescing. Populated since
+                # the worker was written and never returned until now.
+                "triggers_received": vlm_stats.triggers_received if vlm_stats else 0,
+                # Inferences that blew vlm_timeout_s. Note what this does NOT
+                # mean on the default backend: the batch is abandoned, but the
+                # wedged inference runs to completion on the executor's single
+                # worker and the next batch may queue behind it.
+                "triggers_timed_out": (
+                    vlm_stats.triggers_timed_out if vlm_stats else 0
+                ),
+                # Kept at zero and reported so old dashboards do not break. It
+                # was ten unrelated causes under one name; read the four below.
+                "triggers_failed": vlm_stats.triggers_failed if vlm_stats else 0,
+                # Stage 1 published something that will not parse — schema
+                # drift, or a foreign publisher on the detection endpoint.
+                "triggers_malformed": (
+                    vlm_stats.triggers_malformed if vlm_stats else 0
+                ),
+                # The source frame was overwritten before Stage 2 reached it.
+                # A CAPACITY signal, not an error: raise buffer_capacity or
+                # reduce VLM latency. Previously indistinguishable from a crash.
+                "triggers_frame_lost": (
+                    vlm_stats.triggers_frame_lost if vlm_stats else 0
+                ),
+                # The model call raised, or answered a different number of
+                # questions than it was asked. Check device, dtype, memory.
+                "triggers_backend_error": (
+                    vlm_stats.triggers_backend_error if vlm_stats else 0
+                ),
+                # A bug in Eye-Q. Both sites log a traceback. The only one of
+                # these five that should wake a developer.
+                "triggers_internal_error": (
+                    vlm_stats.triggers_internal_error if vlm_stats else 0
+                ),
+                "instances_shed": vlm_stats.instances_shed if vlm_stats else 0,
+                "instances_too_small": (
+                    vlm_stats.instances_too_small if vlm_stats else 0
+                ),
+                # Whether Stage 2 has a working endpoint at all. A backend
+                # that is down looks identical to a quiet scene in every
+                # counter above — both just stop producing verdicts.
+                "backend_unavailable": (
+                    vlm_stats.backend_unavailable if vlm_stats else False
+                ),
+                "batches_dropped_unavailable": (
+                    vlm_stats.batches_dropped_unavailable if vlm_stats else 0
+                ),
                 "avg_inference_ms": vlm_stats.avg_inference_ms if vlm_stats else 0,
+                # Capture-to-verdict, the number an operator actually waits
+                # through. Compare against avg_inference_ms: when the two are
+                # close the appliance is keeping up, and when latency_p95
+                # climbs away from it the queue is the problem, not the model.
+                "avg_queued_ms": vlm_stats.avg_queued_ms if vlm_stats else 0,
+                "latency_p50_ms": vlm_stats.latency_p50_ms if vlm_stats else 0,
+                "latency_p95_ms": vlm_stats.latency_p95_ms if vlm_stats else 0,
             },
             "database": db_stats,
             "websocket_clients": ws_manager.active_count,
+            "webhooks": {
+                # Queued or in flight. Sitting near its cap of 64 means the
+                # endpoint is slower than the violation rate.
+                "in_flight": state.alert_sink.webhooks_in_flight
+                if getattr(state, "alert_sink", None) is not None
+                else 0,
+                # Violations stored and broadcast but never POSTed, because the
+                # backlog was full. Rising means the receiver cannot keep up.
+                "dropped": state.alert_sink.webhooks_dropped
+                if getattr(state, "alert_sink", None) is not None
+                else 0,
+            },
         }
 
     # ── WebSocket ────────────────────────────────────────────────
@@ -646,6 +1205,13 @@ def create_app() -> FastAPI:
                 if data == "ping":
                     await ws.send_json({"type": "pong"})
         except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            # A binary frame, a send to a half-closed socket: anything else
+            # used to leave the connection registered until a broadcast
+            # happened to fail on it.
+            logger.debug(f"WebSocket closed on error: {exc}")
+        finally:
             ws_manager.disconnect(ws)
 
     return app

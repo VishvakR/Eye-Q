@@ -25,8 +25,9 @@ htmlcov/
 /data/
 
 # Model weights. Auto-downloaded on first run: yolov8n.pt (~6 MB) and the
-# VLM cache (~3.5 GB for Moondream2). Never commit these — a fresh clone
-# re-fetches them, and git handles multi-GB binaries badly.
+# VLM cache (~2 GB for the 4-bit 2025-04-14 Moondream, ~3.7 GB for the fp32
+# 2024-08-26 one). Never commit these — a fresh clone re-fetches them, and
+# git handles multi-GB binaries badly.
 /models/
 *.pt
 *.onnx
@@ -52,3 +53,15 @@ Thumbs.db
 
 # Note: uv.lock IS committed — it pins the exact dependency graph so
 # `uv sync` reproduces this environment.
+
+# Internal notes and tooling. Kept locally, never published.
+/docs/
+/CLAUDE.md
+/IMPLEMENTATION.md
+/PLAN.md
+/eyeq.md
+/EVALUATION-4bit.md
+.claude/
+.agents/
+.aider-desk/
+skills-lock.json

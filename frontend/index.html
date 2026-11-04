@@ -3,225 +3,206 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Eye-Q — Intelligent Surveillance Dashboard</title>
-    <meta name="description" content="Open-vocabulary VLM retrofit appliance for IP camera surveillance. Define security alerts in plain English.">
+    <title>Eye-Q</title>
+    <meta name="description" content="Watch a camera and ask it plain-English safety questions. Eye-Q flags every subject that answers yes.">
 
-    <!-- Google Fonts -->
+    <!-- One family. The stack falls back to the system UI face, so an offline
+         appliance that cannot reach Google Fonts still renders correctly. -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-
-    <!-- Tailwind CSS v4 CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-
-    <style type="text/tailwindcss">
-        @theme {
-            --color-surface-primary: #0a0e17;
-            --color-surface-secondary: #111827;
-            --color-surface-elevated: #1e293b;
-            --color-surface-hover: #253449;
-            --color-border-subtle: #1e293b;
-            --color-border-active: #3b82f6;
-
-            --color-accent-blue: #3b82f6;
-            --color-accent-cyan: #06b6d4;
-            --color-accent-green: #10b981;
-            --color-accent-red: #ef4444;
-            --color-accent-amber: #f59e0b;
-            --color-accent-violet: #8b5cf6;
-
-            --color-text-primary: #f1f5f9;
-            --color-text-secondary: #94a3b8;
-            --color-text-muted: #475569;
-
-            --font-sans: "Inter", system-ui, sans-serif;
-            --font-mono: "JetBrains Mono", "Fira Code", monospace;
-
-            --radius-card: 0.75rem;
-            --radius-button: 0.5rem;
-            --radius-badge: 9999px;
-        }
-    </style>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 
     <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body class="bg-surface-primary text-text-primary font-sans min-h-screen">
+<body>
 
-    <!-- Top Navigation Bar -->
-    <nav class="sticky top-0 z-50 bg-surface-secondary/80 backdrop-blur-xl border-b border-border-subtle">
-        <div class="max-w-[1600px] mx-auto px-6 py-3 flex items-center justify-between">
-            <div class="flex items-center gap-3">
-                <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-accent-blue to-accent-cyan flex items-center justify-center">
-                    <span class="text-white font-bold text-sm">EQ</span>
-                </div>
-                <h1 class="text-lg font-semibold tracking-tight">Eye-Q</h1>
-                <span class="text-xs text-text-muted bg-surface-elevated px-2 py-0.5 rounded-full">v0.1.0</span>
-            </div>
-
-            <div class="flex items-center gap-4">
-                <div id="ws-indicator" class="flex items-center gap-2 text-xs">
-                    <span class="w-2 h-2 rounded-full bg-accent-red animate-pulse"></span>
-                    <span class="text-text-muted">Disconnected</span>
-                </div>
-                <div id="device-badge" class="text-xs text-text-muted bg-surface-elevated px-2 py-1 rounded-full font-mono">
-                    CPU
-                </div>
-                <div id="uptime-badge" class="text-xs text-text-muted">
-                    Uptime: --
-                </div>
+    <header class="topbar">
+        <div class="topbar-inner">
+            <h1 class="wordmark">Eye-Q</h1>
+            <div class="topbar-status">
+                <span id="ws-indicator" class="conn">
+                    <span class="conn-dot"></span><span>Disconnected</span>
+                </span>
+                <span id="device-badge" class="topbar-item" title="Inference device">CPU</span>
+                <span id="uptime-badge" class="topbar-item">Up --</span>
             </div>
         </div>
-    </nav>
+    </header>
 
-    <!-- Main Content -->
-    <main class="max-w-[1600px] mx-auto px-6 py-6 space-y-6">
+    <main class="layout">
 
-        <!-- Stats Bar -->
-        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3" id="stats-bar">
-            <div class="stat-card">
-                <div class="stat-label">Buffer</div>
-                <div class="stat-value" id="stat-buffer">0%</div>
-                <div class="stat-bar">
-                    <div class="stat-bar-fill bg-accent-cyan" id="stat-buffer-bar" style="width: 0%"></div>
+        <div class="col-main">
+
+            <!-- Live camera -->
+            <section class="block" aria-labelledby="feed-title">
+                <div class="block-head">
+                    <h2 id="feed-title">Live feed</h2>
+                    <span id="camera-status" class="block-note">default</span>
                 </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">YOLO FPS</div>
-                <div class="stat-value" id="stat-fps">0.0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Detections</div>
-                <div class="stat-value" id="stat-detections">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">VLM Triggers</div>
-                <div class="stat-value" id="stat-vlm-triggers">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Violations</div>
-                <div class="stat-value text-accent-red" id="stat-violations">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Active Rules</div>
-                <div class="stat-value" id="stat-rules">0</div>
-            </div>
-        </div>
-
-        <!-- Live Camera Preview -->
-        <section class="space-y-3">
-            <div class="section-header">
-                <h2 class="text-sm font-semibold uppercase tracking-wider text-text-secondary">Live Feed</h2>
-                <div id="camera-status" class="text-xs text-text-muted font-mono">default</div>
-            </div>
-            <div class="relative rounded-card overflow-hidden border border-border-subtle bg-black">
-                <!-- src lives here, not in JS: the feed must still appear if
-                     app.js is cached, blocked, or fails to parse. The inline
-                     onerror is bound before the request starts, so the
-                     still-frame fallback engages even on the first load. -->
-                <img id="camera-stream"
-                     src="/api/stream/default.mjpg"
-                     onerror="if (window.useSnapshotFallback) useSnapshotFallback();"
-                     alt="Live camera feed with detection overlay"
-                     class="w-full max-h-[520px] object-contain bg-black">
-                <div id="stream-error" class="hidden absolute inset-0 flex items-center justify-center text-sm text-text-muted bg-surface-secondary">
-                    Video pipeline is not running.
-                </div>
-            </div>
-        </section>
-
-        <!-- Two-Column Layout -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-
-            <!-- Left Column: Rules -->
-            <div class="lg:col-span-1 space-y-4">
-                <div class="section-header">
-                    <h2 class="text-sm font-semibold uppercase tracking-wider text-text-secondary">Alert Rules</h2>
-                    <div class="flex items-center gap-2">
-                        <button onclick="clearAllRules()" id="clear-rules-btn" class="btn-danger text-xs hidden">Clear All</button>
-                        <button onclick="openRuleModal()" class="btn-primary text-xs">+ New Rule</button>
+                <div class="feed">
+                    <!-- src lives here, not in JS: the feed must still appear if
+                         app.js is cached, blocked, or fails to parse. The inline
+                         onerror is bound before the request starts, so the
+                         still-frame fallback engages even on the first load. -->
+                    <img id="camera-stream"
+                         src="/api/stream/default.mjpg"
+                         onerror="if (window.useSnapshotFallback) useSnapshotFallback();"
+                         alt="Live camera feed with detection boxes">
+                    <div id="stream-error" class="feed-error hidden">
+                        <p>The video pipeline is not running. Start Eye-Q without <code>--api-only</code> to see the camera.</p>
                     </div>
                 </div>
+            </section>
 
-                <div id="rules-list" class="space-y-3">
-                    <div class="empty-state">No rules configured. Create one to get started.</div>
+            <!-- Pipeline readouts -->
+            <section class="block" aria-labelledby="pipeline-title">
+                <div class="block-head">
+                    <h2 id="pipeline-title">Pipeline</h2>
                 </div>
-            </div>
+                <dl class="readouts" id="stats-bar">
+                    <div class="readout">
+                        <dt>Detector rate</dt>
+                        <dd class="stat-value" id="stat-fps">0.0</dd>
+                        <span class="readout-unit">frames / s</span>
+                    </div>
+                    <div class="readout">
+                        <dt>Frame buffer</dt>
+                        <dd class="stat-value" id="stat-buffer">0%</dd>
+                        <div class="meter"><div class="meter-fill" id="stat-buffer-bar" style="width: 0%"></div></div>
+                    </div>
+                    <div class="readout">
+                        <dt>Detections sent</dt>
+                        <dd class="stat-value" id="stat-detections">0</dd>
+                    </div>
+                    <div class="readout">
+                        <dt>VLM checks</dt>
+                        <dd class="stat-value" id="stat-vlm-triggers">0</dd>
+                    </div>
+                    <div class="readout">
+                        <dt>Verdict reuse</dt>
+                        <dd class="stat-value" id="stat-memo">--</dd>
+                        <div class="meter"><div class="meter-fill" id="stat-memo-bar" style="width: 0%"></div></div>
+                    </div>
+                    <div class="readout">
+                        <dt>Latency, p95</dt>
+                        <dd class="stat-value" id="stat-latency">--</dd>
+                        <span class="readout-unit">capture to verdict</span>
+                    </div>
+                    <div class="readout">
+                        <dt>Violations</dt>
+                        <dd class="stat-value" id="stat-violations">0</dd>
+                    </div>
+                    <div class="readout">
+                        <dt>Active rules</dt>
+                        <dd class="stat-value" id="stat-rules">0</dd>
+                    </div>
+                    <div class="readout">
+                        <dt>Timeouts</dt>
+                        <dd class="stat-value" id="stat-timeouts">0</dd>
+                    </div>
+                    <div class="readout">
+                        <dt>Failures</dt>
+                        <dd class="stat-value" id="stat-failures">0</dd>
+                    </div>
+                    <div class="readout">
+                        <dt>VLM backend</dt>
+                        <dd class="stat-value" id="stat-backend">--</dd>
+                    </div>
+                </dl>
+            </section>
 
-            <!-- Right Column: Alerts -->
-            <div class="lg:col-span-2 space-y-4">
-                <div class="section-header">
-                    <h2 class="text-sm font-semibold uppercase tracking-wider text-text-secondary">Live Alert Feed</h2>
-                    <div class="flex items-center gap-2">
-                        <button onclick="filterAlerts('all')" class="filter-btn active" id="filter-all">All</button>
-                        <button onclick="filterAlerts('violations')" class="filter-btn" id="filter-violations">🔴 Violations</button>
-                        <button onclick="filterAlerts('clear')" class="filter-btn" id="filter-clear">🟢 Clear</button>
+            <!-- Rules -->
+            <section class="block" aria-labelledby="rules-title">
+                <div class="block-head">
+                    <h2 id="rules-title">Rules</h2>
+                    <div class="block-actions">
+                        <button onclick="clearAllRules()" id="clear-rules-btn" class="btn-quiet btn-quiet-danger hidden">Delete all</button>
+                        <button onclick="openRuleModal()" class="btn-primary">New rule</button>
                     </div>
                 </div>
-
-                <div id="alerts-list" class="space-y-2 max-h-[600px] overflow-y-auto pr-1">
-                    <div class="empty-state">No alerts yet. Waiting for detections...</div>
+                <div id="rules-list" class="list">
+                    <div class="empty-state">No rules yet. Add one to start asking questions about the feed.</div>
                 </div>
+            </section>
+        </div>
 
-                <div class="flex justify-center pt-2">
-                    <button onclick="loadMoreAlerts()" id="load-more-btn" class="text-xs text-text-muted hover:text-text-secondary transition-colors hidden">
-                        Load more alerts
-                    </button>
+        <!-- Alerts -->
+        <aside class="col-side block" aria-labelledby="alerts-title">
+            <div class="block-head">
+                <h2 id="alerts-title">Alerts</h2>
+                <div class="segmented" role="group" aria-label="Filter alerts">
+                    <button onclick="filterAlerts('all')" class="filter-btn active" id="filter-all">All</button>
+                    <button onclick="filterAlerts('violations')" class="filter-btn" id="filter-violations">Violations</button>
+                    <button onclick="filterAlerts('clear')" class="filter-btn" id="filter-clear">Clear</button>
                 </div>
             </div>
-        </div>
+
+            <div id="alerts-list" class="list alerts-scroll">
+                <div class="empty-state">No alerts yet. They appear here as the model answers your rules.</div>
+            </div>
+
+            <button onclick="loadMoreAlerts()" id="load-more-btn" class="btn-quiet load-more hidden">Load older alerts</button>
+        </aside>
     </main>
 
-    <!-- Rule Modal -->
+    <!-- Rule editor -->
     <div id="rule-modal" class="modal-overlay hidden" onclick="if(event.target === this) closeRuleModal()">
-        <div class="modal-content">
-            <div class="flex items-center justify-between mb-6">
-                <h3 class="text-lg font-semibold" id="modal-title">New Alert Rule</h3>
-                <button onclick="closeRuleModal()" class="text-text-muted hover:text-text-primary transition-colors">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+            <div class="modal-head">
+                <h3 id="modal-title">New rule</h3>
+                <button onclick="closeRuleModal()" class="icon-btn" aria-label="Close">
+                    <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
                     </svg>
                 </button>
             </div>
 
-            <form id="rule-form" class="space-y-4">
+            <form id="rule-form" class="form">
                 <input type="hidden" id="rule-edit-id" value="">
 
-                <div>
-                    <label class="form-label">Rule Name</label>
-                    <input type="text" id="rule-name" class="form-input" placeholder="e.g., Pallet blocking fire exit" required>
+                <div class="field">
+                    <label class="form-label" for="rule-name">Name</label>
+                    <input type="text" id="rule-name" class="form-input" placeholder="Hard hat check" required>
                 </div>
 
-                <div>
-                    <label class="form-label">VLM Prompt (Plain English Question)</label>
-                    <textarea id="rule-prompt" class="form-input h-20 resize-none" placeholder="e.g., Is a pallet blocking the fire exit?" required></textarea>
+                <div class="field">
+                    <label class="form-label" for="rule-prompt">Question</label>
+                    <textarea id="rule-prompt" class="form-input form-textarea" placeholder="Is this person missing a hard hat?" required></textarea>
+                    <p class="form-hint">
+                        Ask about one subject (&ldquo;Is <em>this person</em>&hellip;&rdquo;, not &ldquo;Is <em>anyone</em>&hellip;&rdquo;)
+                        and keep it to a single yes/no question. Each subject is cropped and judged on its own,
+                        and a yes is recorded as a violation.
+                    </p>
                 </div>
 
-                <div id="rule-error" class="hidden text-xs text-accent-red bg-accent-red/10 border border-accent-red/20 rounded p-2 mb-4"></div>
-                <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label class="form-label">Camera ID</label>
-                        <input type="text" id="rule-camera" class="form-input" placeholder="default" value="default">
-                    </div>
-                    <div>
-                        <label class="form-label">Target Labels (comma-separated)</label>
+                <div id="rule-scope-warning" class="notice notice-caution hidden"></div>
+                <div id="rule-error" class="notice notice-danger hidden"></div>
+
+                <div class="field-row">
+                    <div class="field">
+                        <label class="form-label" for="rule-labels">Objects to watch</label>
                         <input type="text" id="rule-labels" class="form-input" placeholder="person, forklift">
                     </div>
+                    <div class="field">
+                        <label class="form-label" for="rule-camera">Camera</label>
+                        <input type="text" id="rule-camera" class="form-input" placeholder="default" value="default">
+                    </div>
                 </div>
 
-                <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label class="form-label">Min Confidence</label>
+                <div class="field-row">
+                    <div class="field">
+                        <label class="form-label" for="rule-confidence">Detector confidence</label>
                         <input type="number" id="rule-confidence" class="form-input" value="0.25" min="0" max="1" step="0.05">
                     </div>
-                    <div>
-                        <label class="form-label">Cooldown (seconds)</label>
+                    <div class="field">
+                        <label class="form-label" for="rule-cooldown">Cooldown, seconds</label>
                         <input type="number" id="rule-cooldown" class="form-input" value="5.0" min="0" step="0.5">
                     </div>
                 </div>
 
-                <div class="flex justify-end gap-3 pt-2">
+                <div class="modal-actions">
                     <button type="button" onclick="closeRuleModal()" class="btn-secondary">Cancel</button>
-                    <button type="submit" class="btn-primary">Save Rule</button>
+                    <button type="submit" class="btn-primary">Save rule</button>
                 </div>
             </form>
         </div>

@@ -28,11 +28,14 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 
 import zmq
 
 logger = logging.getLogger(__name__)
+
+# Returned internally for a message that arrived but could not be decoded, so
+# drain() can tell "nothing queued" from "one bad message ahead of good ones".
+_MALFORMED = object()
 
 
 class EventPublisher:
@@ -63,11 +66,10 @@ class EventPublisher:
         self._closed = False
         self._messages_sent = 0
 
+        # No settling sleep here. A PUB socket drops messages until a
+        # subscriber has connected however long it waits, and this constructor
+        # runs on the event loop at startup, so a sleep only stalled the loop.
         logger.info(f"ZMQ Publisher bound to {endpoint}")
-
-        # Allow subscribers to connect before we start sending
-        # (ZMQ PUB/SUB has a brief connection setup period)
-        time.sleep(0.1)
 
     def publish(self, topic: str, payload: dict) -> bool:
         """Publish a JSON event on a named topic.
@@ -196,6 +198,11 @@ class EventSubscriber:
             Tuple of ``(topic, payload_dict)`` if a message was received,
             or ``None`` if the timeout elapsed with no message.
         """
+        msg = self._receive_one(timeout_ms)
+        return None if msg is _MALFORMED else msg
+
+    def _receive_one(self, timeout_ms: int):
+        """One receive: a message, ``_MALFORMED``, or None when nothing came."""
         if self._closed:
             logger.warning("Attempted to receive on a closed socket.")
             return None
@@ -211,18 +218,20 @@ class EventSubscriber:
                         f"Received malformed multipart message with {len(parts)} parts, "
                         f"expected 2. Discarding."
                     )
-                    return None
+                    return _MALFORMED
 
-                topic_str = parts[0].decode("utf-8")
-                payload = json.loads(parts[1].decode("utf-8"))
+                try:
+                    topic_str = parts[0].decode("utf-8")
+                    payload = json.loads(parts[1].decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    logger.warning(f"Received undecodable payload: {exc}")
+                    return _MALFORMED
 
                 self._messages_received += 1
                 return topic_str, payload
 
         except zmq.Again:
             pass  # No message available (non-blocking mode)
-        except json.JSONDecodeError as exc:
-            logger.warning(f"Received non-JSON payload: {exc}")
         except zmq.ZMQError as exc:
             logger.error(f"ZMQ receive error: {exc}")
 
@@ -241,9 +250,13 @@ class EventSubscriber:
         """
         messages: list[tuple[str, dict]] = []
         for _ in range(max_messages):
-            msg = self.receive(timeout_ms=0)
+            msg = self._receive_one(timeout_ms=0)
             if msg is None:
                 break
+            if msg is _MALFORMED:
+                # Skip it, not stop: the backlog behind a bad message is still
+                # good, and stopping here handed the coalescer half a batch.
+                continue
             messages.append(msg)
         return messages
 
@@ -370,8 +383,8 @@ class AsyncEventSubscriber:
                 self._messages_received += 1
                 return topic_str, payload
 
-        except json.JSONDecodeError as exc:
-            logger.warning(f"Received non-JSON payload: {exc}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(f"Received undecodable payload: {exc}")
         except zmq.ZMQError as exc:
             if not self._closed:
                 logger.error(f"Async ZMQ receive error: {exc}")

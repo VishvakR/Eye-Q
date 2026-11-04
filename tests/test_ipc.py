@@ -290,3 +290,30 @@ class TestRepr:
                 r = repr(sub)
                 assert "EventSubscriber" in r
                 assert "repr" in r
+
+
+class TestMalformedMessages:
+    """A bad message must not hide the good ones queued behind it."""
+
+    def test_drain_skips_undecodable_messages(self):
+        import zmq
+
+        endpoint = _unique_endpoint()
+        raw = zmq.Context.instance().socket(zmq.PUB)
+        raw.setsockopt(zmq.LINGER, 0)
+        raw.bind(endpoint)
+        try:
+            with EventSubscriber(endpoint, topic="t") as sub:
+                time.sleep(0.2)
+                raw.send_multipart([b"t", b'{"n": 1}'])
+                raw.send_multipart([b"t", b"\xff\xfe not utf-8"])
+                raw.send_multipart([b"t", b"not json"])
+                raw.send_multipart([b"t", b"x", b"three parts"])
+                raw.send_multipart([b"t", b'{"n": 2}'])
+                time.sleep(0.2)
+
+                results = sub.drain(max_messages=10)
+
+                assert [payload["n"] for _topic, payload in results] == [1, 2]
+        finally:
+            raw.close()

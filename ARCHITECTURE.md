@@ -1,0 +1,1316 @@
+# Eye-Q — Architecture
+
+How the system is built, how a frame becomes an alert, and why the non-obvious decisions were made.
+
+> **Where this fits.** `README.md` is the quickstart. This document is the engineering reference.
+> `IMPLEMENTATION.md` is a change-log-shaped record of an earlier rework and predates the current
+> batching and tracking code — where the two disagree, this document and the source are correct.
+> `PLAN.md` is the original design doc, kept for history.
+
+---
+
+## 1. What Eye-Q is
+
+Eye-Q watches a video source and answers plain-English questions about it — *"is this person bending
+over to lift something?"*, *"is anyone in this area without a hi-vis vest?"* — and records an alert
+when the answer is yes.
+
+The whole design falls out of one measurement:
+
+| Stage | Model | Cost per call |
+|---|---|---|
+| Stage 1 | YOLOv8n object detection | **~16 ms** |
+| Stage 2 | Moondream 2B vision-language model | **~1,900 ms** |
+
+Three orders of magnitude. A VLM cannot look at a 30 FPS video stream; it can barely look at one
+frame every eight seconds. So Eye-Q is a **cascade**: a cheap detector looks at everything and a
+slow, smart model looks at almost nothing.
+
+```
+30 FPS of pixels ──▶ [YOLO: is there a person?] ──▶ ~0.1 FPS of subjects ──▶ [VLM: is this a violation?]
+                          runs on everything                                    runs on almost nothing
+```
+
+Everything else in this codebase is machinery for deciding what "almost nothing" means — which
+subjects are worth a question, which questions have already been answered, and which can be dropped
+without missing anything that matters.
+
+**Deployment shape:** a single process, entirely local. No cloud calls, no external services. It runs
+on a laptop, and `.env.pi5` is a worked tuning profile for a Raspberry Pi 5.
+
+---
+
+## 2. System shape
+
+```mermaid
+flowchart TD
+    SRC["RTSP / MP4 / webcam"]
+
+    subgraph capture_t ["VideoCapture thread"]
+        CAP["_capture_loop<br/>grab · pace · decode"]
+    end
+
+    BUF[("RollingFrameBuffer<br/>POSIX shared memory ring<br/>lock-free readers")]
+
+    subgraph yolo_t ["YOLOWatchdog thread"]
+        DET["_watchdog_loop<br/>detect · track · gate"]
+    end
+
+    subgraph vlm_t ["VLMWorker thread"]
+        VLM["_worker_loop<br/>coalesce · shed · memoise"]
+        EXE["VLMInfer executor<br/>1 worker, hard deadline"]
+        VLM --> EXE
+    end
+
+    subgraph loop_t ["uvicorn event loop"]
+        SINK["AlertSink task"]
+        API["FastAPI routes"]
+        MJPEG["MJPEG generator"]
+    end
+
+    DB[("SQLite · WAL")]
+    UI["Dashboard"]
+    HOOK["Webhook"]
+
+    SRC --> CAP --> BUF
+    BUF --> DET
+    BUF --> VLM
+    BUF --> MJPEG
+    DET -- "ZMQ :5557 · detection" --> VLM
+    EXE -- "ZMQ :5558 · vlm_result" --> SINK
+    SINK --> DB
+    SINK -- "WebSocket" --> UI
+    SINK -- "violations only" --> HOOK
+    API <--> DB
+    MJPEG --> UI
+    API --> UI
+```
+
+### Threads
+
+Four daemon threads plus the uvicorn event loop, all in one process:
+
+| Thread / task | Owner | Entry point |
+|---|---|---|
+| `VideoCapture-default` | lifespan | [capture.py:236](app/core/capture.py#L236) `_capture_loop` |
+| `YOLOWatchdog` | lifespan | [detector.py:428](app/pipelines/detector.py#L428) `_watchdog_loop` |
+| `VLMWorker` | lifespan | [vlm_worker.py:816](app/pipelines/vlm_worker.py#L816) `_worker_loop` |
+| `VLMInfer` (1-worker pool) | VLMWorker | [vlm_worker.py:493](app/pipelines/vlm_worker.py#L493), used at [:948](app/pipelines/vlm_worker.py#L948) |
+| `AlertSink` (asyncio task) | lifespan | [alert_sink.py:106](app/services/alert_sink.py#L106) `_consume_loop` |
+| uvicorn event loop | `main.py` | [main.py:110](main.py#L110) |
+
+They exist to protect one invariant:
+
+> **A slow VLM must never drop a video frame.**
+
+That is enforced at three independent hops, each of which is non-blocking by construction:
+
+1. **Buffer writes overwrite; they never wait.** The ring buffer has no "full" state — the writer
+   advances the head and clobbers the oldest frame ([buffer.py:225-236](app/core/buffer.py#L225-L236)).
+2. **ZMQ sends are `NOBLOCK` and drop at the high-water mark.** A backed-up subscriber returns
+   `zmq.Again`, the publisher logs it and moves on ([ipc.py:95-100](app/core/ipc.py#L95-L100)).
+3. **Inference runs behind a deadline.** `_infer` submits to a single-worker executor and calls
+   `future.result(timeout=...)`, so a wedged model wakes the caller on schedule
+   ([vlm_worker.py:948](app/pipelines/vlm_worker.py#L948)).
+
+The result is that Stage 2 falling behind degrades *coverage* (fewer questions answered), never
+*capture* (the video keeps flowing and the live feed keeps drawing).
+
+### Why two ZMQ endpoints, not one socket with two topics
+
+`:5557` carries `detection` (Stage 1 → Stage 2); `:5558` carries `vlm_result` (Stage 2 → control
+plane). They are separate endpoints because **ZMQ sockets are not thread-safe** and the two
+publishers live in different threads ([settings.py:102-113](app/config/settings.py#L102-L113)). Each
+publisher owns its socket in the thread that uses it; nothing is shared.
+
+The result subscriber is the `zmq.asyncio` variant (`AsyncEventSubscriber`,
+[ipc.py:290](app/core/ipc.py#L290)) so the control plane polls without blocking the event loop.
+
+---
+
+## 3. Ownership and lifecycle
+
+**`main.py` is only a CLI.** It translates flags into `EYEQ_*` environment variables and hands off to
+uvicorn ([main.py:35](main.py#L35) `_apply_cli_overrides`, [main.py:110](main.py#L110)).
+
+The ordering there is load-bearing. `get_settings()` is `@functools.lru_cache(maxsize=1)`
+([settings.py:400](app/config/settings.py#L400)), so **the first call freezes configuration for the
+life of the process**. Any override — CLI flag, test fixture, demo script — must be written to the
+environment before anything reads settings.
+
+**The FastAPI lifespan owns every component** ([server.py:156](app/api/server.py#L156)). It builds
+them in a fixed order and tears them down in exact reverse:
+
+```
+startup:   database → buffer → publisher → capture → Stage 1 → Stage 2 → alert sink → sync_rules
+shutdown:  alert sink → Stage 2 → Stage 1 → capture → publisher → buffer (close+unlink) → database
+```
+
+Single ownership is deliberate, and the docstring at [server.py:1-10](app/api/server.py#L1-L10)
+records why: an earlier version split ownership between `main.py` and the lifespan, and the result
+was that rules silently stopped reaching the pipeline. Note also that `sync_rules` runs *before* the
+first frame is judged ([server.py:181](app/api/server.py#L181)) — otherwise Stage 2 would spend its
+first inferences answering no question at all.
+
+`uvicorn` owns `SIGINT`/`SIGTERM` and drives lifespan shutdown; there is no separate signal handling.
+
+**Entry points:**
+
+| Command | What it runs |
+|---|---|
+| `uv run eyeq` | Full pipeline + dashboard on `:8000` |
+| `uv run eyeq --api-only` | Dashboard and API only, no capture or inference |
+| `uv run eyeq --no-vlm` | Stage 1 only — detection and live feed, no model load |
+| `uv run python demo_cctv.py` | Seeded warehouse-CCTV demo with three pre-built rules |
+| `uv run python demo.py` | Stage 1 only in a native OpenCV window |
+
+---
+
+## 4. The workflow: how a frame becomes an alert
+
+```mermaid
+sequenceDiagram
+    participant C as VideoCapture
+    participant B as RingBuffer
+    participant Y as YOLOWatchdog
+    participant V as VLMWorker
+    participant S as AlertSink
+    participant U as Dashboard
+
+    C->>B: write(frame, monotonic_ts)
+    Note over C,B: over-rate frames are grabbed but never decoded
+
+    Y->>B: read_latest()
+    Note over Y: skip if timestamp unchanged
+    Y->>Y: detect → track → gate (label, ROI, cooldown)
+    Y-->>V: ZMQ "detection" {label, bbox, track_id, ts}
+
+    Note over V: drain backlog · coalesce by (label, track_id)
+    Note over V: drop groups older than staleness threshold
+    Note over V: skip subjects already judged (verdict memo)
+    V->>B: read_by_timestamp(ts) — once per frame group
+    Note over V: crop every subject BEFORE any inference runs
+    V->>V: infer under hard deadline → parse Yes/No
+    V-->>S: ZMQ "vlm_result" {verdict, response, snapshot}
+
+    S->>S: store alert (both verdicts)
+    S-->>U: WebSocket broadcast
+    S-->>S: webhook (violations only)
+```
+
+### Stage 0 — Capture
+
+[`capture.py:350`](app/core/capture.py#L350) `_run_capture` runs **two independent rates**:
+
+- **Grab pacing** applies to file sources only. A file is paced to its own FPS
+  ([`_playback_interval`](app/core/capture.py#L433)) so an MP4 plays back in real time rather than
+  blurring past at decode speed. Live sources — device indices, `rtsp://`, `http://` — free-run and
+  are consumed as fast as they arrive.
+- **Write gating** applies to everything. If less than `1/target_fps` has elapsed, the frame is
+  grabbed but **not decoded** ([capture.py:401-403](app/core/capture.py#L401-L403)) — `grab()`
+  without `retrieve()` skips the expensive JPEG/H.264 decode entirely. Surviving frames are written
+  with a `time.monotonic()` timestamp, which becomes the frame's identity everywhere downstream.
+
+Write gating is a **deadline with half a frame of slack**, not `elapsed < 1/target_fps` against the
+last write. The strict test rejected every frame that arrived a hair early, so a source running at
+exactly `target_fps` lost frames in bursts: measured on a 25 FPS file at `target_fps=25`, capture
+wrote **15.7 FPS** before and **25.0 FPS** after.
+
+Resilience: EOF triggers an in-session `_rewind()` for seamless looping; connection failures back
+off exponentially, capped at 30 s, interruptible by shutdown, and **retried for as long as the
+appliance runs** (`reconnect_max_retries=None`) — it used to give up after five attempts, about
+31 s, leaving a camera that rebooted slowly blind until a process restart. A run of
+`_MAX_CONSECUTIVE_ERRORS` per-frame exceptions hands over to that reconnect path rather than
+logging 100 times a second. `_MIN_SESSION_S = 0.5` stops a source that ends instantly from pinning
+a core in a reopen spin.
+
+### Stage 1 — Detect, track, gate
+
+[`_process_frame`](app/pipelines/detector.py) runs four passes:
+
+1. **Decode** YOLO output, filter by confidence, normalize boxes to 0–1. Deliberately *not* narrowed
+   with Ultralytics' `classes=` argument — both the live overlay and the co-occurrence gate below
+   need every class YOLO scored, and narrowing here would disable the gate with no counter moving.
+2. **Track** — `tracker.update(...)` assigns ids for the whole frame at once. Frames with no
+   detections still call `update([])` so tracks age correctly.
+3. **Resolve co-occurrence** — `_pair_blocked(candidates)`, whole-frame for the same reason tracking
+   is: whether a detection qualifies is a fact about the *other* boxes in its frame. Runs after
+   tracking, so the box that publishes already carries the id Stage 2 keys on.
+4. **Gate** — each detection passes **label → ROI → size → pair → cooldown**, in that order, each
+   with its own counter so `/api/status` can show *why* things were dropped.
+
+Stage 1 sheds ahead of Stage 2's four layers rather than forwarding everything to them, so
+`triggers_coalesced` and `instances_shed` both read lower than they did before it existed. Measured
+over 300 s of `cctv_demo.mp4` at the demo's settings, the ladder removes **97.4%** of detections
+before ZMQ: 24.1% on the size floor, 73.2% on the cooldown, leaving 190 of 7,352 published.
+
+Five details are worth understanding before changing anything here:
+
+**Cooldown is per instance, not per label.** The key is `f"{label}#{track_id}"`
+([detector.py:652](app/pipelines/detector.py#L652)). Before tracking existed, the key was just
+`"person"` — meaning one person in frame suppressed alerts for *everyone else* for the whole cooldown
+window. In a warehouse with five workers, four were invisible.
+
+**Display scope is wider than trigger scope.** Every detection above the confidence threshold is
+appended to a `deque(maxlen=256)` with a `fired` flag, *regardless* of whether it passed the gates
+([detector.py:666-667](app/pipelines/detector.py#L666-L667)). The live feed reads that deque
+([`recent_detections`](app/pipelines/detector.py#L300)), so the operator sees the whole scene while
+only a fraction of it wakes the VLM.
+
+**The ladder order is load-bearing, and the cooldown must stay last.** `should_trigger` *mutates* —
+it records the trigger and returns `True` in the same breath. Any gate placed below it therefore
+spends a subject's cooldown on a detection it then discards, so a person rejected at 30 px would be
+suppressed by a cooldown they never spent when they walk close enough to answer. Stage 2 makes the
+same call one stage later by refusing to memoise a subject it skipped for being too small. Two tests
+in `TestStageOneSizeFloor` and `TestCoOccurrenceGating` exist solely to lock this in.
+
+**The size floor and pair gate live in Pass 4, never Pass 1.** Filtering candidates before
+`tracker.update()` would hand a subject a fresh `track_id` on crossing the floor, and Stage 2's memo
+is keyed `(track_id, rule_id)` — so every approach would become a cache miss and the filter would
+*increase* VLM load. It would also remove the box from the live overlay.
+
+**Repeated frames are skipped — before they are copied.** The loop reads
+`buffer.latest_timestamp()` first; a timestamp it has already processed is counted as
+`frames_repeated` and costs no full-frame copy and no inference. Without this, a 6 FPS clip under a
+30 FPS watchdog would run YOLO five times on identical pixels.
+
+**The loop paces from the start of each cycle.** It used to pace from the end of inference, so
+every cycle lasted `interval + inference` and the watchdog never reached `watchdog_fps`: measured
+with real YOLOv8n on CPU against a 25 FPS source, **15.1 FPS before, 25.0 FPS after** (capped by
+the source). Note the consequence — the watchdog now actually spends the CPU `EYEQ_WATCHDOG_FPS`
+asks for, which makes that setting a real lever rather than a ceiling it could not reach.
+
+**Runtime settings are read once per frame.** `sync_rules` swaps the label scope, ROI, pair
+requirements and confidence from the API thread. `_process_frame` snapshots all four into locals,
+so one frame is gated by one configuration and a swap to `None` mid-frame cannot raise.
+
+#### The size floor, and why it moved from Stage 2
+
+Stage 2 had this floor first, and it was correct there but paid for too late. A 30 px subject that
+`_too_small` was always going to reject had already cost a ZMQ publish, a ring-buffer read, and a
+slot in the batch `vlm_max_instances_per_batch` truncates — meaning it could **displace a legible
+subject** from the priority sort. That last point is what made it worth moving rather than leaving.
+
+Both floors are kept. Stage 2's remains a backstop against anything else publishing on `:5557` and
+against `_prepare` being driven directly, which every test in `TestUnreadableSubjectsAreSkipped`
+does. Both read `vlm_min_subject_px` and both call `BoundingBox.pixel_size`, so the predicate is
+literally the same function and cannot drift by a pixel.
+
+> **Reading the counters:** `vlm.instances_too_small` should read **zero**. That is the healthy
+> steady state, not a regression — Stage 1 sheds first. A non-zero value means the floors were
+> deliberately set apart, or something other than this watchdog is publishing on the detection
+> endpoint. Watch `watchdog.detections_filtered_size` instead.
+
+#### Co-occurrence gating — `overlap_ratio`, not IoU
+
+A rule may carry a `pair_label`: its targets only trigger when a partner class has an overlapping
+box in the same frame — "a person **holding a phone**", not "a person".
+
+**The predicate is deliberately not IoU.** A cell phone fully inside a person's box scores
+**IoU ≈ 0.028** — not because the phone is barely inside, but because the person is roughly
+thirty-six times larger and IoU divides by the *union*. Any IoU threshold loose enough to admit that
+pair also admits two boxes that merely graze at a corner. `BoundingBox.overlap_ratio` divides by the
+**smaller** box instead, returning ~1.0 for full containment at any size ratio, and
+`yolo_pair_overlap` (0.5) reads as "at least half the smaller object is inside the larger". Bare
+`intersection > 0` was rejected as the opposite failure: YOLO boxes are generous and axis-aligned,
+so a phone on a desk two metres behind someone clips their box by a pixel.
+
+**The partner is exempt from two gates, and both fail silently if that changes.** The pair search
+runs over the raw Pass-1 candidate list, which has had only the confidence filter applied:
+
+- *Exempt from the label allowlist* — a rule watching only `person` narrows `target_labels` to that
+  one label, so the phone would already be gone. This works only because `model.predict()` is given
+  no `classes=` argument. Adding one is the obvious future "optimisation" and would disable the gate
+  with no counter moving.
+- *Exempt from the size floor* — a phone is **always** under a 96 px floor. Testing partners against
+  it means the gate can never fire, and it fails **closed**, so Stage 2 simply goes quiet while every
+  counter looks like a peaceful scene.
+
+**The primary's own box publishes** — not a union, not both. A union box has no identity of its own;
+synthesising one breaks `_coalesce`'s key, the `(track_id, rule_id)` memo, `_is_new_subject` and
+`_remember_verdict` at once, and its *shape changes every frame* as the phone moves in the hand, so
+even a stable synthetic id would fail `rejudge_iou` constantly. That would disable Stage 2's main
+load control in the name of a load-shedding feature.
+
+#### Why `pair_label` is per-rule, and when it does nothing
+
+`sync_rules` hands Stage 1 the **coarsest** setting across rules, because Stage 1 must never filter
+out something a rule still wants. A pair requirement is a *narrowing*, and there is no coarsest
+narrowing. With one plain `person` rule alongside one `person + cell phone` rule, the only
+composition that keeps the plain rule firing is **no gate at all** — so the requirement is dropped
+and every person wakes the VLM.
+
+That is correct but invisible, so `sync_rules` logs a warning naming the rule responsible:
+
+```
+Rule 'Forklift watch' targets 'person' with no pair_label, so the 'person + cell phone'
+gate on rule 'Phone use' cannot be enforced at Stage 1 — every person will still wake the VLM.
+```
+
+A global setting would always shed, but the failure directions are not symmetric. Per-rule fails
+toward **over-triggering** — wasted inference, recoverable. Global fails toward **silently blinding a
+rule** the operator never meant to narrow — a missed violation, which is not.
+
+### Stage 2 — The VLM worker
+
+This is where most of the engineering is. The problem: triggers arrive faster than 8-second
+inferences can consume them, so the worker must decide what to skip. It does so in **four layers**,
+cheapest first.
+
+**Layer 1 — Coalesce** ([`_collect_batch`](app/pipelines/vlm_worker.py#L850)). Take one blocking
+receive, then drain up to 512 queued triggers. Keep only the **newest payload per
+`(label, track_id)`** ([:906-913](app/pipelines/vlm_worker.py#L906-L913)), sort newest-first, and cap
+at 64. Keying on `label` alone was a real bug: five workers in frame collapsed into a single
+judgement, because they all looked like "person".
+
+**Layer 2 — Shed stale** ([:1101-1108](app/pipelines/vlm_worker.py#L1101-L1108)). Group events by
+timestamp — one timestamp is one source frame — and discard whole groups older than
+`vlm_staleness_s`. This happens *before* any frame is fetched or pixel touched, so shedding is
+essentially free. **A high `triggers_stale` count is correct load shedding, not a fault.**
+
+**Layer 3 — Memoise verdicts** (`_rules_to_judge`). This is the main load-control mechanism, and
+it has **two tiers** — an exact lookup on `(track_id, rule_id)`, then a spatial fallback when the id
+is new. The second exists because the first was measurably not working; see *Identity churn* below.
+The exact tier skips a `(track_id, rule_id)` pair when its answer is still expected to hold — all
+of:
+
+- the subject has a stable track id (an untracked detection is nobody in particular);
+- the verdict is younger than `vlm_verdict_ttl_s`;
+- and the subject has *not* moved away from where it was judged — unless it moved *and* at least
+  `vlm_min_rejudge_s` has passed.
+
+That last floor matters. Movement is detected as `bbox.iou(judged_bbox) < rejudge_iou`, and without a
+time floor a person simply walking across frame would demand a fresh inference roughly every 0.6
+seconds. The governing arithmetic, stated in the settings themselves (`vlm_verdict_ttl_s`):
+
+```
+duty_cycle = subjects × inference_seconds ÷ verdict_ttl_seconds
+```
+
+Five subjects at 8 s/inference with a 300 s TTL is a duty cycle of 0.13 — comfortable. Drop the TTL
+to 30 s and it is 1.33, and the worker is permanently behind.
+
+**Read `subjects` as *track ids*, not people — that distinction is the whole of the next section.**
+Substituting the measured value rather than the intuitive one changes the answer completely: six
+people at 1.9 s with a 300 s TTL is 0.038, but the 80 track ids those six people actually produced,
+across two rules, is 1.01 — saturated.
+
+### Identity churn is the dominant load driver
+
+Every gate in this pipeline is keyed on `track_id`, and `track_id` is not stable. Measured over a
+300 s replay of `cctv_demo.mp4` (`bench/replay_load.py`):
+
+| | |
+|---|---|
+| distinct track ids | **80**, for ~6 real people |
+| memo misses: **new id** | **122 (98.4%)** |
+| memo misses: TTL expired | **0** |
+| memo misses: subject moved | 2 |
+
+Zero TTL expiries in five minutes. `vlm_verdict_ttl_s`, `vlm_rejudge_iou` and `vlm_min_rejudge_s`
+were doing nothing — and they are the three knobs an operator reaches for first.
+
+The two gates that look independent fail *together*, because both read the same unstable value: a
+fresh id hits `last is None` in `CooldownGate.should_trigger` and `entry is None` in
+`_rules_to_judge` in the same instant, and `_is_new_subject` then sorts it *ahead* of genuine
+re-checks. Nothing in the pipeline was a gate a new id did not walk straight through.
+
+**The spatial tier.** On an exact miss the memo scans for a verdict from the same rule and the same
+label, within `vlm_crossid_reuse_s` (45 s), whose box overlaps this one by at least
+`vlm_crossid_iou` (0.7). Measured effect on the same replay: hit rate 67.4% → **87.4%**, inferences
+**124 → 48** (0.413/s → 0.16/s), duty cycle at 1.9 s/query 0.78 → **0.30**. `memo_miss_new_track`
+fell by exactly the number of spatial hits gained, which is what makes it the diagnosed fix rather
+than a coincidence.
+
+The label is carried in the memo *entry* rather than the key precisely because this tier matches on
+geometry, and geometry alone would hand a forklift's verdict to the person driving it. A hit is
+written through under the new key, so the next frame takes the O(1) exact path instead of rescanning.
+
+**Where the ids come from.** Two sources, and the first is not a bug:
+
+- *Looping playback.* The demo clip is 17 s and `VideoCapture` seeks to frame 0 on EOF. On rewind the
+  previous pass's tracks are still alive — `max_age_frames=60` is 10 s at 6 FPS — but the frame-1
+  boxes are 17 s of motion away, so nothing matches and ~14 fresh ids mint every loop, forever.
+  About 85% of the 80 ids are this. **The tracker is behaving correctly**; the boxes genuinely do not
+  overlap, and resetting it on seek would not change the count.
+- *Continuous footage.* Smaller but real. On `demo1.mp4` (37 s, no loop) a person visible in 105 of
+  555 frames still produced 8 distinct ids from detection flicker alone — a gap longer than
+  `max_age_frames` retires a track that then returns as a stranger. Add greedy id swaps when two
+  people cross, and occlusions past 10 s.
+
+**The 0.7 threshold is the safety argument.** It is far above the 0.2 the tracker itself uses to
+assert two boxes are the same object, so this tier never claims an identity the tracker would have
+rejected — it only recovers one the tracker lost. It is still a real trade: reusing across
+identities can hand one subject the verdict earned by another, and a wrongly reused "No" is a missed
+alert. Bounded by the tight IoU, by a window far shorter than the TTL, by a `0` kill switch
+(`EYEQ_VLM_CROSSID_REUSE_S=0`), and by being counted separately as `instances_memoised_spatial`.
+**The accuracy cost is unmeasured** — see Gaps.
+
+**Diagnosing this on a live appliance.** `/api/status` exposes the miss reasons, which is what makes
+the difference between tuning and guessing:
+
+| Signal | What it means | What to do |
+|---|---|---|
+| `memo_miss_new_track` dominates | Identity is churning | The TTL is irrelevant however high you set it. This tier is the lever. |
+| `memo_miss_ttl` dominates | Verdicts really are ageing out | Raise `vlm_verdict_ttl_s` — here it will actually help |
+| `memo_miss_moved` dominates | Subjects walk out of their own boxes | Raise `vlm_min_rejudge_s` |
+| `instances_memoised_spatial` ≫ `instances_memoised` | Nearly all shedding rests on cross-identity reuse | Tighten `vlm_crossid_iou`; check for a fixable cause (frame rate, dropped frames) |
+| `detections_filtered_cooldown` dwarfs every other Stage 1 drop | The cooldown is carrying the whole load | Nothing else is contributing; look upstream |
+
+At Stage 1 the churn signature is **`cooldown_keys` ≫ `tracks_active`** — keys are `label#id` and
+prune on age, so ids minting faster than the cooldown ages them out shows as a growing ratio while
+`tracks_active` stays flat.
+
+**Considered and not done.** A *motion model* in the tracker would cut churn at source and help fast
+movers, but does nothing for detection flicker, occlusion past `max_age_frames`, or a video seek —
+which is most of it here. *Appearance hashing* is the only approach that would recognise a person who
+moved **and** changed id, but it is net-new machinery, fragile under lighting and pose change, and no
+such utility exists in the repo. *Raising the TTL* is measured to be useless: zero expiries in 300 s.
+*Changing Stage 1's cooldown* misses the point — Stage 1 already sheds 73%; the leak was at Stage 2.
+
+Batched probing (`vlm_batch_size > 1`) encodes each image before calling `probe_binary_batch`,
+whose contract is handles. Passing images straight through made every row raise on the default
+`moondream4bit` backend, so batching produced no verdicts at all.
+
+**Layer 4 — Prioritise and truncate** ([:1178-1186](app/pipelines/vlm_worker.py#L1178-L1186)).
+Never-before-judged subjects sort ahead of re-checks, then newest first. Anything past
+`vlm_max_instances_per_batch` is deferred and counted as `instances_shed`. The priority order is the
+point: a person who just walked into frame is more informative than a re-check of someone already
+cleared.
+
+**Then the ordering guarantee.** The frame is read **once per group**, and **every crop is taken
+before any inference runs** (`_prepare`):
+
+```python
+frame = self._read_frame(group[0])             # once
+crops = [prepare_vlm_crop(frame, e.bbox, ...) for e in group]   # all of them
+for crop in crops:                             # only now do we infer
+    ...
+```
+
+This is a correctness requirement, not an optimisation. Inference takes seconds; the ring buffer
+recycles slots in well under a second. Cropping up front makes the buffer irrelevant by the time the
+slow work starts.
+
+### Crop preparation and the tiling threshold
+
+[`prepare_vlm_crop`](app/pipelines/vlm_worker.py#L141) is the single path from a frame plus a box to
+the array the backend sees: pad the box by `vlm_crop_padding` (0.20) per axis and clamp to the frame,
+optionally dim outside the subject (`vlm_focus_dim`, off), then letterbox to a `vlm_square_edge`
+(378) square padded with mid-grey `114`. There is exactly one implementation because there used to be
+two — `bench/make_fixtures.py` called a helper bare and took its *signature* default — and every
+accuracy number measured before that was fixed described a crop the appliance does not generate.
+
+**Why letterbox at all.** Not for token count. The image-token count is **always 729** regardless of
+input size, because `vision_projection` adaptive-pools to 27×27 and hard-codes `.view(729, …)`.
+The real reason is in `overlap_crop_image`, which resizes the global view with an unconditional
+`pil_img.resize((378, 378), LANCZOS)` that does *not* preserve aspect ratio. Subjects here run about
+1:3, so without letterboxing a standing person reaches the encoder three times too wide.
+
+**Why 378 exactly.** The shipped 2025 model tiles by `select_tiling()` in `image_crops.py`, which
+returns a single tile only when **`min(height, width) ≤ 378`** — a test on the *short* side. The
+number falls out of `crop_window_size = (378//14 − 2×4) × 14 = 266` plus
+`total_margin_pixels = 14×4×2 = 112`. The threshold has **no margin**:
+
+| Crop reaching the model | tiling | encoder passes |
+|---|---|---|
+| 378×378 | (1,1) | **2** |
+| 379×379 | (3,3) | 10 |
+| 392×392 | (3,3) | 10 |
+| 511×511 | (3,3) | 10 |
+| 511×383 | (2,4) | 9 |
+| 378×283 | (1,1) | **2** |
+
+Since the vision encoder is 88.8% of a query, tiling multiplies the expensive half. Two consequences
+worth carrying:
+
+- **Do not raise `vlm_square_edge`.** 379 is a 5× encoder cost. In particular 392 — which this
+  document and the settings once suggested as a Qwen2-VL-friendly alternative — costs 10 passes here.
+  It is correct only if you also change backends.
+- **`vlm_max_crop_edge` was 511 and is now 378.** 511 was `512 − 1`, tracking the *2024* model's
+  `if max_dim < 512` branch; that model is no longer the default. Under the 2025 rule 511 is
+  single-tile only for very elongated crops — a 511×383 crop, a person barely off square, cost 9
+  passes. This path is reached only when `vlm_square_edge=0`, so the bug was latent, but it was a
+  4.5× cost sitting in the documented opt-out. Pinned by `TestTilingInvariant`.
+
+**The redundant cache reload — taken.** `load_encoded_image` copies every block's K/V for the image
+positions (~143 MB at fp16) and ran before every rule, although only `encode_image` writes those
+positions: a question's prefill writes after them, and the causal mask hides anything a longer,
+earlier question left behind. `Moondream4BitBackend` now tracks which handle is live (a weak
+reference) and reloads only when another image was encoded since. Measured on the 29 fixtures × 3
+rules at MPS, including an interleaved encode-A / encode-B / probe-A pass that must reload: every
+p(yes) bit-identical, median probe **161.5 → 152.6 ms**. Unified memory makes that copy cheap; on
+CPU (fp32, ~287 MB) it is proportionally larger.
+
+**The redundant encode — taken, and smaller than predicted.** `overlap_crop_image` returns
+`tiling[0] × tiling[1] + 1` crops, so `n_crops` is **never 1**. Even at tiling `(1,1)` the global
+view and its single tile come from the same `pil_img.resize((378, 378), LANCZOS)` call and are
+pixel-identical, and the encoder ran on both. `vlm_dedupe_encode` (default on) patches
+`MoondreamModel._vis_enc` as an instance attribute — the mechanism `_align_remote_code` already
+uses for two other fixes, so no vendored file is edited — encoding one row when
+`torch.equal(x[0], x[1])` holds and repeating it back, since `reconstruct_from_crops` requires
+`n_crops` rows and `.view` rejects an expanded tensor.
+
+The guard is a full tensor comparison rather than a tiling assumption, so if a future revision or
+a different `vlm_square_edge` makes the crops genuinely differ it falls through to encoding both
+rather than answering about the wrong pixels.
+
+Measured on the 29 bundled fixtures at MPS: the encode step falls from 1,874 ms to 1,491 ms (20.4%), and a full three-rule query from 2,229 ms to 1,985 ms (11%). All 87 probes came back bit-identical — zero verdict flips, max p_yes delta 0.000000, including the six probes sitting within 0.1 of the threshold. **The first estimate was ~800 ms, or 44%, and it was wrong.** Halving the batch does
+not halve the time: a batch of two costs well under twice a batch of one on a GPU saturated by
+neither. The win is real and free, but it is a fifth of the encode, not half.
+
+**Why cropping stays in Stage 2.** Moving it to Stage 1 was considered and declined. It would kill
+one real failure mode — a trigger whose frame has already been overwritten is currently lost, and a
+Stage 1 crop would make the ring buffer irrelevant end to end. But it delivers **no accuracy or
+latency change**, because the model sees identical pixels either way, and it would put image bytes on
+a wire that today carries ~200 bytes of JSON: ~428 KB raw or ~25 KB as JPEG, against a 1000-deep
+high-water mark, on top of the 415 MB ring buffer. The invariant that a slow VLM must never drop a
+frame is protected by keeping that hop small.
+
+#### What a timeout actually bounds
+
+`vlm_timeout_s` bounds **the batch, not the work.** `future.result(timeout=...)` abandons the
+*caller's* wait; the inference itself keeps running on the executor's single worker, and its result
+is discarded when it finishes. The next batch may queue behind it and pay a fresh full timeout. A
+timed-out future is cancelled, which stops any job still *queued* behind the wedged one from running
+at all. Shutdown is checked between rules, and `stop()` leaves a still-busy executor to the worker
+thread's own teardown rather than shutting it down underneath a pending submit.
+
+`request_stop()` exists for this and is a **no-op on three of the four backends**, including the
+shipped default. That is not an oversight:
+
+- The dominant cost is `encode_image` — one uninterruptible sequence of torch ops, ~1,491 ms of a
+  ~1,750 ms query.
+- The default verdict path is `probe_binary`, a single prefill with **no decode loop to interrupt**.
+- `vlm_max_tokens` is 2, so even interrupting generation would save at most one token.
+- A second executor would be worse than the stall: every `query()` and `probe_binary()` writes the
+  model's shared K/V cache, and there is **no model-level lock anywhere in `vlm_backends.py`** — two
+  concurrent inferences would interleave into the same tensors and produce *silently wrong verdicts*.
+
+The only real fix is running inference in a subprocess that can be killed, which was considered and
+not taken: it costs an IPC hop per encode and a second copy of model memory. Reducing how often the
+budget is blown — see the encoder dedupe above — was preferred. `triggers_timed_out` is on
+`/api/status`; a rising value with a flat verdict rate means the appliance is spending its budget on
+work it throws away.
+
+**Judging** ([`_judge_instance`](app/pipelines/vlm_worker.py#L1236)): convert the crop once
+(BGR → RGB → PIL), append `" Answer with only Yes or No."` to the prompt, infer under the deadline,
+parse, remember the verdict, save one evidence JPEG per subject (shared across all rules that
+subject matched), and publish. A timeout calls `backend.request_stop()` and **abandons the entire
+remaining batch** ([:1198-1202](app/pipelines/vlm_worker.py#L1198-L1202)) — with a single-worker
+executor, continuing would just queue behind a thread that is still wedged.
+
+### Alerting
+
+[`alert_sink.py:125`](app/services/alert_sink.py#L125) `_handle_result` does four things:
+
+1. **Re-file orphans.** If the rule was deleted while its inference was in flight, the alert is
+   stored under sentinel `rule_id = 0` rather than dropped
+   ([:131-134](app/services/alert_sink.py#L131-L134)).
+2. **Store both verdicts.** Violations *and* clears go into the database. A history containing only
+   the times the system said "yes" tells you nothing about whether it was looking.
+3. **Broadcast the database row**, not the `VLMResult` — `record_alert` returns the stored row from
+   the insert itself (`RETURNING *`), the sink grafts on `rule_name` / `label` /
+   `detection_confidence`, and sends that. Live WebSocket cards and paginated history therefore
+   render through one code path and can't drift apart. The broadcast sends to every client
+   concurrently with a 2 s per-client timeout, dropping clients that miss it: it is awaited by the
+   sink, so a single stalled client used to delay storing the next verdict.
+4. **Fire the webhook on violations only**, as a detached task so a slow endpoint cannot stall the
+   sink. The task handles are retained (the event loop holds tasks only weakly), at most four POST
+   at once, and beyond a backlog of 64 new webhooks are dropped and counted —
+   `/api/status` `webhooks.dropped`, with `webhooks.in_flight` beside it. `stop()` waits for
+   in-flight POSTs, bounded by the webhook timeout, before closing their client.
+
+Per-message exceptions are caught and logged inside the loop
+([:121-123](app/services/alert_sink.py#L121-L123)), so one malformed payload can never kill the sink
+and silently stop all alerting.
+
+---
+
+## 5. Component reference
+
+### `app/core/buffer.py` — `RollingFrameBuffer`
+
+A circular frame buffer in POSIX shared memory: three segments holding the frame ring
+`(capacity, H, W, 3) uint8`, a `float64` timestamp array, and a 2-slot `int64` metadata array
+(`write_head`, `frame_count`).
+
+The counters live in shared memory rather than `multiprocessing.Value` because `Value` carries a
+POSIX semaphore that `unlink()` cannot release — a genuine resource leak on every shutdown
+([buffer.py:69-74](app/core/buffer.py#L69-L74)).
+
+Writers take a lock; **readers are lock-free, and detect torn reads rather than tolerate them.** The
+writer zeroes a slot's timestamp before overwriting its pixels and restores it after — a sequence
+lock in miniature. `read_by_timestamp` and `read_at_index` re-read the timestamp after copying and
+discard the frame if it moved. This matters more than it looks: with the default 150 frames at
+30 FPS and a 5 s staleness threshold, Stage 2 routinely reads the *oldest* slot, which is the next
+one capture reuses, and a torn read there was not "one slot off" but half of one frame and half of
+a frame five seconds newer. `read_latest` needs no check: the head advances only after a write
+completes. A reader still never stalls the writer, and every read returns a `.copy()`.
+
+A frame whose resolution differs from the buffer is resized straight into its shared slot
+(`cv2.resize(..., dst=...)`), with no intermediate frame-sized array.
+
+`read_by_timestamp(target, tolerance_ms)` is the lookup Stage 2 uses to recover the exact frame a
+detection came from.
+
+Sizing is memory, not frames: 150 frames at 1280×720 ≈ 405 MB; 300 frames at 1080p ≈ 1.77 GB.
+
+### `app/core/capture.py` — `VideoCapture`
+
+Covered in §4. Also worth noting `is_file_source()`
+([capture.py:45](app/core/capture.py#L45)): device indices and stream schemes are always treated as
+live, and only paths that actually exist on disk get file treatment (real-time pacing and looping).
+
+### `app/core/ipc.py` — ZMQ transport
+
+Two-frame multipart messages: `[topic_bytes, json_payload_bytes]`. `EventPublisher` (PUB, binds,
+`NOBLOCK`, `LINGER=0`), `EventSubscriber` (SUB + poller, with `drain()` for backlog collection), and
+`AsyncEventSubscriber` (`zmq.asyncio`, for the event loop).
+
+### `app/pipelines/detector.py` — `YOLOWatchdog`
+
+Covered in §4. Two supporting pieces:
+
+**`CooldownGate`** ([:64](app/pipelines/detector.py#L64)) — an opaque-keyed rate limiter. It prunes
+expired keys at 512 entries and hard-caps at 4096, degrading by forgetting the entries nearest to
+expiry ([:120](app/pipelines/detector.py#L120)). Bounded memory matters here because track ids are
+never reused, so the key space grows forever without pruning.
+
+**Runtime mutators** — `update_roi`, `update_target_labels`, `update_cooldown`, `update_confidence`.
+These let `sync_rules` retune a running watchdog without a restart (§7).
+
+**Model loading** ([:486](app/pipelines/detector.py#L486)) is lazy, runs a dummy warm-up inference,
+and **falls back to CPU** if the accelerator fails — a bad GPU shouldn't take the appliance down.
+
+### `app/pipelines/tracker.py` — `GreedyIoUTracker`
+
+Frame-to-frame identity by greedy IoU matching. Deliberately **not** ByteTrack: ultralytics' tracker
+calls `check_requirements()` on `lap` at import time, which attempts a runtime `pip install` — fatal
+on an offline appliance ([tracker.py:14-18](app/pipelines/tracker.py#L14-L18)).
+
+- **Matching is within-label only** ([:108-113](app/pipelines/tracker.py#L108-L113)) — a person and
+  the forklift they're driving can overlap almost perfectly.
+- All candidate pairs above threshold are scored, sorted `(-iou, idx, track_id)` for determinism, and
+  claimed best-first. A `claimed` set guarantees **two detections in one frame can never share an
+  id** ([:120-133](app/pipelines/tracker.py#L120-L133)).
+- Ids are monotonic, unique across labels, and **never reused**. `_evict()`
+  ([:154](app/pipelines/tracker.py#L154)) retiring tracks past `max_age_frames` is the only bound on
+  memory.
+- Returns ids **in input order**, so the caller can `zip` them straight back onto its detections.
+
+The accepted trade-off is stated at [:21-24](app/pipelines/tracker.py#L21-L24): with no motion model,
+an occlusion can split one person into two ids. That costs one redundant inference. It never costs a
+missed alert — which is the right direction for the error to point.
+
+### `app/core/labels.py` — Prompt / label linting
+
+Pure functions, advisory only, with no role in the runtime pipeline.
+
+- `COCO_CLASSES` — the 80 YOLO classes, served verbatim by `GET /api/labels`.
+- A synonym map: `worker`, `staff`, `employee`, `someone`, `pedestrian`, `driver` → `person`;
+  `vehicle` → `car` ([:40](app/core/labels.py#L40)).
+- An `_AMBIGUOUS` blocklist — `{orange, tie, bear, train, remote, mouse, clock, apple, kite}` are
+  never auto-suggested ([:74-76](app/core/labels.py#L74-L76)), because "high-visibility **orange**
+  vest" is a rule about people, not fruit.
+- `scope_warning()` ([:123](app/core/labels.py#L123)) — when a prompt clearly names a class but the
+  rule has no label filter, it explains that the rule will spend its inference budget on trucks and
+  pallets. **Non-blocking**: the API attaches it as a `warning` field and the UI offers it as a
+  choice.
+
+### `app/pipelines/vlm_worker.py` — `VLMWorker`
+
+Covered in §4. Two more things:
+
+**Square letterboxing** ([`letterbox_square`](app/pipelines/vlm_worker.py#L336)). Every subject is a
+standing person, so crops run about 1:3. A model that resizes its input to a square receives that
+person stretched to three times their width — a shape nothing in its training data had. The crop is
+scaled by its long side into a fixed square canvas and the remainder padded mid-grey, which both
+preserves the proportions and makes the image-token count **constant**: prefill is ~99% of a Stage 2
+query, and it now stops varying with how tall the subject happened to be. `EYEQ_VLM_SQUARE_EDGE=0`
+restores the old max-edge downscaling.
+
+**Focused cropping** ([`crop_detection_focused`](app/pipelines/vlm_worker.py#L235)). The crop is
+padded by 15% for context, and everything outside the subject's *own* box can be dimmed. Dimming is
+**off by default** (`EYEQ_VLM_FOCUS_DIM=1.0`) — it is a synthetic edit no VLM saw in training. The
+mechanism is kept rather than deleted because the failure it fixed was real and measured: with it
+off, a helmeted neighbour standing inside the padding routinely flipped a bare-headed subject's
+verdict. Set `EYEQ_VLM_FOCUS_DIM=0.4` to restore it if crowded scenes start answering about the
+wrong person.
+
+**Frame recovery** (`_read_frame`). Lookup is by **exact timestamp** — 1 ms of slack for float
+noise. A trigger carries the buffer's own timestamp through JSON unchanged, so the frame is either
+still there to the bit or it is gone. The tolerance used to be 500 ms, which at 30 FPS quietly
+substituted a frame up to fifteen slots away and cropped the subject's box from where they *used*
+to stand. There is no fallback to `frame_index`: it is a ring slot, not a frame number, and a
+timestamp lookup that failed has already examined that slot — the fallback could only ever succeed
+on a torn one. A miss counts as `triggers_frame_lost`.
+
+### `app/pipelines/vlm_backends.py` — Three swappable backends
+
+One `@runtime_checkable` Protocol (`load`, `query`, `encode`, `answer`, `query_batch`,
+`request_stop`, `cleanup`, `unload`), four implementations, chosen by `EYEQ_VLM_BACKEND` through
+[`build_backend`](app/pipelines/vlm_backends.py#L1010):
+
+| Backend | Mechanism | Use for |
+|---|---|---|
+| `moondream4bit` (default) | In-process 4-bit `2025-04-14` Moondream, sha-pinned | Laptop / workstation with an accelerator |
+| `moondream` | In-process fp32 `2024-08-26` Moondream2, revision-pinned | The measured baseline; CPU-only boxes |
+| `transformers` | Any chat-templated vision-to-text HF model | Swapping in Qwen2-VL, SmolVLM, MiniCPM-V |
+| `openai_compat` | HTTP to Ollama / llama.cpp / vLLM / SGLang | Quantized models, edge hardware |
+
+All four are local — there is no cloud path in this codebase. `build_backend` returns an
+**unloaded** backend deliberately: the consuming thread calls `load()` itself, so model weights land
+in the thread that will use them.
+
+Only `TransformersVLMBackend` supports genuine interruption, via a `StoppingCriteria` watching a
+`threading.Event` checked per token ([:396-399](app/pipelines/vlm_backends.py#L396-L399)). On the other two,
+`request_stop()` is an honest no-op — neither Moondream wrapper accepts a stopping hook, and
+the HTTP backend is bounded by its request timeout instead. Interruption does not apply to a probe
+either: one forward pass has no token boundary to stop at. That is a shrink, not a regression — the
+worst case falls from `prefill + N decode` to `prefill`.
+
+#### Verdict probing — a second, optional Protocol
+
+Stage 2 needs exactly one bit back. Generating it as *text* runs the model autoregressively and then
+guesses the bit back out of the words with a string parser that defaults to "no alert" on anything it
+fails to recognise. `BinaryProbeBackend` reads the bit off the distribution the prefill already
+computed: compare the probability mass on the Yes tokens against the No tokens at the first answer
+position, one forward pass, no decode, no parsing.
+
+It is kept **separate** from `VLMBackend` on purpose. Adding it to the base Protocol would force all
+four backends to implement it, and one genuinely cannot — so the worker checks the capability with
+`isinstance` and falls back:
+
+| Backend | Probing | Why |
+|---|---|---|
+| `moondream4bit` (default) | Yes | `_prefill_prompt()` returns its logits |
+| `transformers` | Yes | Logits are directly available |
+| `openai_compat` | Depends on the server | **llama.cpp implements `logprobs`; Ollama does not** |
+| `moondream` | No | The pinned revision's `answer_question()` exposes no logits |
+
+A backend that refuses raises `ProbeUnsupportedError`, and the worker **latches** it off for the rest of
+the session — re-checking would buy a doomed request before every single generate. The query that
+triggered the fallback is still answered the old way, so the transition costs nothing.
+
+#### Losing the endpoint
+
+Putting inference behind a socket adds a failure mode the in-process backends do not have: the server
+can be gone. `OpenAICompatBackend._post` is the single choke point every request passes through, so it
+is where the distinction is drawn. Transport failures and 5xx replies raise `VLMUnavailableError`,
+which the worker reads as a statement about the *endpoint* rather than the query and answers by
+abandoning the rest of the batch — otherwise every remaining subject pays its own doomed round-trip to
+learn the same thing. Measured against a dead port, a batch of eight costs one connection attempt and
+~10 ms instead of eight.
+
+A 4xx is deliberately excluded. That is a malformed request, which is our bug to fix; shedding traffic
+on it would hide a payload defect behind what looks like an infrastructure problem.
+
+Two supporting details. The connect timeout is split out of `vlm_timeout_s` and bounded at 2 s: a read
+has to allow a full prefill over 729 image tokens, but a connection to loopback either lands at once or
+is not going to, and the scalar form previously gave connect the same minute — pinning the single-worker
+executor for that long before anything noticed. And the outage log is latched, because `_collect_batch`
+delivers a new batch roughly every second and a refused connection fails fast, so an unthrottled ERROR
+would repeat several times a second for the duration. `/api/status` carries `backend_unavailable` and
+`batches_dropped_unavailable`, since a backend that is down is indistinguishable from a quiet scene in
+every other counter.
+
+Note for anyone writing tests here: since Python 3.12 `runtime_checkable` `isinstance` uses
+`inspect.getattr_static`, which does not see attributes a `MagicMock` conjures on access. A mock
+double is therefore reported as probe-*incapable* however it is specced. `tests/test_vlm.py` uses a
+real `ProbeStub` class for this reason.
+
+`transformers` is pinned `<4.50` because the `moondream` backend's pinned revision depends on APIs removed after
+that.
+
+### `app/pipelines/vlm_judge.py` — `BinaryVerdictParser`
+
+Turns free text into a boolean, in three strategies:
+
+1. **First word** — "Yes…" / "No…". Highest confidence (0.95), and the reason the prompt is forced to
+   end with *"Answer with only Yes or No."*
+2. **Keyword scoring** — with negation handling, so `"is not blocking"` scores negative
+   ([:112-120](app/pipelines/vlm_judge.py#L112-L120)).
+3. **Default: `False`.**
+
+That default is a policy choice, documented at [:37-43](app/pipelines/vlm_judge.py#L37-L43): an
+unparseable response becomes a non-alert. False negatives are recoverable; alert fatigue means the
+operator stops looking at the screen, and then nothing works.
+
+### `app/core/roi.py`, `app/core/overlay.py`
+
+`RegionOfInterest` — normalized polygon with ray-casting point-in-polygon; `contains_bbox_center` is
+the primary gate.
+
+`overlay.py` — all frame annotation, shared by the live MJPEG preview and the native demo window so
+both speak one visual language. Boxes are labelled `person#3 87%`, with a `[TRIGGER]` prefix when the
+detection actually fired.
+
+### `app/services/webhook.py` — `WebhookDispatcher`
+
+One shared `httpx.AsyncClient`, per-request timeout, **no retry and no queue by design**
+([webhook.py:1-6](app/services/webhook.py#L1-L6)). `dispatch()` never raises; failures are logged and
+return `False`. A webhook is a notification convenience, not a delivery guarantee — the database is
+the system of record.
+
+---
+
+## 6. Data and contracts
+
+### Wire schemas — `app/schemas/events.py`
+
+All coordinates are **normalized 0–1**, so resolution changes anywhere don't invalidate stored boxes.
+
+| Model | Topic | Notes |
+|---|---|---|
+| `BoundingBox` | — | `iou()` returns `0.0` for degenerate boxes, so no caller needs a division guard |
+| `DetectionEvent` | `detection` | Stage 1 → Stage 2 |
+| `VLMQuery` | — | Embedded in the result: which rule asked what |
+| `VLMResult` | `vlm_result` | Stage 2 → control plane |
+
+`DetectionEvent.track_id` is **deliberately unconstrained** and defaults to `-1`
+([events.py:107-119](app/schemas/events.py#L107-L119)). A publisher with tracking disabled stays wire
+compatible, and every per-instance code path degrades gracefully to per-label.
+
+`SystemStatus` is declared but **unused** — `/api/status` hand-builds its dict
+([server.py:724-771](app/api/server.py#L724-L771)).
+
+### SQLite — `app/core/database.py`
+
+```
+rules    id · camera_id · name · prompt · target_labels(JSON) · roi_json(JSON)
+         confidence · cooldown_s · enabled · created_at · updated_at
+
+alerts   id · rule_id → rules(id) ON DELETE CASCADE · camera_id · timestamp
+         verdict · raw_response · inference_ms · bbox_json · frame_snapshot
+         created_at · track_id · label
+
+cameras  id · name · source · resolution · fps · enabled · created_at
+```
+
+Indices on `alerts(rule_id)`, `alerts(created_at DESC)`, `rules(camera_id)`. `journal_mode=WAL` so
+the API can read while the sink writes; `foreign_keys=ON`.
+
+**Migrations are additive.** `_migrate_alerts` ([:140](app/core/database.py#L140)) issues idempotent
+`ALTER TABLE ... ADD COLUMN` for post-release columns (`track_id`, `label`) — an existing database
+upgrades in place without losing history.
+
+**Deleting rules doesn't delete history.** Both `delete_rule` and `delete_all_rules` reassign alerts
+to the sentinel rule (`id = 0`) *before* dropping the rows, because `ON DELETE CASCADE` would
+otherwise wipe the log. Single-rule delete used to cascade while delete-all preserved, which made
+deleting one rule the more destructive action. The sentinel itself is refused by `PUT` and
+`DELETE /api/rules/0` (403): deleting it cascaded every orphaned alert away, and enabling it — a rule
+with no labels — woke the VLM for every COCO class.
+
+`synchronous=NORMAL` (crash-consistent under WAL; a power cut can lose the last few commits, never
+corrupt the file) and `busy_timeout=5000` are set at connect. Alerts are inserted with
+`RETURNING *`, paginated `ORDER BY id DESC` — `created_at` has one-second resolution, and ties made
+pages repeat or skip rows — and joined to `rules` for `rule_name` so history renders like the live
+feed. `(rule_id, id DESC)` is indexed for the per-rule history query.
+
+Rule payloads are validated at the API: `confidence` in [0, 1], `cooldown_s ≥ 0`, and `roi_json`
+empty or at least three `[x, y]` vertices in [0, 1]. A malformed polygon used to reach `sync_rules`,
+which treats an unparseable ROI as none, and silently widen the rule to the whole frame. Labels
+outside the COCO vocabulary are warned about, not refused, since a custom YOLO model may score them.
+
+### The polarity contract
+
+**"Yes" means violation, and violations render red.** Rules must be phrased so that an affirmative
+answer is the thing worth looking at:
+
+- ✅ *"Is this person bending at the waist to lift something?"*
+- ❌ *"Is this person lifting safely?"* — inverts the whole UI.
+
+One predicate per rule, one subject per rule. `"Is this person bending over AND not wearing a vest?"`
+gives a small VLM two ways to be wrong and no way to tell you which.
+
+---
+
+## 7. Rule propagation
+
+[`sync_rules`](app/api/server.py#L77) runs at startup and synchronously after every rule
+create/update/delete, before the HTTP response returns. It pushes the same rule table into two stages
+that need it at **different granularities**:
+
+**Stage 2 gets per-rule detail** — each rule's own prompt and its own ROI, registered once per target
+label (or under `"*"` if unscoped). Stage 2 can hold N distinct polygons because it evaluates rules
+one at a time.
+
+**Stage 1 gets the coarsest filter that satisfies every rule** — the union of all labels, the
+*minimum* confidence, the *minimum* cooldown. A single watchdog cannot carry N polygons, and it must
+never filter out something that some rule still wants to see.
+
+The subtlest part is the **three-state label scope**
+([server.py:124-133](app/api/server.py#L124-L133)):
+
+| Scope | Meaning |
+|---|---|
+| `None` | Some rule is unscoped → every label triggers |
+| non-empty set | Trigger on exactly this union |
+| **empty set** | **Nothing triggers** |
+
+**Stage 2's table is swapped atomically.** `sync_rules` builds the full list and calls
+`VLMWorker.replace_rules` once. It used to call `clear_rules()` and then `add_rule()` per rule, each
+under its own acquisition of the lock, and a batch matching in between saw no rules, judged nobody,
+and moved no counter — after which Stage 1's cooldown kept that subject quiet for its full window.
+
+**Editing a rule's question forgets its verdicts.** The memo is keyed `(track_id, rule_id)` and an
+edit keeps the id, so a rule reworded from "missing a hard hat?" to "missing a vest?" went on
+answering with hard-hat verdicts for up to `vlm_verdict_ttl_s`, and the spatial tier handed them to
+new ids too. `replace_rules` compares each rule's prompt and ROI with the previous table and drops
+memo entries for any that changed or disappeared. Unchanged rules keep theirs, so saving an
+unrelated edit does not cause an inference storm.
+
+The empty case is the one that's easy to get wrong. With no enabled rules there is no question to
+ask, so Stage 2 should stay asleep rather than burn inferences nobody asked for — while the detector
+keeps running and the live feed keeps drawing. Collapsing "no rules" into "all labels" would make an
+idle system the most expensive one.
+
+---
+
+## 8. API and frontend
+
+### Routes — `app/api/server.py`
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` | Dashboard |
+| `GET` | `/api/stream/{camera_id}.mjpg` | Live MJPEG stream |
+| `GET` | `/api/stream/{camera_id}/frame.jpg` | Single annotated JPEG (fallback) |
+| `GET` | `/api/rules` | List rules |
+| `GET` | `/api/labels?prompt=` | COCO vocabulary + suggestions for a prompt |
+| `POST` | `/api/rules` | Create rule (returns `warning` if unscoped) |
+| `DELETE` | `/api/rules` | Bulk clear — history preserved via sentinel |
+| `GET` | `/api/rules/{id}` | Get rule |
+| `PUT` | `/api/rules/{id}` | Partial update |
+| `DELETE` | `/api/rules/{id}` | Delete rule |
+| `GET` | `/api/alerts?limit&offset&rule_id` | Paginated alert history |
+| `GET` | `/api/alerts/{id}` | Single alert |
+| `GET` | `/api/cameras` · `POST` · `DELETE /{id}` | Camera registry |
+| `GET` | `/api/status` | Full pipeline telemetry |
+| `WS` | `/ws/events` | Live alert push |
+
+Plus static mounts: `/static` (frontend assets, forced `no-store`) and `/snapshots` (evidence images,
+following `settings.snapshot_dir` rather than a hardcoded path).
+
+`/api/status` is the observability surface and exposes every counter that matters: buffer occupancy,
+watchdog FPS and per-reason filter counts, active tracks, and the worker's
+`triggers_stale` / `triggers_coalesced` / `instances_memoised` / `instances_shed`. Stage 1's
+per-reason counts include `detections_filtered_size` and `detections_filtered_pair`; note that
+`vlm.instances_too_small` now reads **zero** in normal operation, because Stage 1 applies the same
+floor first. `_stats_of`
+tolerates a dead component by returning `None` rather than throwing
+([server.py:708](app/api/server.py#L708)) — a status endpoint that 500s when a thread dies is useless
+exactly when you need it.
+
+### Frontend — vanilla JS, no build step
+
+Four transports, each chosen for a different surface:
+
+| Surface | Transport |
+|---|---|
+| Live video | **MJPEG** `multipart/x-mixed-replace` in an `<img>` |
+| Live video fallback | **Still-JPEG polling** at ~5 FPS (Safari, and stream errors) |
+| Alerts | **WebSocket** `/ws/events`, with a 30 s application-level ping |
+| Stats | **Polling** `/api/status` every 3 s |
+| Rules, history | Plain REST |
+
+The live feed has three layers of resilience, because a blank video panel is the failure users
+actually notice:
+
+1. `src` is set in the HTML, not JS, so the feed loads even if `app.js` is cached stale or blocked
+   (`frontend/index.html:117-123`).
+2. Client-side, an `onerror` handler swaps to snapshot polling, and after 8 s a
+   `naturalWidth === 0` check catches the nastier case — a stream that connects but renders nothing
+   (`frontend/app.js:75-80`).
+3. Server-side, the generator **never goes silent and never dies**
+   ([server.py:391-452](app/api/server.py#L391-L452)): it emits a cached placeholder card instead of
+   no part, and wraps each frame in try/except with logging backoff. It also opens with a leading
+   CRLF, without which Safari won't parse the stream at all.
+
+**One encoder serves every viewer.** `_PreviewBroadcaster` is a single producer task, started by
+the first stream and stopped with the last. It re-renders only when the frame timestamp or the
+watchdog's processed-frame count changed (or once a second, so overlay boxes still age out on a
+stalled camera), and wakes every client with the same bytes; `/frame.jpg` reuses them while fresh.
+Each stream used to run its own copy–draw–resize–encode loop at `stream_fps`, so N tabs cost N times
+the CPU and unchanged frames were re-encoded — on hardware where JPEG encoding competes with YOLO.
+
+Overlay drawing dedupes to the newest box per `(label, track_id)` — otherwise a stationary person is
+drawn 30 times into a smear — and the full-frame ROI is no longer tinted and labelled on every
+frame. Every `cv2.imencode` runs under `asyncio.to_thread`; encoding inline would stall the event
+loop and take the REST API and WebSocket down with the video.
+
+**Shutdown with a tab open.** The stream never ends by itself, so uvicorn used to wait forever for
+it to disconnect, and a second Ctrl+C skipped lifespan shutdown — threads, shared memory and the
+database left behind. `main.py` and `demo_cctv.py` pass `timeout_graceful_shutdown=5`; measured with
+three viewers attached, Ctrl+C now exits in about 6 s through a clean lifespan shutdown, where the
+previous code was still running 20 s later. The lifespan's teardown also runs when startup fails
+part-way, and component `stop()` joins run off the event loop.
+
+The **scope-warning flow** is the one clever bit of UI: on save, if a rule has no labels, the client
+calls `/api/labels?prompt=` and renders an inline choice — *"Watch only person"* (fills the field and
+resubmits) or *"Watch every class"* (accepts and resubmits). Guidance at the moment of the decision,
+not a validation error afterwards.
+
+---
+
+## 9. Notable implementation ideas
+
+1. **The cascade itself.** Three orders of magnitude of latency arbitrage between a detector and a
+   VLM. Everything else follows from it.
+2. **Zero-copy shared-memory ring with lock-free readers.** Readers are stale-tolerant, so a reader
+   can never stall the writer, so the VLM can never drop a frame.
+3. **Four-layer load control** — coalesce, shed, memoise, truncate — with an operator-facing formula
+   (`duty_cycle = subjects × inference_s ÷ ttl`) rather than a magic number.
+4. **Focused crops.** Dim everything outside the subject's own box so a neighbour can't flip the
+   verdict. A correctness fix that costs nothing at inference time.
+5. **Crop-before-infer as a correctness guarantee.** Inference outlives buffer slots; crops don't.
+6. **Four swappable VLM backends behind one Protocol.** The same appliance runs an in-process HF
+   model on a laptop and a quantized model over HTTP on a Pi, with one env var between them.
+7. **Conservative verdict parsing.** Three strategies defaulting to `False`, because alert fatigue is
+   a worse failure than a missed alert.
+8. **The accelerator is arbitrated, not contended.** Stage 1 and an in-process VLM cannot both
+   drive MPS — the process segfaults inside `_mps_convolution_impl`, one thread building an
+   `MPSGraph` while another tears one down. So the two `auto`s resolve in one place, and Stage 2
+   wins: losing MPS costs Stage 1 **9.9 ms/frame** (16.9 → 26.8) and would cost Stage 2
+   **9.8 s/verdict** (1,873 → 11,712). A thousandfold asymmetry is not a close call. This also
+   retires a year-old default — `vlm_device` was `cpu` on the finding that Moondream2 ran 5.6 s
+   there against 6.1 s on MPS, and the fp32 model now measures 3,327 ms on MPS against 4,757 ms
+   on CPU. See [EVALUATION-4bit.md](EVALUATION-4bit.md) §6. Device detection uses a *functional*
+   probe (`torch.zeros(1, device="mps")`), not a capability flag, because the flag lies.
+9. **Prompt-side latency engineering.** `max_tokens=2` and a forced Yes/No suffix — each extra token
+   is another sequential forward pass through the model. Note the ceiling is a *guard*, not a lever:
+   it bounds a model that ignores the instruction and rambles, and it stops a batched `generate()`
+   being held to one row's budget. It does not speed up a model that already stops at EOS, and at
+   ~99% prefill there is little decode to remove — which is why probing, not the token cap, is what
+   actually moves Stage 2.
+10. **Both verdicts stored, the DB row broadcast.** History stays interpretable, and live and
+    historical views can't diverge.
+11. **Graceful degradation everywhere it counts:** GPU warm-up failure → CPU; rule deleted mid-flight
+    → sentinel; malformed message → logged, sink survives; camera drops → backoff and reconnect;
+    file ends → seamless loop.
+
+---
+
+## 10. Configuration
+
+All settings are `pydantic-settings` fields with the prefix `EYEQ_`, readable from the environment or
+a `.env` file. Every field carries a `description` explaining its rationale — `settings.py` is the
+authoritative configuration documentation.
+
+**Source and buffer**
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `EYEQ_DEFAULT_SOURCE` | `0` | RTSP URL, file path, or device index |
+| `EYEQ_FRAME_WIDTH` | `1280` | 160–7680 |
+| `EYEQ_FRAME_HEIGHT` | `720` | 120–4320 |
+| `EYEQ_TARGET_FPS` | `30` | 1–120 |
+| `EYEQ_BUFFER_CAPACITY` | `150` | 10–3000 (≈405 MB at 720p) |
+
+**IPC**
+
+| Variable | Default |
+|---|---|
+| `EYEQ_ZMQ_ENDPOINT` | `tcp://127.0.0.1:5557` |
+| `EYEQ_ZMQ_RESULT_ENDPOINT` | `tcp://127.0.0.1:5558` |
+
+**Stage 1 — detection**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EYEQ_YOLO_MODEL` | `models/yolov8n.pt` | |
+| `EYEQ_YOLO_CONFIDENCE` | `0.25` | 0–1 |
+| `EYEQ_YOLO_IMGSZ` | `640` | 416 is ~2.1× faster on ARM CPU; no gain on MPS |
+| `EYEQ_DETECTION_COOLDOWN_S` | `5.0` | Per *instance* when tracking is on |
+| `EYEQ_WATCHDOG_FPS` | `30.0` | ≤120 — **the main CPU lever** |
+
+**Tracking**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EYEQ_TRACK_ENABLED` | `true` | `false` reverts to one-alert-per-label |
+| `EYEQ_TRACK_IOU_THRESHOLD` | `0.2` | 0.45 measured 4.2 ids/person; 0.2 gives 2.0 |
+| `EYEQ_TRACK_MAX_AGE_FRAMES` | `60` | |
+
+**Stage 2 — VLM**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EYEQ_VLM_BACKEND` | `moondream4bit` | `moondream4bit` \| `moondream` \| `transformers` \| `openai_compat` |
+| `EYEQ_VLM_MODEL` | `moondream/moondream-2b-2025-04-14-4bit` | `vikhyatk/moondream2` for the `moondream` backend |
+| `EYEQ_VLM_REVISION` | `a89c5922…` | Pinned to a sha — this backend patches the repo's remote code. `2024-08-26` for the `moondream` backend |
+| `EYEQ_VLM_COMPUTE_DTYPE` | *(auto)* | Dequantized weight dtype: fp32 on CPU, fp16 on MPS, bf16 on CUDA |
+| `EYEQ_VLM_API_BASE` | `http://127.0.0.1:11434/v1` | `openai_compat` only |
+| `EYEQ_VLM_API_MODEL` | `moondream` | |
+| `EYEQ_VLM_API_KEY` | `EMPTY` | |
+| `EYEQ_VLM_MAX_TOKENS` | `2` | Guard against a rambling model, not a latency lever |
+| `EYEQ_VLM_TIMEOUT_S` | `60.0` | Runaway guard, not a latency target |
+| `EYEQ_VLM_STALENESS_S` | `5.0` | Shed frames older than this |
+| `EYEQ_VLM_DEFAULT_PROMPT` | *(none)* | Fallback for unmatched detections |
+| `EYEQ_VLM_CROP_PADDING` | `0.15` | Context around the subject |
+| `EYEQ_VLM_FOCUS_DIM` | `1.0` | Context dimming, off by default. `0.4` restores it |
+| `EYEQ_VLM_VERDICT_TTL_S` | `300.0` | `0` disables verdict reuse |
+| `EYEQ_VLM_REJUDGE_IOU` | `0.5` | Below this counts as "moved" |
+| `EYEQ_VLM_MIN_REJUDGE_S` | `20.0` | Floor on movement-triggered re-judging |
+| `EYEQ_VLM_MAX_INSTANCES_PER_BATCH` | `8` | Hard cap on inferences per batch |
+| `EYEQ_VLM_MAX_CROP_EDGE` | `378` | Single-tile at any aspect ratio on the 2025 encoder; `0` disables. Reached only when `SQUARE_EDGE=0`. Was 511, which tracked the *2024* model's threshold — see “Crop preparation and the tiling threshold” |
+| `EYEQ_VLM_MIN_SUBJECT_PX` | `96` | Skip subjects with too little pixel evidence, measured on the longer side; `0` disables |
+| `EYEQ_VLM_BATCH_SIZE` | `1` | Crops per forward pass. `1` dispatches singly |
+| `EYEQ_VLM_SQUARE_EDGE` | `378` | Letterbox canvas edge. `0` falls back to max-edge downscaling |
+| `EYEQ_VLM_PROBE` | `auto` | Read verdicts from token probabilities where supported |
+| `EYEQ_VLM_PROBE_THRESHOLD` | `0.5` | p(yes) at or above which a probed verdict alerts |
+
+**Devices**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EYEQ_DEVICE` | `auto` | Stage 1 — `auto` \| `mps` \| `cuda` \| `cpu`. Under `auto` it **yields the accelerator to an in-process VLM and takes CPU**; two threads on one MPS device segfaults PyTorch |
+| `EYEQ_VLM_DEVICE` | `auto` | `auto` \| `mps` \| `cuda` \| `cpu`. The 4-bit model is vision-bound and wins the arbitration; `moondream` still prefers `cpu` |
+
+**API, storage, streaming, logging**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EYEQ_API_HOST` | `0.0.0.0` | |
+| `EYEQ_API_PORT` | `8000` | |
+| `EYEQ_ENABLE_PIPELINE` | `true` | `false` = dashboard only |
+| `EYEQ_ENABLE_VLM` | `true` | `false` = Stage 1 only, no model load |
+| `EYEQ_DATABASE_PATH` | `data/eyeq.db` | |
+| `EYEQ_SNAPSHOT_DIR` | `data/snapshots` | |
+| `EYEQ_STREAM_FPS` | `12.0` | ≤30 |
+| `EYEQ_STREAM_WIDTH` | `1280` | Preview downscale |
+| `EYEQ_STREAM_QUALITY` | `70` | 10–100 |
+| `EYEQ_WEBHOOK_URL` | *(none)* | Violations only |
+| `EYEQ_WEBHOOK_TIMEOUT_S` | `5.0` | |
+| `EYEQ_LOG_LEVEL` | `INFO` | |
+
+`.env.pi5` is a fully commented ARM / CPU-only profile (`cp .env.pi5 .env`) showing how these
+interact under constraint: 960×540 @ 8 FPS, `WATCHDOG_FPS=4`, `YOLO_IMGSZ=416`, a quantized model
+over `openai_compat`, `VERDICT_TTL_S=900`, and a preview dropped to 640 @ q55 — because JPEG encoding
+is pure CPU and competes directly with YOLO. It is explicitly labelled unverified on hardware.
+
+---
+
+## 11. Testing
+
+268 test functions across 9 files, ~3,800 lines. pytest with `asyncio_mode = "auto"`, no
+`conftest.py` — fixtures are local to each file.
+
+```bash
+uv run ruff check .
+uv run pytest -m "not slow"    # fast suite: no model downloads, no camera
+uv run pytest                  # includes real YOLO + both Moondream backends
+```
+
+**Only 3 tests are marked `slow`.** Everything else runs with no camera and no model weights, which
+is what makes the suite usable:
+
+- **No camera** — `tests/test_capture.py:24` *synthesises* an MP4 with `cv2.VideoWriter` into
+  `tmp_path`, and skips cleanly if the codec is unavailable.
+- **No YOLO** — `_fake_result()` helpers build nested `MagicMock`s mimicking Ultralytics'
+  `Results.boxes` shape (`box.cls[0].item()`, `box.xyxy[0].tolist()`), assigned directly to
+  `watchdog._model`.
+- **No VLM** — `VLMWorker` takes an injectable `backend=`, so tests pass a mock. Backend *selection*
+  is tested through `isinstance(b, VLMBackend)` against the runtime-checkable Protocol, touching no
+  weights.
+- **Real lifespan, no pipeline** — the API fixture sets `EYEQ_ENABLE_PIPELINE=false`, points the
+  database at `tmp_path`, clears the settings cache before *and* after, and drives `lifespan(app)`
+  manually (`httpx.ASGITransport` doesn't fire lifespan events). The real startup path is exercised
+  without loading a model.
+
+Two environment-specific details worth knowing before writing tests here: ZMQ's slow-joiner problem
+is handled by republishing until consumed rather than sleeping, and macOS caps POSIX shared-memory
+names at 31 characters, so buffer ids in tests are short and time-derived.
+
+---
+
+## 12. Traps and known gaps
+
+**Traps**
+
+- **`frame_index` is a ring slot, not a frame number.** Slots are reused every `capacity` frames.
+  Always look frames up by exact timestamp; `_read_frame` has no index fallback precisely because of
+  this.
+- **A buffer slot's timestamp reads 0.0 while it is being rewritten.** That is the torn-read signal,
+  not an unwritten slot to special-case.
+- **`get_settings()` is cached.** The first call freezes configuration. Overrides go into the
+  environment before anything reads settings; tests must call `get_settings.cache_clear()`.
+- **Timestamps are `time.monotonic()`**, not wall clock. They are frame identity, not a date.
+- **"Yes" means violation.** Inverting a prompt inverts the entire UI.
+- **A high `triggers_stale` is correct**, not a fault. It means load shedding is working.
+- **`vlm.instances_too_small` reading zero is correct**, not a broken counter. Stage 1 applies the
+  same size floor first, so Stage 2's is an unreachable backstop. Watch
+  `watchdog.detections_filtered_size` instead. A *non*-zero value means something other than the
+  watchdog is publishing on the detection endpoint.
+- **A rule's `pair_label` is not always enforceable.** A pair requirement is a narrowing, and
+  `sync_rules` composes the *coarsest* setting across rules — so one unpaired rule on the same label
+  drops the gate for every rule. That is deliberate (enforcing it would silently blind the unpaired
+  rule), and it logs a warning naming the rule responsible.
+- **ZMQ sockets are not thread-safe.** A socket belongs to the thread that created it. Don't share.
+
+**Gaps**
+
+- **No data retention.** There is no purge, TTL, or row cap on `alerts`, and no cleanup of
+  `data/snapshots/*.jpg`. Both grow without bound on a long-running appliance. The only
+  retention-shaped code is in-memory pruning (cooldown gate, verdict memo, tracker eviction).
+- **No authentication.** CORS is `*`, the default bind is `0.0.0.0:8000`, and every mutating endpoint
+  is open. Fine on a trusted LAN; not fine anywhere else.
+- **Single-camera in practice.** The schema, the camera registry, and `app.state.captures` are all
+  multi-camera-shaped, but exactly one `VideoCapture` and one buffer are created.
+- **Webhooks are best-effort.** No retry and no persistent queue; a bounded in-memory backlog, with
+  drops counted on `/api/status`.
+- **The tracker has no motion model** — roughly 2 ids per real person at 6 FPS on continuous
+  footage, and **13 per person over a 300 s loop of the bundled clip**, where every rewind mints a
+  fresh set. The spatial memo tier now absorbs most of the cost, but it absorbs it rather than
+  removing it: `bench/replay_load.py` still reports 80 distinct ids for ~6 people. A constant-
+  velocity predictor would cut it at source for fast movers, though not for detection flicker,
+  occlusion past `max_age_frames`, or a video seek — which is most of it here.
+- **Cross-identity verdict reuse is unvalidated for accuracy.** The spatial memo tier trades
+  correctness for load by design, and with no `labels.json` (below) the size of that trade has never
+  been measured. It is bounded — IoU 0.7, a 45 s window, `EYEQ_VLM_CROSSID_REUSE_S=0` to disable —
+  but bounded is not the same as verified.
+- **Probing is unavailable on two of the four backends.** The pinned `2024-08-26` Moondream exposes no logits and Ollama
+  serves no `logprobs`, so both fall back to generate-and-parse — including its conservative default,
+  which turns an unrecognised answer into a silent "no alert". Measured on this project's own
+  fixtures, Moondream answers `"Crouching"` to "is this person bending over or crouching?" on 1 of
+  every 3 queries, and every one of those is filed as no-alert.
+- **`request_stop()` is a no-op** on the Moondream and HTTP backends; a timed-out inference runs to
+  completion and its result is discarded. See "What a timeout actually bounds" — this is a property
+  of the model's API, not a missing feature, and the honest fix is a killable subprocess.
+- **No ROI editor in the UI.** `roi_json` is accepted by the API but can't be drawn from the
+  dashboard.
+- **`SystemStatus` in `schemas/events.py` is dead code** — `/api/status` builds its dict by hand.
+- **Verdict accuracy is now measured once, provisionally, and the result is bad.** The first run
+  ever made on this repo — `bench/results/accuracy-moondream4bit-arm64.json`, 84 judgements over 15
+  subjects — gives **overall precision 0.14 at the shipped `vlm_probe_threshold=0.5`**:
+
+  | rule | precision | recall | TP / FP / TN / FN |
+  |---|---|---|---|
+  | `bending` | **0.20** | 1.00 | 5 / 24 / **0** / 0 |
+  | `carrying` | 0.17 | 1.00 | 1 / 9 / 17 / 0 |
+  | `ppe` | 1.00 | 1.00 | 2 / 0 / 26 / 0 |
+
+  **`bending` answers "yes" to all 29 crops** — a true-negative count of zero — with p(yes) above
+  0.9 for people standing upright at a bench. It is not discriminating at all, and it is the rule
+  `demo_cctv.py` enables and describes as "the rule that puts red on the dashboard". `ppe` is the
+  only rule that works. The PR curve puts best F1 at threshold **0.95**, not 0.5.
+
+  Three caveats, all load-bearing. **The labels are machine-generated** (`_provenance` in
+  `labels.json`), so this measures agreement between two models, not correctness — a human pass with
+  `bench/label_fixtures.py` should overwrite it. **The class balance is too thin for two of the three
+  rules**: `ppe` has 2 positives and `carrying` has 1, so their recall can take only a few discrete
+  values and their intervals span most of [0, 1]. And 15 subjects carries roughly ±25 points at 95%
+  confidence, so this settles a large difference and not a small one. What survives all three
+  caveats is `bending`'s 24 false positives against 0 true negatives: that is not a labelling
+  disagreement, it is a rule that does not work.
+
+- **The size floor, the padding change and cross-identity reuse remain unvalidated.** All three can
+  only lose recall, and none has been measured against the floor-64 alternative or against human
+  labels.
+- ~~The vision encoder does redundant work on every verdict.~~ **Fixed** by `vlm_dedupe_encode`
+  — see “Crop preparation and the tiling threshold”. Worth recording that the estimate was 44% and
+  the measured result is 20% of the encode step and 11% of a three-rule query.
+- **Two feature branches are unmerged.** `feat/stage1-load-shedding` (Stage 1 size floor and
+  co-occurrence gating) and `feat/crop-retune` (stacked on it) carry the behaviour this document
+  describes. `main` does not. Anyone reading `main` is not looking at this code.

@@ -1,0 +1,1241 @@
+{
+  "backend": "moondream4bit",
+  "label_provenance": {
+    "caveat": "These labels come from a vision model, so any accuracy number derived from them measures agreement between two models, not correctness. They are provisional. A human pass with bench/label_fixtures.py should overwrite this file, after which this field should be updated to say so.",
+    "labelled_at": "2026-08-29",
+    "labeller": "Claude (Opus 5) \u2014 MACHINE-GENERATED, NOT HUMAN GROUND TRUTH",
+    "method": "each 378x378 fixture viewed once and judged against the three bench/benchmark_vlm.py prompts; 'unsure' where the crop cannot support the question"
+  },
+  "device": "mps",
+  "system": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.13.11",
+    "physical_cores": 8,
+    "logical_cores": 8,
+    "total_ram_gb": 17.2
+  },
+  "probe_threshold": 0.5,
+  "subjects": 15,
+  "metrics": {
+    "bending": {
+      "rule": "bending",
+      "tp": 5,
+      "fp": 24,
+      "tn": 0,
+      "fn": 0,
+      "unsure_excluded": 0,
+      "subjects": 15,
+      "precision": [
+        0.2,
+        0.07047420643610414,
+        0.4518593533465045
+      ],
+      "recall": [
+        1.0,
+        0.43849391955098227,
+        1.0
+      ],
+      "accuracy": [
+        0.2,
+        0.07047420643610414,
+        0.4518593533465045
+      ],
+      "f1": 0.33333333333333337,
+      "p_yes_histogram": {
+        "0.8": 7,
+        "0.6": 3,
+        "0.9": 13,
+        "0.5": 3,
+        "0.7": 3
+      },
+      "p_yes_min": 0.5235,
+      "p_yes_max": 0.979
+    },
+    "ppe": {
+      "rule": "ppe",
+      "tp": 2,
+      "fp": 0,
+      "tn": 26,
+      "fn": 0,
+      "unsure_excluded": 0,
+      "subjects": 15,
+      "precision": [
+        1.0,
+        0.20654329147389294,
+        1.0
+      ],
+      "recall": [
+        1.0,
+        0.20654329147389294,
+        1.0
+      ],
+      "accuracy": [
+        1.0,
+        0.7961107336956521,
+        1.0
+      ],
+      "f1": 1.0,
+      "p_yes_histogram": {
+        "0.0": 13,
+        "0.1": 12,
+        "0.6": 2,
+        "0.3": 1
+      },
+      "p_yes_min": 0.0481,
+      "p_yes_max": 0.6758
+    },
+    "overall": {
+      "rule": "overall",
+      "tp": 8,
+      "fp": 33,
+      "tn": 43,
+      "fn": 0,
+      "unsure_excluded": 0,
+      "subjects": 15,
+      "precision": [
+        0.14285714285714285,
+        0.02567895594897479,
+        0.51313450331903
+      ],
+      "recall": [
+        1.0,
+        0.20654329147389294,
+        1.0
+      ],
+      "accuracy": [
+        0.6,
+        0.357464427565077,
+        0.8017577191740534
+      ],
+      "f1": 0.25,
+      "p_yes_histogram": {
+        "0.8": 9,
+        "0.0": 13,
+        "0.6": 10,
+        "0.1": 15,
+        "0.9": 13,
+        "0.3": 6,
+        "0.5": 5,
+        "0.7": 4,
+        "0.2": 8,
+        "0.4": 1
+      },
+      "p_yes_min": 0.0481,
+      "p_yes_max": 0.979
+    },
+    "carrying": {
+      "rule": "carrying",
+      "tp": 1,
+      "fp": 9,
+      "tn": 17,
+      "fn": 0,
+      "unsure_excluded": 0,
+      "subjects": 15,
+      "precision": [
+        0.16666666666666666,
+        0.03005258587173032,
+        0.563509436563646
+      ],
+      "recall": [
+        1.0,
+        0.20654329147389294,
+        1.0
+      ],
+      "accuracy": [
+        0.6666666666666666,
+        0.41713125151212976,
+        0.8482389930530876
+      ],
+      "f1": 0.2857142857142857,
+      "p_yes_histogram": {
+        "0.6": 5,
+        "0.8": 2,
+        "0.3": 5,
+        "0.5": 2,
+        "0.1": 3,
+        "0.2": 8,
+        "0.4": 1,
+        "0.7": 1
+      },
+      "p_yes_min": 0.1082,
+      "p_yes_max": 0.8758
+    }
+  },
+  "pr_curve": [
+    {
+      "threshold": 0.0,
+      "precision": 0.0952,
+      "recall": 1.0,
+      "f1": 0.1739,
+      "alerts": 84
+    },
+    {
+      "threshold": 0.05,
+      "precision": 0.0964,
+      "recall": 1.0,
+      "f1": 0.1758,
+      "alerts": 83
+    },
+    {
+      "threshold": 0.1,
+      "precision": 0.1127,
+      "recall": 1.0,
+      "f1": 0.2025,
+      "alerts": 71
+    },
+    {
+      "threshold": 0.15,
+      "precision": 0.1333,
+      "recall": 1.0,
+      "f1": 0.2353,
+      "alerts": 60
+    },
+    {
+      "threshold": 0.2,
+      "precision": 0.1429,
+      "recall": 1.0,
+      "f1": 0.25,
+      "alerts": 56
+    },
+    {
+      "threshold": 0.25,
+      "precision": 0.1569,
+      "recall": 1.0,
+      "f1": 0.2712,
+      "alerts": 51
+    },
+    {
+      "threshold": 0.3,
+      "precision": 0.1667,
+      "recall": 1.0,
+      "f1": 0.2857,
+      "alerts": 48
+    },
+    {
+      "threshold": 0.35,
+      "precision": 0.186,
+      "recall": 1.0,
+      "f1": 0.3137,
+      "alerts": 43
+    },
+    {
+      "threshold": 0.4,
+      "precision": 0.1905,
+      "recall": 1.0,
+      "f1": 0.32,
+      "alerts": 42
+    },
+    {
+      "threshold": 0.45,
+      "precision": 0.1951,
+      "recall": 1.0,
+      "f1": 0.3265,
+      "alerts": 41
+    },
+    {
+      "threshold": 0.5,
+      "precision": 0.1951,
+      "recall": 1.0,
+      "f1": 0.3265,
+      "alerts": 41
+    },
+    {
+      "threshold": 0.55,
+      "precision": 0.2105,
+      "recall": 1.0,
+      "f1": 0.3478,
+      "alerts": 38
+    },
+    {
+      "threshold": 0.6,
+      "precision": 0.2222,
+      "recall": 1.0,
+      "f1": 0.3636,
+      "alerts": 36
+    },
+    {
+      "threshold": 0.65,
+      "precision": 0.2258,
+      "recall": 0.875,
+      "f1": 0.359,
+      "alerts": 31
+    },
+    {
+      "threshold": 0.7,
+      "precision": 0.1923,
+      "recall": 0.625,
+      "f1": 0.2941,
+      "alerts": 26
+    },
+    {
+      "threshold": 0.75,
+      "precision": 0.2,
+      "recall": 0.625,
+      "f1": 0.303,
+      "alerts": 25
+    },
+    {
+      "threshold": 0.8,
+      "precision": 0.2273,
+      "recall": 0.625,
+      "f1": 0.3333,
+      "alerts": 22
+    },
+    {
+      "threshold": 0.85,
+      "precision": 0.2632,
+      "recall": 0.625,
+      "f1": 0.3704,
+      "alerts": 19
+    },
+    {
+      "threshold": 0.9,
+      "precision": 0.3846,
+      "recall": 0.625,
+      "f1": 0.4762,
+      "alerts": 13
+    },
+    {
+      "threshold": 0.95,
+      "precision": 0.5714,
+      "recall": 0.5,
+      "f1": 0.5333,
+      "alerts": 7
+    },
+    {
+      "threshold": 1.0,
+      "precision": 1.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "alerts": 0
+    }
+  ],
+  "judgements": [
+    {
+      "crop": "crop_000.png",
+      "rule": "bending",
+      "track_id": 3,
+      "subject_px": 138,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8856,
+      "answer": "Yes",
+      "latency_ms": 194.3
+    },
+    {
+      "crop": "crop_000.png",
+      "rule": "ppe",
+      "track_id": 3,
+      "subject_px": 138,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0792,
+      "answer": "No",
+      "latency_ms": 171.1
+    },
+    {
+      "crop": "crop_000.png",
+      "rule": "carrying",
+      "track_id": 3,
+      "subject_px": 138,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6298,
+      "answer": "Yes",
+      "latency_ms": 129.0
+    },
+    {
+      "crop": "crop_001.png",
+      "rule": "bending",
+      "track_id": 3,
+      "subject_px": 132,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6478,
+      "answer": "Yes",
+      "latency_ms": 157.6
+    },
+    {
+      "crop": "crop_001.png",
+      "rule": "ppe",
+      "track_id": 3,
+      "subject_px": 132,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1113,
+      "answer": "No",
+      "latency_ms": 142.1
+    },
+    {
+      "crop": "crop_001.png",
+      "rule": "carrying",
+      "track_id": 3,
+      "subject_px": 132,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8081,
+      "answer": "Yes",
+      "latency_ms": 117.7
+    },
+    {
+      "crop": "crop_002.png",
+      "rule": "bending",
+      "track_id": 2,
+      "subject_px": 288,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.9173,
+      "answer": "Yes",
+      "latency_ms": 198.2
+    },
+    {
+      "crop": "crop_002.png",
+      "rule": "ppe",
+      "track_id": 2,
+      "subject_px": 288,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1481,
+      "answer": "No",
+      "latency_ms": 166.4
+    },
+    {
+      "crop": "crop_002.png",
+      "rule": "carrying",
+      "track_id": 2,
+      "subject_px": 288,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.3008,
+      "answer": "No",
+      "latency_ms": 129.5
+    },
+    {
+      "crop": "crop_003.png",
+      "rule": "bending",
+      "track_id": 4,
+      "subject_px": 190,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6993,
+      "answer": "Yes",
+      "latency_ms": 159.6
+    },
+    {
+      "crop": "crop_003.png",
+      "rule": "ppe",
+      "track_id": 4,
+      "subject_px": 190,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1756,
+      "answer": "No",
+      "latency_ms": 143.3
+    },
+    {
+      "crop": "crop_003.png",
+      "rule": "carrying",
+      "track_id": 4,
+      "subject_px": 190,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8758,
+      "answer": "Yes",
+      "latency_ms": 140.5
+    },
+    {
+      "crop": "crop_004.png",
+      "rule": "bending",
+      "track_id": 4,
+      "subject_px": 175,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6407,
+      "answer": "Yes",
+      "latency_ms": 160.6
+    },
+    {
+      "crop": "crop_004.png",
+      "rule": "ppe",
+      "track_id": 4,
+      "subject_px": 175,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0876,
+      "answer": "No",
+      "latency_ms": 142.6
+    },
+    {
+      "crop": "crop_004.png",
+      "rule": "carrying",
+      "track_id": 4,
+      "subject_px": 175,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.5545,
+      "answer": "Yes",
+      "latency_ms": 135.9
+    },
+    {
+      "crop": "crop_005.png",
+      "rule": "bending",
+      "track_id": 6,
+      "subject_px": 147,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.5235,
+      "answer": "Yes",
+      "latency_ms": 196.7
+    },
+    {
+      "crop": "crop_005.png",
+      "rule": "ppe",
+      "track_id": 6,
+      "subject_px": 147,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.6077,
+      "answer": "Yes",
+      "latency_ms": 157.1
+    },
+    {
+      "crop": "crop_005.png",
+      "rule": "carrying",
+      "track_id": 6,
+      "subject_px": 147,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1895,
+      "answer": "No",
+      "latency_ms": 144.7
+    },
+    {
+      "crop": "crop_006.png",
+      "rule": "bending",
+      "track_id": 6,
+      "subject_px": 147,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.5312,
+      "answer": "Yes",
+      "latency_ms": 160.4
+    },
+    {
+      "crop": "crop_006.png",
+      "rule": "ppe",
+      "track_id": 6,
+      "subject_px": 147,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.6758,
+      "answer": "Yes",
+      "latency_ms": 156.9
+    },
+    {
+      "crop": "crop_006.png",
+      "rule": "carrying",
+      "track_id": 6,
+      "subject_px": 147,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.3175,
+      "answer": "No",
+      "latency_ms": 157.3
+    },
+    {
+      "crop": "crop_007.png",
+      "rule": "bending",
+      "track_id": 7,
+      "subject_px": 96,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.788,
+      "answer": "Yes",
+      "latency_ms": 159.6
+    },
+    {
+      "crop": "crop_007.png",
+      "rule": "ppe",
+      "track_id": 7,
+      "subject_px": 96,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1645,
+      "answer": "No",
+      "latency_ms": 167.4
+    },
+    {
+      "crop": "crop_008.png",
+      "rule": "bending",
+      "track_id": 9,
+      "subject_px": 207,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.9752,
+      "answer": "Yes",
+      "latency_ms": 160.7
+    },
+    {
+      "crop": "crop_008.png",
+      "rule": "ppe",
+      "track_id": 9,
+      "subject_px": 207,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1023,
+      "answer": "No",
+      "latency_ms": 143.3
+    },
+    {
+      "crop": "crop_008.png",
+      "rule": "carrying",
+      "track_id": 9,
+      "subject_px": 207,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2255,
+      "answer": "No",
+      "latency_ms": 144.5
+    },
+    {
+      "crop": "crop_009.png",
+      "rule": "bending",
+      "track_id": 11,
+      "subject_px": 125,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.9173,
+      "answer": "Yes",
+      "latency_ms": 189.5
+    },
+    {
+      "crop": "crop_009.png",
+      "rule": "ppe",
+      "track_id": 11,
+      "subject_px": 125,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1009,
+      "answer": "No",
+      "latency_ms": 154.6
+    },
+    {
+      "crop": "crop_009.png",
+      "rule": "carrying",
+      "track_id": 11,
+      "subject_px": 125,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6792,
+      "answer": "Yes",
+      "latency_ms": 135.7
+    },
+    {
+      "crop": "crop_010.png",
+      "rule": "bending",
+      "track_id": 12,
+      "subject_px": 138,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8652,
+      "answer": "Yes",
+      "latency_ms": 178.1
+    },
+    {
+      "crop": "crop_010.png",
+      "rule": "carrying",
+      "track_id": 12,
+      "subject_px": 138,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.686,
+      "answer": "Yes",
+      "latency_ms": 138.5
+    },
+    {
+      "crop": "crop_011.png",
+      "rule": "bending",
+      "track_id": 10,
+      "subject_px": 228,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.78,
+      "answer": "Yes",
+      "latency_ms": 192.2
+    },
+    {
+      "crop": "crop_011.png",
+      "rule": "ppe",
+      "track_id": 10,
+      "subject_px": 228,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1312,
+      "answer": "No",
+      "latency_ms": 157.9
+    },
+    {
+      "crop": "crop_011.png",
+      "rule": "carrying",
+      "track_id": 10,
+      "subject_px": 228,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2975,
+      "answer": "No",
+      "latency_ms": 149.8
+    },
+    {
+      "crop": "crop_012.png",
+      "rule": "bending",
+      "track_id": 1,
+      "subject_px": 233,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8688,
+      "answer": "Yes",
+      "latency_ms": 176.3
+    },
+    {
+      "crop": "crop_012.png",
+      "rule": "ppe",
+      "track_id": 1,
+      "subject_px": 233,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.077,
+      "answer": "No",
+      "latency_ms": 173.1
+    },
+    {
+      "crop": "crop_012.png",
+      "rule": "carrying",
+      "track_id": 1,
+      "subject_px": 233,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.3999,
+      "answer": "No",
+      "latency_ms": 160.7
+    },
+    {
+      "crop": "crop_013.png",
+      "rule": "bending",
+      "track_id": 5,
+      "subject_px": 195,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8312,
+      "answer": "Yes",
+      "latency_ms": 196.9
+    },
+    {
+      "crop": "crop_013.png",
+      "rule": "ppe",
+      "track_id": 5,
+      "subject_px": 195,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0637,
+      "answer": "No",
+      "latency_ms": 196.3
+    },
+    {
+      "crop": "crop_013.png",
+      "rule": "carrying",
+      "track_id": 5,
+      "subject_px": 195,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2069,
+      "answer": "No",
+      "latency_ms": 161.1
+    },
+    {
+      "crop": "crop_014.png",
+      "rule": "bending",
+      "track_id": 9,
+      "subject_px": 197,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.9752,
+      "answer": "Yes",
+      "latency_ms": 169.1
+    },
+    {
+      "crop": "crop_014.png",
+      "rule": "ppe",
+      "track_id": 9,
+      "subject_px": 197,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.094,
+      "answer": "No",
+      "latency_ms": 179.0
+    },
+    {
+      "crop": "crop_014.png",
+      "rule": "carrying",
+      "track_id": 9,
+      "subject_px": 197,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.3041,
+      "answer": "No",
+      "latency_ms": 155.0
+    },
+    {
+      "crop": "crop_015.png",
+      "rule": "bending",
+      "track_id": 10,
+      "subject_px": 179,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.9033,
+      "answer": "Yes",
+      "latency_ms": 214.9
+    },
+    {
+      "crop": "crop_015.png",
+      "rule": "ppe",
+      "track_id": 10,
+      "subject_px": 179,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0839,
+      "answer": "No",
+      "latency_ms": 186.2
+    },
+    {
+      "crop": "crop_015.png",
+      "rule": "carrying",
+      "track_id": 10,
+      "subject_px": 179,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.4264,
+      "answer": "No",
+      "latency_ms": 151.8
+    },
+    {
+      "crop": "crop_016.png",
+      "rule": "bending",
+      "track_id": 8,
+      "subject_px": 275,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.9674,
+      "answer": "Yes",
+      "latency_ms": 196.8
+    },
+    {
+      "crop": "crop_016.png",
+      "rule": "ppe",
+      "track_id": 8,
+      "subject_px": 275,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0676,
+      "answer": "No",
+      "latency_ms": 187.1
+    },
+    {
+      "crop": "crop_016.png",
+      "rule": "carrying",
+      "track_id": 8,
+      "subject_px": 275,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2254,
+      "answer": "No",
+      "latency_ms": 163.0
+    },
+    {
+      "crop": "crop_017.png",
+      "rule": "bending",
+      "track_id": 11,
+      "subject_px": 150,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8578,
+      "answer": "Yes",
+      "latency_ms": 208.2
+    },
+    {
+      "crop": "crop_017.png",
+      "rule": "ppe",
+      "track_id": 11,
+      "subject_px": 150,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0748,
+      "answer": "No",
+      "latency_ms": 187.6
+    },
+    {
+      "crop": "crop_017.png",
+      "rule": "carrying",
+      "track_id": 11,
+      "subject_px": 150,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.7342,
+      "answer": "Yes",
+      "latency_ms": 156.5
+    },
+    {
+      "crop": "crop_018.png",
+      "rule": "bending",
+      "track_id": 14,
+      "subject_px": 108,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.788,
+      "answer": "Yes",
+      "latency_ms": 192.2
+    },
+    {
+      "crop": "crop_018.png",
+      "rule": "ppe",
+      "track_id": 14,
+      "subject_px": 108,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1009,
+      "answer": "No",
+      "latency_ms": 174.3
+    },
+    {
+      "crop": "crop_018.png",
+      "rule": "carrying",
+      "track_id": 14,
+      "subject_px": 108,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2721,
+      "answer": "No",
+      "latency_ms": 149.5
+    },
+    {
+      "crop": "crop_019.png",
+      "rule": "bending",
+      "track_id": 1,
+      "subject_px": 161,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.9579,
+      "answer": "Yes",
+      "latency_ms": 177.8
+    },
+    {
+      "crop": "crop_019.png",
+      "rule": "ppe",
+      "track_id": 1,
+      "subject_px": 161,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1259,
+      "answer": "No",
+      "latency_ms": 190.4
+    },
+    {
+      "crop": "crop_019.png",
+      "rule": "carrying",
+      "track_id": 1,
+      "subject_px": 161,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2721,
+      "answer": "No",
+      "latency_ms": 161.8
+    },
+    {
+      "crop": "crop_020.png",
+      "rule": "bending",
+      "track_id": 12,
+      "subject_px": 107,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.956,
+      "answer": "Yes",
+      "latency_ms": 193.6
+    },
+    {
+      "crop": "crop_020.png",
+      "rule": "ppe",
+      "track_id": 12,
+      "subject_px": 107,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0759,
+      "answer": "No",
+      "latency_ms": 177.8
+    },
+    {
+      "crop": "crop_020.png",
+      "rule": "carrying",
+      "track_id": 12,
+      "subject_px": 107,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.5468,
+      "answer": "Yes",
+      "latency_ms": 143.9
+    },
+    {
+      "crop": "crop_021.png",
+      "rule": "bending",
+      "track_id": 5,
+      "subject_px": 187,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8312,
+      "answer": "Yes",
+      "latency_ms": 189.5
+    },
+    {
+      "crop": "crop_021.png",
+      "rule": "ppe",
+      "track_id": 5,
+      "subject_px": 187,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0481,
+      "answer": "No",
+      "latency_ms": 177.5
+    },
+    {
+      "crop": "crop_021.png",
+      "rule": "carrying",
+      "track_id": 5,
+      "subject_px": 187,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.3008,
+      "answer": "No",
+      "latency_ms": 144.3
+    },
+    {
+      "crop": "crop_022.png",
+      "rule": "bending",
+      "track_id": 8,
+      "subject_px": 225,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.9434,
+      "answer": "Yes",
+      "latency_ms": 203.0
+    },
+    {
+      "crop": "crop_022.png",
+      "rule": "ppe",
+      "track_id": 8,
+      "subject_px": 225,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.3174,
+      "answer": "No",
+      "latency_ms": 187.7
+    },
+    {
+      "crop": "crop_022.png",
+      "rule": "carrying",
+      "track_id": 8,
+      "subject_px": 225,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2174,
+      "answer": "No",
+      "latency_ms": 147.4
+    },
+    {
+      "crop": "crop_023.png",
+      "rule": "bending",
+      "track_id": 15,
+      "subject_px": 109,
+      "truth": true,
+      "verdict": true,
+      "p_yes": 0.979,
+      "answer": "Yes",
+      "latency_ms": 206.7
+    },
+    {
+      "crop": "crop_023.png",
+      "rule": "ppe",
+      "track_id": 15,
+      "subject_px": 109,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1052,
+      "answer": "No",
+      "latency_ms": 189.1
+    },
+    {
+      "crop": "crop_024.png",
+      "rule": "bending",
+      "track_id": 7,
+      "subject_px": 124,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.5851,
+      "answer": "Yes",
+      "latency_ms": 207.1
+    },
+    {
+      "crop": "crop_024.png",
+      "rule": "ppe",
+      "track_id": 7,
+      "subject_px": 124,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1603,
+      "answer": "No",
+      "latency_ms": 185.5
+    },
+    {
+      "crop": "crop_024.png",
+      "rule": "carrying",
+      "track_id": 7,
+      "subject_px": 124,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6893,
+      "answer": "Yes",
+      "latency_ms": 125.4
+    },
+    {
+      "crop": "crop_025.png",
+      "rule": "bending",
+      "track_id": 16,
+      "subject_px": 190,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.8963,
+      "answer": "Yes",
+      "latency_ms": 190.0
+    },
+    {
+      "crop": "crop_025.png",
+      "rule": "ppe",
+      "track_id": 16,
+      "subject_px": 190,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0759,
+      "answer": "No",
+      "latency_ms": 157.5
+    },
+    {
+      "crop": "crop_025.png",
+      "rule": "carrying",
+      "track_id": 16,
+      "subject_px": 190,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.116,
+      "answer": "No",
+      "latency_ms": 128.8
+    },
+    {
+      "crop": "crop_026.png",
+      "rule": "bending",
+      "track_id": 15,
+      "subject_px": 111,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.954,
+      "answer": "Yes",
+      "latency_ms": 187.6
+    },
+    {
+      "crop": "crop_026.png",
+      "rule": "ppe",
+      "track_id": 15,
+      "subject_px": 111,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1176,
+      "answer": "No",
+      "latency_ms": 152.4
+    },
+    {
+      "crop": "crop_026.png",
+      "rule": "carrying",
+      "track_id": 15,
+      "subject_px": 111,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.6478,
+      "answer": "Yes",
+      "latency_ms": 136.7
+    },
+    {
+      "crop": "crop_027.png",
+      "rule": "bending",
+      "track_id": 16,
+      "subject_px": 187,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.9305,
+      "answer": "Yes",
+      "latency_ms": 156.1
+    },
+    {
+      "crop": "crop_027.png",
+      "rule": "ppe",
+      "track_id": 16,
+      "subject_px": 187,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0647,
+      "answer": "No",
+      "latency_ms": 149.8
+    },
+    {
+      "crop": "crop_027.png",
+      "rule": "carrying",
+      "track_id": 16,
+      "subject_px": 187,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.1082,
+      "answer": "No",
+      "latency_ms": 149.2
+    },
+    {
+      "crop": "crop_028.png",
+      "rule": "bending",
+      "track_id": 2,
+      "subject_px": 249,
+      "truth": false,
+      "verdict": true,
+      "p_yes": 0.9173,
+      "answer": "Yes",
+      "latency_ms": 154.9
+    },
+    {
+      "crop": "crop_028.png",
+      "rule": "ppe",
+      "track_id": 2,
+      "subject_px": 249,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.0995,
+      "answer": "No",
+      "latency_ms": 148.6
+    },
+    {
+      "crop": "crop_028.png",
+      "rule": "carrying",
+      "track_id": 2,
+      "subject_px": 249,
+      "truth": false,
+      "verdict": false,
+      "p_yes": 0.2309,
+      "answer": "No",
+      "latency_ms": 152.1
+    }
+  ]
+}

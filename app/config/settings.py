@@ -123,15 +123,104 @@ class Settings(BaseSettings):
     detection_cooldown_s: float = Field(
         default=5.0,
         ge=0.0,
-        description="Minimum seconds between triggers for the same label.",
+        description=(
+            "Minimum seconds between triggers for the same subject. With "
+            "tracking on this is per instance, so one worker's cooldown never "
+            "suppresses the worker standing beside them."
+        ),
+    )
+
+    watchdog_fps: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=120.0,
+        description=(
+            "Maximum rate at which Stage 1 runs YOLO. The main CPU lever on a "
+            "board with no GPU: the watchdog is paced independently of "
+            "capture, so left at 30 it will use every cycle it can get and "
+            "starve the VLM and the API. There is no benefit to setting it "
+            "above the camera's frame rate — repeated frames are skipped "
+            "without inference either way."
+        ),
+    )
+
+    # ── Tracking (Stage 1) ───────────────────────────────────────
+    track_enabled: bool = Field(
+        default=True,
+        description=(
+            "Assign stable per-instance ids so every subject in a frame can be "
+            "judged, not just the first of its label. Set false to restore the "
+            "original one-per-label behaviour exactly."
+        ),
+    )
+    track_iou_threshold: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum IoU for a detection to continue an existing track. Set "
+            "deliberately low: a subject who is not matched gets a fresh id and "
+            "is judged again, so a strict threshold shows up as wasted "
+            "inferences. Measured on the bundled 6 FPS clip, 0.45 produced 4.2 "
+            "ids per real person against 2.0 at this value. Two people in one "
+            "frame can never share an id whatever this is set to, so lowering "
+            "it cannot hide a subject. Raise it for high-frame-rate cameras "
+            "where boxes barely move between frames."
+        ),
+    )
+    track_max_age_frames: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Frames a track survives unmatched before its id is retired. Long "
+            "enough to ride out a subject passing behind an obstacle — who "
+            "would otherwise return as a stranger and cost a fresh inference — "
+            "and short enough that a departed subject stops costing memory."
+        ),
+    )
+
+    yolo_pair_overlap: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How much of the smaller box must lie inside the larger for a "
+            "rule's pair_label to count as a co-occurrence, measured as "
+            "BoundingBox.overlap_ratio — intersection over the *smaller* "
+            "area.\n\n"
+            "Explicitly not IoU. A cell phone fully inside a person's box "
+            "scores about 0.028 on IoU, not because the phone is barely inside "
+            "but because the person is roughly thirty-six times larger and IoU "
+            "divides by the union. Any IoU threshold loose enough to admit "
+            "that pair also admits two boxes that merely graze at a corner. "
+            "Dividing by the smaller area asks the question the operator means "
+            "— 'is the phone in the person?' — and returns ~1.0 for full "
+            "containment at any size ratio.\n\n"
+            "0.5 reads as 'at least half the smaller object is inside the "
+            "larger'. Lower it toward 0 for partners YOLO boxes loosely; "
+            "raising it above ~0.9 demands near-total containment, which a "
+            "phone held out to the side will fail. 0.0 accepts any touch at "
+            "all, which on generous axis-aligned boxes is close to no gate — "
+            "a phone on a desk two metres behind someone clips their box by a "
+            "pixel, and at 30 FPS that is a firehose."
+        ),
     )
 
     # ── VLM (Stage 2) ───────────────────────────────────────────
-    vlm_backend: Literal["moondream", "transformers", "openai_compat"] = Field(
-        default="moondream",
+    vlm_backend: Literal[
+        "moondream4bit", "moondream", "transformers", "openai_compat"
+    ] = Field(
+        default="moondream4bit",
         description=(
-            "Which VLM backend to use. All three run locally — no cloud. "
-            "'moondream' loads Moondream2 in-process via its bespoke API. "
+            "Which VLM backend to use. All four run locally — no cloud. "
+            "'moondream4bit' — the default — loads the 4-bit 2025-04-14 "
+            "Moondream in-process: a third the download of the fp32 revision, "
+            "and the only in-process backend that can read a verdict off the "
+            "prefill logits instead of generating text (see vlm_probe). "
+            "'moondream' loads Moondream2 at the pinned 2024-08-26 revision "
+            "in fp32 via its older bespoke API; it is the baseline the 4-bit "
+            "backend is measured against and stays available if that "
+            "comparison ever goes the wrong way on your hardware. "
             "'transformers' loads any chat-templated vision-to-text model "
             "in-process (Qwen2-VL-2B, SmolVLM, MiniCPM-V) — set vlm_model to "
             "the HF id. 'openai_compat' calls a local OpenAI-compatible server "
@@ -140,7 +229,12 @@ class Settings(BaseSettings):
         ),
     )
     vlm_model: str = Field(
-        default="vikhyatk/moondream2", description="Hugging Face model ID for the VLM."
+        default="moondream/moondream-2b-2025-04-14-4bit",
+        description=(
+            "Hugging Face model ID for the VLM. Set this and vlm_revision "
+            "together — they are read by whichever in-process backend is "
+            "selected, and the two Moondream backends want different pairs."
+        ),
     )
     vlm_api_base: str = Field(
         default="http://127.0.0.1:11434/v1",
@@ -154,20 +248,45 @@ class Settings(BaseSettings):
         default="EMPTY", description="API key for the local VLM server (usually unused)."
     )
     vlm_max_tokens: int = Field(
-        default=24,
+        default=2,
         ge=1,
         description=(
             "Maximum tokens the VLM may generate per query. Verdicts are "
             "binary and BinaryVerdictParser only reads the leading word, so "
-            "this is a worst-case guard against a model that ignores the "
+            "2 is enough for 'Yes' or 'No' plus its punctuation, and the rest "
+            "is a worst-case guard against a model that ignores the "
             "'answer Yes or No' instruction and rambles — each extra token is "
-            "another sequential forward pass. It does not speed up a model "
-            "that already stops at EOS. Ignored by the moondream backend, "
-            "whose wrapper sets its own limit."
+            "another sequential forward pass. This is not a latency lever: it "
+            "does not speed up a model that already stops at EOS, and Stage 2 "
+            "is ~99% prefill regardless. It is moot on the probe path, which "
+            "generates nothing at all. Raise it if a backend prefixes its "
+            "answer, because a truncated leading word parses as 'no alert' "
+            "and disappears silently."
         ),
     )
     vlm_revision: str = Field(
-        default="2024-08-26", description="Model revision/commit for reproducibility."
+        default="a89c59223ef8b5bb7826780728eeec172727ca84",
+        description=(
+            "Model revision/commit for reproducibility. Pinned to a sha rather "
+            "than a branch because the moondream4bit backend patches the "
+            "repo's remote code — it replaces QuantizedLinear.unpack to skip a "
+            "CUDA-only torchao kernel — and a moving revision could change "
+            "what is being patched without anything failing loudly. "
+            "vlm_backend='moondream' wants '2024-08-26' instead."
+        ),
+    )
+    vlm_compute_dtype: Literal["", "float32", "float16", "bfloat16"] = Field(
+        default="",
+        description=(
+            "Dtype the moondream4bit backend dequantizes its packed weights "
+            "to. Empty — the default — picks per device: fp32 on CPU, fp16 on "
+            "MPS, bf16 on CUDA. The CPU choice is the load-bearing one: torch "
+            "has no Accelerate-backed bf16 GEMM on ARM, and Stage 2 is "
+            "prefill-bound, so upstream's bf16 would buy memory at the "
+            "expense of the thing being optimized. Override only against a "
+            "bench/benchmark_vlm.py --compute-dtype sweep on your own board. "
+            "Ignored by every other backend."
+        ),
     )
     vlm_timeout_s: float = Field(
         default=60.0,
@@ -195,25 +314,330 @@ class Settings(BaseSettings):
         ),
     )
     vlm_crop_padding: float = Field(
-        default=0.15,
+        default=0.20,
         ge=0.0,
         le=1.0,
-        description="Extra padding around bounding box as fraction of bbox size.",
+        description=(
+            "Context kept around the subject's box, as a fraction of that "
+            "box's own size. Applied per axis — the width fraction to left "
+            "and right, the height fraction to top and bottom — and clamped "
+            "to the frame, so a subject at the edge simply gets less on that "
+            "side rather than an out-of-bounds slice. A box too small after "
+            "padding is widened to a 64 px floor around its own centre.\n\n"
+            "Costs no latency. The crop is letterboxed to a fixed "
+            "vlm_square_edge canvas afterwards, so more padding buys context "
+            "at the price of resolution on the subject, not of time.\n\n"
+            "That price is real in a crowd. Padding drags in whoever is "
+            "standing nearby, and a helmeted neighbour inside the crop can "
+            "flip the verdict on a bare-headed subject — the failure "
+            "vlm_focus_dim exists to fix. If accuracy drops in crowded "
+            "scenes after raising this, set vlm_focus_dim to 0.4 rather than "
+            "surrendering the context."
+        ),
+    )
+    vlm_focus_dim: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Brightness multiplier applied outside the subject's own box "
+            "within its crop. The padding above exists to give the VLM spatial "
+            "context, but it also drags in whoever is standing nearby — and a "
+            "helmeted neighbour in the frame can flip the verdict on a "
+            "bare-headed subject. Dimming keeps the context readable while "
+            "leaving no doubt who the question is about. 1.0 disables. "
+            "Defaults to disabled: dimming is a synthetic edit no VLM saw in "
+            "training, and vlm_square_edge now bounds the crop so context is "
+            "cheaper than it was when this was introduced. The mechanism is "
+            "kept because the failure it fixed is real — set this to 0.4 to "
+            "restore it if crowded scenes start answering about the wrong "
+            "person."
+        ),
+    )
+    vlm_verdict_ttl_s: float = Field(
+        default=300.0,
+        ge=0.0,
+        description=(
+            "Seconds a per-instance verdict is reused before that subject is "
+            "judged again. This is the appliance's load control, and the "
+            "governing arithmetic is duty_cycle = subjects x inference_s / ttl "
+            "— at ~6s per query on CPU, five subjects and a 30s TTL would "
+            "saturate the VLM completely. Keep it well above 2 x subjects x "
+            "inference_s. 0 disables reuse (every trigger is judged)."
+        ),
+    )
+    vlm_rejudge_iou: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Re-judge a subject early when IoU against the box it was last "
+            "judged in falls below this — they have moved far enough that the "
+            "old verdict may no longer describe them."
+        ),
+    )
+    vlm_min_rejudge_s: float = Field(
+        default=20.0,
+        ge=0.0,
+        description=(
+            "Floor between re-judgements of one subject, however far they "
+            "moved. Without it a single walker re-judges roughly every 0.6s as "
+            "their box slides off its own footprint, which alone would "
+            "saturate an edge CPU."
+        ),
+    )
+    vlm_crossid_reuse_s: float = Field(
+        default=45.0,
+        ge=0.0,
+        description=(
+            "Seconds a verdict may be reused for a subject carrying a "
+            "DIFFERENT track id, matched by position. 0 disables.\n\n"
+            "This exists because the exact memo was measurably not working. "
+            "Every gate in the pipeline is keyed on track_id, and track_id is "
+            "not stable: over a 300s replay of the bundled clip the tracker "
+            "minted 80 ids for about six real people, and 122 of 124 memo "
+            "misses were a new id rather than an expired verdict — zero were "
+            "TTL expiries. An id change resets the Stage 1 cooldown and this "
+            "memo in the same instant, so inference demand ran roughly ten "
+            "times what stable identity would need. Raising "
+            "vlm_verdict_ttl_s does nothing about that; this does.\n\n"
+            "Deliberately a separate, much shorter window than the TTL, "
+            "because it trades correctness for load where the TTL does not: "
+            "reusing across identities can hand one subject the verdict "
+            "earned by another, and a wrongly reused 'No' is a missed alert. "
+            "45s is chosen to span a short looping clip while staying far "
+            "under the 300s TTL. Watch instances_memoised_spatial on "
+            "/api/status — if it dominates instances_memoised, your identity "
+            "is churning and this is carrying the appliance."
+        ),
+    )
+    vlm_crossid_iou: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum overlap between a new subject's box and a previously "
+            "judged one before vlm_crossid_reuse_s will reuse that verdict.\n\n"
+            "Deliberately far above track_iou_threshold (0.2), which is what "
+            "the tracker itself uses to assert two boxes are the same object. "
+            "That gap is the safety argument: this gate never claims an "
+            "identity the tracker would have rejected, only recovers one it "
+            "lost. Lowering it toward 0.2 makes the two equivalent and will "
+            "start merging people who cross paths."
+        ),
+    )
+    vlm_max_instances_per_batch: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Maximum subjects inferred from one drained batch. Never-judged "
+            "subjects are taken first, so a crowd delays re-checks rather than "
+            "first looks."
+        ),
+    )
+
+    vlm_max_crop_edge: int = Field(
+        default=378,
+        ge=0,
+        description=(
+            "Longest side, in pixels, of the crop handed to the VLM. Tracks a "
+            "tiling cliff in Moondream's preprocessor, not a quality dial.\n\n"
+            "Was 511 — i.e. 512-1, the largest value satisfying the 2024 "
+            "encoder's `if max_dim < 512` branch in vision_encoder.py. That "
+            "model is no longer the default backend and that threshold no "
+            "longer applies. The shipped 2025 model tiles by select_tiling() "
+            "in image_crops.py, which returns a single tile only when "
+            "min(height, width) <= 378. The number falls out of "
+            "crop_window_size = (378//14 - 2*4) * 14 = 266 plus "
+            "total_margin_pixels = 112.\n\n"
+            "The difference is not academic. 511 is single-tile only for very "
+            "tall or very wide crops; a 511x383 crop — a person barely off "
+            "square — tiles (2,4) into 9 encoder passes against 2 at 378. "
+            "Since the vision encoder is 88.8% of a query "
+            "(see EVALUATION-4bit.md), that is roughly 4.5x the cost of the "
+            "expensive half. 378 is single-tile at every aspect ratio.\n\n"
+            "Note this path is only reached when vlm_square_edge is 0; "
+            "otherwise letterboxing already fixes the long side and "
+            "short-circuits it. 0 disables."
+        ),
+    )
+
+    vlm_batch_size: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "How many crops the VLM may answer about in one forward pass. "
+            "1 — the default — dispatches one query at a time, which is what "
+            "this appliance has always done. Raising it is measured, not "
+            "assumed: Stage 2 carries 729 image tokens against a one-token "
+            "answer, making it ~99% prefill, and prefill is compute-bound at "
+            "roughly 280 FLOP/byte. Batching amortizes a weight read that "
+            "prefill is not waiting on, so it buys little — while the KV cache "
+            "grows linearly with this value (~295 MB per sequence for "
+            "Moondream at fp32). Measure with bench/benchmark_vlm.py before "
+            "raising it, and never raise it on a memory-bound board. The "
+            "default moondream4bit backend cannot batch at all — its "
+            "revision's batch_answer() is a sequential loop upstream — so "
+            "there this only groups queries, it does not fuse them."
+        ),
+    )
+    vlm_min_subject_px: int = Field(
+        default=96,
+        ge=0,
+        description=(
+            "Skip a detection whose own box, before padding, is smaller than "
+            "this on its longer side. Governs BOTH stages: Stage 1 sheds "
+            "against it before publishing (watchdog.detections_filtered_size) "
+            "and Stage 2 keeps the same test as a backstop. One setting on "
+            "purpose — both call BoundingBox.pixel_size on the same "
+            "fixed-shape ring buffer, so the predicate is literally the same "
+            "function and the two floors cannot drift by a pixel. The "
+            "consequence to know when reading /api/status: "
+            "vlm.instances_too_small should now read ZERO, which is the "
+            "healthy steady state and not a regression — Stage 1 sheds first. "
+            "A non-zero value there means something other than this watchdog "
+            "is publishing on the detection endpoint. "
+            "Such a subject cannot support the question: "
+            "demo_cctv.py already records that at this camera distance a head "
+            "is about 20 px and Moondream answers 'No' to every phrasing of a "
+            "hard-hat question regardless of what is on the worker's head. "
+            "Before this existed the crop fell back to the whole frame, so the "
+            "least answerable subject bought the most expensive inference and "
+            "the answer was filed against that person's box anyway. 0 disables. "
+            "Raised from 24 to 96 to discard crops no model can solve — but "
+            "note what it trades: a skipped subject is never judged at all, so "
+            "this buys precision with recall. It is also measured in "
+            "*captured* pixels, so it interacts with frame resolution more "
+            "sharply than it looks. Measured over cctv_demo.mp4, a floor of 96 "
+            "skips 8.9% of person detections at 1920x1080 — but 24.1% at "
+            "1280x720, which is what demo_cctv.py actually captures, and 38.7% "
+            "at the 960x540 .env.pi5 profile, where 64 is the right value. "
+            "An earlier version of this note claimed 6.5% and quoted only the "
+            "1080p figure; the shipped demo runs at 720p and therefore "
+            "discards roughly a quarter of the people it detects. Recompute "
+            "for your own resolution rather than inheriting a number measured "
+            "at someone else's. "
+            "Watch watchdog.detections_filtered_size on /api/status after "
+            "changing it (NOT vlm.instances_too_small, which correctly reads "
+            "zero because Stage 1 sheds first); if it swallows most detections "
+            "at your camera distance, lower it rather than accepting the blind "
+            "spot."
+        ),
+    )
+
+    vlm_dedupe_encode: bool = Field(
+        default=True,
+        description=(
+            "Encode a crop once when Moondream's preprocessor hands the vision "
+            "tower the same image twice.\n\n"
+            "overlap_crop_image returns tiling[0]*tiling[1] + 1 crops — a "
+            "global view plus one per tile — so it never returns fewer than "
+            "two. At tiling (1,1), which production always hits because every "
+            "crop is letterboxed to vlm_square_edge, the global view and the "
+            "single tile come from the same LANCZOS resize and are "
+            "pixel-identical. The encoder ran on both: roughly 832ms of a "
+            "1,873ms query, on the stage that is 88.8% of Stage 2's cost.\n\n"
+            "Guarded by a full torch.equal comparison rather than a tiling "
+            "assumption, so if the crops ever genuinely differ it falls back "
+            "to encoding both rather than answering about the wrong pixels. "
+            "Set false to disable if you suspect the dedupe is changing "
+            "verdicts — batch-1 and batch-2 GEMM kernels can differ in the "
+            "last bits, and vlm_probe_threshold is a hard cut at 0.5."
+        ),
+    )
+    vlm_square_edge: int = Field(
+        default=378,
+        ge=0,
+        description=(
+            "Edge, in pixels, of the square canvas each crop is letterboxed "
+            "into before it reaches the VLM. Subjects are tall and narrow — "
+            "the demo's crops run about 1:3 — and a model that resizes to a "
+            "square input stretches them, so a person arrives roughly three "
+            "times too wide. Letterboxing scales the long side to fit and pads "
+            "the short one, preserving the shape the model was trained on. "
+            "The stretch is real and confirmed in the model code: "
+            "overlap_crop_image resizes the global view with an unconditional "
+            "pil_img.resize((378, 378), LANCZOS) that does not preserve "
+            "aspect ratio, so a 1:3 person really does arrive three times too "
+            "wide without this.\n\n"
+            "That is now the whole justification. An earlier version of this "
+            "note also claimed letterboxing holds the image-token count "
+            "constant; it does not, because the count is *always* 729 "
+            "regardless of input size — vision_projection adaptive-pools to "
+            "27x27 and hard-codes .view(729, ...). Tiling scales the vision "
+            "encoder's batch dimension, never the token count.\n\n"
+            "378 is Moondream's native SigLIP edge and the exact value at "
+            "which select_tiling still returns a single tile. It has no "
+            "margin: 379 tiles (3,3) into 10 encoder passes. Do not raise it "
+            "on this backend. In particular 392 — suggested here previously "
+            "because 14x28 lands on Qwen2-VL's grid and avoids its "
+            "smart_resize rounding — costs 10 passes on Moondream. It is the "
+            "right value only if you also switch backends. "
+            "0 disables letterboxing and falls back to vlm_max_crop_edge "
+            "downscaling."
+        ),
+    )
+
+    # ── Verdict Probing ──────────────────────────────────────────
+    vlm_probe: Literal["auto", "on", "off"] = Field(
+        default="auto",
+        description=(
+            "Whether to read the verdict from the model's token probabilities "
+            "instead of generating an answer and parsing it. A Stage 2 query "
+            "is ~99% prefill and needs exactly one bit back, so generating "
+            "prose spends a full forward pass per token on text that a string "
+            "parser then discards — and that parser defaults to 'no alert' on "
+            "anything it fails to recognise, turning a malformed answer into a "
+            "silent false negative. 'auto' probes wherever the backend can and "
+            "falls back permanently on the first backend that cannot: the "
+            "moondream4bit and transformers backends always can, llama.cpp "
+            "can via logprobs, Ollama and the pinned 2024-08-26 Moondream "
+            "wrapper cannot. 'off' forces "
+            "generate-and-parse; 'on' is the same as 'auto' but logs the "
+            "fallback as a warning rather than an informational message."
+        ),
+    )
+    vlm_probe_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Yes-probability above which a probed verdict counts as a "
+            "violation, after renormalizing over the Yes/No pair alone. 0.5 is "
+            "the neutral comparison and matches what generate-and-parse did "
+            "implicitly. Raise it to make alerts harder to trigger — this is "
+            "the dial the old text path never offered, because a parsed 'Yes' "
+            "carried no strength."
+        ),
     )
 
     # ── Inference Device ─────────────────────────────────────────
     device: Literal["auto", "mps", "cuda", "cpu"] = Field(
         default="auto",
-        description="Inference device for YOLO. 'auto' detects MPS → CUDA → CPU.",
+        description=(
+            "Inference device for YOLO. 'auto' detects MPS → CUDA → CPU, then "
+            "yields the accelerator to an in-process VLM and takes CPU — two "
+            "threads on one MPS device segfaults PyTorch, and Stage 1 pays "
+            "~10 ms/frame for the swap where Stage 2 would pay ~10 s/verdict. "
+            "Set this explicitly to opt out of that arbitration."
+        ),
     )
     vlm_device: Literal["auto", "mps", "cuda", "cpu"] = Field(
-        default="cpu",
+        default="auto",
         description=(
-            "Inference device for the VLM. Defaults to 'cpu': Moondream2 does "
-            "run on MPS, but measured no faster there (6.1s vs 5.6s per query) "
-            "and took ~10s longer to load, so MPS only costs unified memory "
-            "that Stage 1 wants. Other backends may benefit — try 'mps' when "
-            "running vlm_backend='transformers'."
+            "Inference device for the VLM. 'auto' probes MPS -> CUDA -> CPU "
+            "and wins it from Stage 1, which drops to CPU — see "
+            "Settings.inference_device for why that arbitration exists and "
+            "what it costs. "
+            "This used to default to 'cpu' on the measurement that Moondream2 "
+            "at the 2024-08-26 revision ran no faster on MPS (6.1s vs 5.6s per "
+            "query) and loaded ~10s slower, so the accelerator only cost "
+            "unified memory Stage 1 wanted. That finding does not carry to the "
+            "2025-04-14 model now behind moondream4bit, whose vision tower "
+            "dominates its query: measured on an M2 over one real crop, "
+            "encode_image takes 7,313 ms on CPU against 1,672 ms on MPS at "
+            "fp16. Set 'cpu' explicitly to restore the old behaviour, and note "
+            "that vlm_backend='moondream' is still better off there."
         ),
     )
 
@@ -267,19 +691,79 @@ class Settings(BaseSettings):
         default="INFO", description="Application log level."
     )
 
+    # Backends that run the model inside this process, and therefore contend
+    # with Stage 1 for an accelerator. ``openai_compat`` holds its weights in
+    # another process and never does.
+    _IN_PROCESS_VLM_BACKENDS = ("moondream4bit", "moondream", "transformers")
+
+    def _accelerator_contended(self) -> bool:
+        """Whether both stages would land on the same accelerator by default.
+
+        Only true when *neither* device was set explicitly. An operator who
+        names a device gets that device, and a warning if the pairing is the
+        unsafe one.
+        """
+        return (
+            self.device == "auto"
+            and self.vlm_device == "auto"
+            and self.vlm_backend in self._IN_PROCESS_VLM_BACKENDS
+            and detect_inference_device() != "cpu"
+        )
+
     @property
     def inference_device(self) -> str:
-        """Resolve ``'auto'`` to the actual best-available device string."""
-        if self.device == "auto":
-            return detect_inference_device()
-        return self.device
+        """Resolve Stage 1's device, yielding the accelerator to Stage 2.
+
+        PyTorch's MPS backend is not safe to drive from two threads at once.
+        With Stage 1 and an in-process VLM both on MPS, this process segfaults
+        inside ``_mps_convolution_impl`` — one thread building an ``MPSGraph``
+        while the other tears one down — usually before the VLM has even
+        finished loading. It is a hard crash, not an exception: no traceback,
+        no shutdown hook, and the ring buffer's shared memory is left behind.
+
+        So the two `auto`s are arbitrated here rather than resolved
+        independently, and the accelerator goes to Stage 2. The measurement is
+        lopsided enough that it is not a close call — on an M2, per call:
+
+        | | MPS | CPU | cost of losing it |
+        |---|---|---|---|
+        | Stage 1 (YOLOv8n @720p) | 16.9 ms | 26.8 ms | **9.9 ms** |
+        | Stage 2 (Moondream 2B 4-bit) | 1,873 ms | 11,712 ms | **9,839 ms** |
+
+        Stage 1 gives up ten milliseconds a frame; Stage 2 would give up ten
+        seconds a verdict. Setting ``EYEQ_DEVICE`` explicitly opts out.
+        """
+        if self.device != "auto":
+            return self.device
+        if self._accelerator_contended():
+            return "cpu"
+        return detect_inference_device()
 
     @property
     def vlm_inference_device(self) -> str:
-        """Resolve the VLM device. Defaults to CPU to avoid MPS crashes."""
-        if self.vlm_device == "auto":
-            return detect_inference_device()
-        return self.vlm_device
+        """Resolve the VLM device. Falls back to CPU inside the backend's load().
+
+        Wins the arbitration described on :attr:`inference_device`. Warns when
+        an explicit pairing recreates the crash rather than silently overriding
+        it — an operator who named both devices meant both devices.
+        """
+        resolved = (
+            detect_inference_device() if self.vlm_device == "auto" else self.vlm_device
+        )
+        if (
+            resolved != "cpu"
+            and self.vlm_backend in self._IN_PROCESS_VLM_BACKENDS
+            and self.device != "auto"
+            and self.device == resolved
+        ):
+            logger.warning(
+                f"EYEQ_DEVICE and EYEQ_VLM_DEVICE are both '{resolved}'. Driving "
+                "it from Stage 1 and an in-process VLM at the same time "
+                "segfaults inside PyTorch's MPS backend. Set EYEQ_DEVICE=cpu, "
+                "or EYEQ_VLM_BACKEND=openai_compat to move the weights out of "
+                "this process."
+            )
+        return resolved
 
     @property
     def video_source(self) -> str | int:

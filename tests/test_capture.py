@@ -13,9 +13,11 @@ import numpy as np
 import pytest
 
 from app.core.buffer import RollingFrameBuffer
-from app.core.capture import VideoCapture
+from app.core.capture import VideoCapture, is_file_source
 
 FRAME_W, FRAME_H = 320, 240
+SAMPLE_FPS = 30.0
+SAMPLE_FRAMES = 60  # 2 seconds at SAMPLE_FPS
 
 
 @pytest.fixture
@@ -23,12 +25,12 @@ def sample_video(tmp_path):
     """Write a short MP4 whose frames have distinguishable content."""
     path = tmp_path / "sample.mp4"
     writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (FRAME_W, FRAME_H)
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), SAMPLE_FPS, (FRAME_W, FRAME_H)
     )
     if not writer.isOpened():
         pytest.skip("No MP4 encoder available in this OpenCV build")
 
-    for i in range(60):
+    for i in range(SAMPLE_FRAMES):
         frame = np.full((FRAME_H, FRAME_W, 3), i * 4 % 256, dtype=np.uint8)
         writer.write(frame)
     writer.release()
@@ -159,6 +161,21 @@ class TestVideoCaptureResilience:
         assert capture.stats.reconnect_attempts >= 1
         assert not capture.is_connected
 
+    def test_default_never_gives_up_on_a_source(self, buffer):
+        """A camera rebooting for longer than the backoff must still come back."""
+        capture = VideoCapture(
+            source="/nonexistent/path/video.mp4",
+            buffer=buffer,
+            reconnect_base_delay=0.01,
+        )
+        capture.start()
+        try:
+            time.sleep(0.5)  # several capped-backoff attempts
+            assert capture.is_running, "Capture gave up on a source with no retry limit"
+            assert capture.stats.reconnect_attempts >= 3
+        finally:
+            capture.stop(timeout=3.0)
+
     def test_stop_interrupts_reconnect_backoff(self, buffer):
         """Shutdown must not wait out a long backoff sleep."""
         capture = VideoCapture(
@@ -176,3 +193,187 @@ class TestVideoCaptureResilience:
 
         assert elapsed < 3.0, f"stop() blocked on the backoff sleep for {elapsed:.1f}s"
         assert not capture.is_running
+
+
+class TestWritePacing:
+    """A live source at the target rate must be written at the target rate."""
+
+    class _FakeCap:
+        """Delivers frames on a scripted clock: each grab advances time."""
+
+        def __init__(self, capture, arrivals: list[float]) -> None:
+            self._capture = capture
+            self._arrivals = iter(arrivals)
+            self.now = 0.0
+
+        def grab(self) -> bool:
+            try:
+                self.now = next(self._arrivals)
+            except StopIteration:
+                self._capture._shutdown_event.set()
+                return False
+            return True
+
+        def retrieve(self):
+            return True, np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
+
+    def _run(self, capture, monkeypatch, arrivals: list[float]) -> None:
+        cap = self._FakeCap(capture, arrivals)
+        monkeypatch.setattr("app.core.capture.time.monotonic", lambda: cap.now)
+        capture._cap = cap
+        capture._run_capture()
+
+    def test_jittered_frames_at_target_fps_are_all_written(self, buffer, monkeypatch):
+        """30 FPS frames with ±2 ms of jitter under target_fps=30 lose nothing.
+
+        The old test compared elapsed time against the last write with no
+        slack, so every frame arriving a hair early was dropped.
+        """
+        capture = VideoCapture(source=0, buffer=buffer, target_fps=30)
+        interval = 1.0 / 30.0
+        jitter = [0.002, -0.002, 0.0015, -0.0015]
+        self._run(
+            capture,
+            monkeypatch,
+            [100.0 + i * interval + jitter[i % len(jitter)] for i in range(120)],
+        )
+
+        assert capture.stats.frames_dropped == 0
+        assert capture.stats.frames_captured == 120
+
+    def test_over_rate_source_is_held_to_target(self, buffer, monkeypatch):
+        capture = VideoCapture(source=0, buffer=buffer, target_fps=10)
+        # 10 s at 60 FPS.
+        self._run(capture, monkeypatch, [100.0 + i / 60.0 for i in range(600)])
+
+        assert 98 <= capture.stats.frames_captured <= 102
+
+    def test_repeated_frame_errors_hand_over_to_reconnect(self, buffer):
+        capture = VideoCapture(source=0, buffer=buffer)
+
+        class _BrokenCap:
+            def grab(self):
+                raise RuntimeError("decoder wedged")
+
+        capture._cap = _BrokenCap()
+        capture._run_capture()  # must return rather than spin forever
+
+        assert capture.stats.frames_dropped == VideoCapture._MAX_CONSECUTIVE_ERRORS
+
+
+class TestFileSourceClassification:
+    """Only real files on disk may be paced and rewound."""
+
+    def test_video_file_is_a_file_source(self, sample_video):
+        assert is_file_source(sample_video)
+
+    def test_device_index_is_not_a_file_source(self):
+        assert not is_file_source(0)
+
+    def test_rtsp_uri_is_not_a_file_source(self):
+        assert not is_file_source("rtsp://192.168.1.100:554/stream1")
+
+    def test_http_uri_is_not_a_file_source(self):
+        assert not is_file_source("http://example.com/stream.m3u8")
+
+    def test_missing_path_is_not_a_file_source(self):
+        assert not is_file_source("/nonexistent/path/video.mp4")
+
+
+class TestFilePlayback:
+    """A recorded clip must behave like a live camera, not a decode benchmark.
+
+    Without pacing, ``cv2`` decodes a short clip as fast as the CPU allows —
+    a 2-second sample replays dozens of times per second, so every frame the
+    watchdog reads is seconds away from the one before it.
+    """
+
+    def test_playback_runs_at_the_recorded_frame_rate(self, sample_video, buffer):
+        capture = VideoCapture(source=sample_video, buffer=buffer, target_fps=30)
+        capture.start()
+        try:
+            # Let the source open and the first frames land before timing.
+            assert _wait_until(lambda: capture.stats.frames_captured > 0)
+            baseline = capture.stats.frames_captured
+            time.sleep(1.0)
+            captured = capture.stats.frames_captured - baseline
+        finally:
+            capture.stop()
+
+        # ~30 frames in ~1s. The window is wide enough for a loaded machine
+        # but nowhere near the hundreds an unpaced decode loop produces.
+        assert 12 <= captured <= 55, (
+            f"Expected roughly {SAMPLE_FPS:.0f} FPS playback, got {captured} frames in 1s"
+        )
+
+    def test_source_fps_is_reported(self, sample_video, buffer):
+        capture = VideoCapture(source=sample_video, buffer=buffer)
+        capture.start()
+        try:
+            assert _wait_until(lambda: capture.stats.frames_captured > 0)
+            assert capture.stats.source_fps == pytest.approx(SAMPLE_FPS, abs=1.0)
+        finally:
+            capture.stop()
+
+    def test_target_fps_skips_frames_without_slowing_playback(self, sample_video, buffer):
+        """A low target FPS must drop frames, not stretch the clip's duration.
+
+        Playing every frame at 2 FPS would run the 2-second sample in slow
+        motion; the clip has to stay in real time and lose the frames between
+        writes instead.
+        """
+        capture = VideoCapture(source=sample_video, buffer=buffer, target_fps=2)
+        capture.start()
+        try:
+            # 2s of clip at real-time speed is one full pass, so a loop must
+            # have happened even though only ~2 frames/s were written.
+            assert _wait_until(lambda: capture.stats.loops_completed >= 1, timeout=6.0), (
+                "Playback did not reach EOF in real time — it ran in slow motion"
+            )
+            assert capture.stats.frames_dropped > 0, "Skipped frames were not counted"
+        finally:
+            capture.stop()
+
+
+class TestFileLooping:
+    """A finished clip must restart seamlessly, without a reconnect cycle."""
+
+    def test_clip_loops_without_reconnecting(self, sample_video, buffer):
+        capture = VideoCapture(source=sample_video, buffer=buffer, target_fps=30)
+        capture.start()
+        try:
+            assert _wait_until(lambda: capture.stats.loops_completed >= 1, timeout=8.0), (
+                "Capture never looped the sample clip"
+            )
+            stats = capture.stats
+            assert stats.is_connected, "Looping dropped the connection"
+            assert stats.reconnect_attempts == 0, (
+                "Looping went through the reconnect path instead of seeking"
+            )
+        finally:
+            capture.stop()
+
+    def test_frames_keep_arriving_across_the_loop_point(self, sample_video, buffer):
+        capture = VideoCapture(source=sample_video, buffer=buffer, target_fps=30)
+        capture.start()
+        try:
+            assert _wait_until(lambda: capture.stats.loops_completed >= 1, timeout=8.0)
+            after_loop = capture.stats.frames_captured
+            assert _wait_until(
+                lambda: capture.stats.frames_captured > after_loop, timeout=3.0
+            ), "Capture stalled after rewinding"
+        finally:
+            capture.stop()
+
+    def test_looping_can_be_disabled(self, sample_video, buffer):
+        """``loop_file=False`` keeps the original end-of-session behaviour."""
+        capture = VideoCapture(
+            source=sample_video, buffer=buffer, target_fps=30, loop_file=False
+        )
+        capture.start()
+        try:
+            assert _wait_until(lambda: capture.stats.frames_captured > 0)
+            time.sleep(3.0)  # Longer than the 2s clip.
+            assert capture.stats.loops_completed == 0
+        finally:
+            capture.stop()

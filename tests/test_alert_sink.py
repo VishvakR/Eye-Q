@@ -42,6 +42,7 @@ def make_result(
     rule_id: int = DEFAULT_RULE_ID,
     raw_response: str = "Yes, a person is blocking the fire exit.",
     snapshot_path: str | None = None,
+    confidence: float | None = None,
 ) -> VLMResult:
     """Build a VLMResult exactly as the worker would publish it."""
     detection = DetectionEvent(
@@ -62,8 +63,9 @@ def make_result(
         verdict=verdict,
         raw_response=raw_response,
         inference_time_ms=812.5,
-        model_name="moondream2",
+        model_name="moondream-2b-2025-04-14-4bit",
         snapshot_path=snapshot_path,
+        confidence=confidence,
     )
 
 
@@ -242,3 +244,254 @@ class TestAlertSink:
         finally:
             publisher.close()
             await sink.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Schema Migration Tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+# The `alerts` DDL exactly as it shipped before per-instance judging. Kept
+# verbatim so the migration is tested against a real old database rather than
+# against a hand-waved approximation of one.
+LEGACY_ALERTS_DDL = """
+CREATE TABLE alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id         INTEGER NOT NULL,
+    camera_id       TEXT    NOT NULL,
+    timestamp       REAL    NOT NULL,
+    verdict         INTEGER NOT NULL,
+    raw_response    TEXT    NOT NULL,
+    inference_ms    REAL    NOT NULL,
+    bbox_json       TEXT    NOT NULL,
+    frame_snapshot  TEXT,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+async def _alert_columns(database: Database) -> set[str]:
+    cursor = await database._db.execute("PRAGMA table_info(alerts)")
+    return {row["name"] for row in await cursor.fetchall()}
+
+
+class TestSchemaMigration:
+    """An appliance upgraded in place must not lose its alert history.
+
+    `initialize_tables()` only runs CREATE TABLE IF NOT EXISTS, so new columns
+    reach an existing database solely through the ALTER TABLE migration.
+    """
+
+    async def test_fresh_database_has_the_new_columns(self, db):
+        assert {"track_id", "label"} <= await _alert_columns(db)
+
+    async def test_legacy_database_is_migrated_with_rows_intact(self, tmp_path):
+        path = str(tmp_path / "legacy.db")
+
+        # Build a database at the pre-change schema and put history in it.
+        legacy = await Database.create(path)
+        await legacy._db.executescript(LEGACY_ALERTS_DDL)
+        await legacy._db.execute(
+            """INSERT INTO alerts (rule_id, camera_id, timestamp, verdict,
+                                   raw_response, inference_ms, bbox_json)
+               VALUES (0, 'cam', 1.0, 1, 'Yes', 800.0, '{}')"""
+        )
+        await legacy._db.commit()
+        assert "track_id" not in await _alert_columns(legacy)
+        await legacy.close()
+
+        # Reopening runs the migration.
+        upgraded = await Database.create(path)
+        await upgraded.initialize_tables()
+        try:
+            assert {"track_id", "label"} <= await _alert_columns(upgraded)
+
+            cursor = await upgraded._db.execute(
+                "SELECT raw_response, track_id, label FROM alerts"
+            )
+            rows = await cursor.fetchall()
+            assert len(rows) == 1, "Existing alert history was lost"
+            assert rows[0]["raw_response"] == "Yes"
+            assert rows[0]["track_id"] == -1
+            assert rows[0]["label"] == ""
+        finally:
+            await upgraded.close()
+
+    async def test_migration_is_idempotent(self, tmp_path):
+        """Every restart calls initialize_tables(); it must stay a no-op."""
+        path = str(tmp_path / "repeat.db")
+        database = await Database.create(path)
+        try:
+            for _ in range(3):
+                await database.initialize_tables()
+
+            columns = await _alert_columns(database)
+            assert len([c for c in columns if c == "track_id"]) == 1
+            assert {"track_id", "label"} <= columns
+        finally:
+            await database.close()
+
+    async def test_create_alert_round_trips_the_new_columns(self, db):
+        await db.ensure_default_rule()  # alerts.rule_id is a foreign key
+        alert_id = await db.create_alert(
+            rule_id=DEFAULT_RULE_ID,
+            camera_id="cam",
+            timestamp=1.0,
+            verdict=True,
+            raw_response="Yes",
+            inference_ms=800.0,
+            bbox_json={"x1": 0.1, "y1": 0.1, "x2": 0.2, "y2": 0.2},
+            track_id=7,
+            label="person",
+        )
+        row = await db.get_alert(alert_id)
+        assert row["track_id"] == 7
+        assert row["label"] == "person"
+
+    async def test_create_alert_defaults_stay_backward_compatible(self, db):
+        """Callers that never heard of tracking must still work."""
+        await db.ensure_default_rule()
+        alert_id = await db.create_alert(
+            rule_id=DEFAULT_RULE_ID,
+            camera_id="cam",
+            timestamp=1.0,
+            verdict=False,
+            raw_response="No",
+            inference_ms=800.0,
+            bbox_json={"x1": 0.1, "y1": 0.1, "x2": 0.2, "y2": 0.2},
+        )
+        row = await db.get_alert(alert_id)
+        assert row["track_id"] == -1
+        assert row["label"] == ""
+
+
+class TestConfidenceAttribution:
+    """Two different confidences meet in the sink and must not be swapped.
+
+    ``VLMResult.confidence`` is the VLM's p(yes) from the probe path — the
+    number that says whether a verdict was a close call.
+    ``DetectionEvent.confidence`` is YOLO's box score — how sure the detector
+    was that this was a person at all. The sink used to publish the detector's
+    score under the name ``confidence`` and never store the VLM's at all, so
+    every dashboard card and webhook payload carried a number that meant
+    something entirely different from what it claimed, and no threshold
+    question could be asked of alerts already filed.
+    """
+
+    async def _run(self, db, settings, ws, confidence):
+        """Drive one verdict through the sink's handler.
+
+        The sentinel rule is seeded first because ``alerts.rule_id`` is a
+        foreign key; ``AlertSink.start()`` normally does this, but starting it
+        would also spin up the ZMQ subscriber this test does not need.
+        """
+        await db.ensure_default_rule()
+        sink = AlertSink(db, ws, settings)
+        await sink._handle_result(make_result(confidence=confidence).model_dump())
+        return sink
+
+    async def test_the_vlm_confidence_reaches_sqlite(self, db, settings):
+        await self._run(db, settings, FakeWSManager(), 0.83)
+
+        alerts = await db.list_alerts()
+        assert alerts[0]["confidence"] == pytest.approx(0.83)
+
+    async def test_generate_and_parse_stores_null_not_zero(self, db, settings):
+        """A parsed verdict carries no strength, and 0.0 would read as
+        'certainly not a violation' rather than 'no number available'."""
+        await self._run(db, settings, FakeWSManager(), None)
+
+        alerts = await db.list_alerts()
+        assert alerts[0]["confidence"] is None
+
+    async def test_the_broadcast_does_not_publish_the_detector_score(
+        self, db, settings
+    ):
+        """The exact bug: 0.91 is YOLO's box score, 0.83 is the VLM's p(yes)."""
+        ws = FakeWSManager()
+        await self._run(db, settings, ws, 0.83)
+
+        payload = ws.messages[-1]["data"]
+        assert payload["confidence"] == pytest.approx(0.83), "must be the VLM's p(yes)"
+        assert payload["detection_confidence"] == pytest.approx(0.91)
+
+    async def test_the_webhook_separates_the_two(self, db, settings):
+        sent: list[dict] = []
+        ws = FakeWSManager()
+
+        await db.ensure_default_rule()
+        sink = AlertSink(db, ws, settings)
+
+        async def capture(payload: dict) -> bool:
+            sent.append(payload)
+            return True
+
+        # The dispatcher is disabled without a URL, so stub both the gate and
+        # the send rather than reaching for the read-only property.
+        sink._webhook.dispatch = capture
+        type(sink._webhook).enabled = property(lambda self: True)
+        try:
+            await sink._handle_result(
+                make_result(verdict=True, confidence=0.83).model_dump()
+            )
+            await asyncio.sleep(0)  # let the fire-and-forget task run
+        finally:
+            del type(sink._webhook).enabled
+
+        assert sent, "no webhook payload dispatched"
+        assert sent[0]["confidence"] == pytest.approx(0.83)
+        assert sent[0]["detection_confidence"] == pytest.approx(0.91)
+
+
+class TestWebhookTasks:
+    """Webhook POSTs are detached from the sink, but never abandoned."""
+
+    def _sink(self, db, settings, dispatch):
+        sink = AlertSink(db, FakeWSManager(), settings)
+        sink._webhook.dispatch = dispatch
+        type(sink._webhook).enabled = property(lambda self: True)
+        return sink
+
+    async def test_stop_waits_for_in_flight_webhooks(self, db, settings):
+        delivered = []
+
+        async def slow(payload):
+            await asyncio.sleep(0.2)
+            delivered.append(payload)
+            return True
+
+        await db.ensure_default_rule()
+        sink = self._sink(db, settings, slow)
+        try:
+            await sink._handle_result(make_result(verdict=True).model_dump())
+            assert sink.webhooks_in_flight == 1
+            await sink.stop()
+        finally:
+            del type(sink._webhook).enabled
+
+        assert len(delivered) == 1, "the webhook was cut off by shutdown"
+        assert sink.webhooks_in_flight == 0
+
+    async def test_a_full_backlog_drops_and_counts(self, db, settings, monkeypatch):
+        import app.services.alert_sink as alert_sink_module
+
+        monkeypatch.setattr(alert_sink_module, "_WEBHOOK_BACKLOG", 2)
+        release = asyncio.Event()
+
+        async def blocked(payload):
+            await release.wait()
+            return True
+
+        await db.ensure_default_rule()
+        sink = self._sink(db, settings, blocked)
+        try:
+            for _ in range(5):
+                await sink._handle_result(make_result(verdict=True).model_dump())
+
+            assert sink.webhooks_in_flight == 2
+            assert sink.webhooks_dropped == 3
+            assert sink.alerts_stored == 5, "dropping a webhook must not drop the alert"
+        finally:
+            release.set()
+            await asyncio.sleep(0)
+            del type(sink._webhook).enabled

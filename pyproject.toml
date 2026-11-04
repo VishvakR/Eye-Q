@@ -17,6 +17,9 @@ dependencies = [
     "ultralytics>=8.2",
     "torch>=2.1",
     "torchvision>=0.16",
+    # Capped below 4.50 for the vlm_backend='moondream' path, which pins
+    # Moondream2's 2024-08-26 revision. The default moondream4bit backend's
+    # 2025-04-14 remote code targets 4.44+ and is happy inside the same range.
     "transformers>=4.40,<4.50.0",
     "einops>=0.7",
     "accelerate>=0.25",
@@ -30,6 +33,18 @@ dependencies = [
     # ── Utilities ────────────────────────────
     "python-dotenv>=1.0",
 ]
+
+[project.optional-dependencies]
+# torchao is what keeps the moondream4bit weights 4-bit *at runtime*, and it
+# only pays off on CUDA: the remote code's int4_weight_only() defaults to
+# TensorCoreTiledLayout, which dispatches to torch._weight_int4pack_mm and
+# exists on no other device. Off CUDA the backend stubs the import and
+# dequantizes at load instead, so this is deliberately not a hard dependency.
+#
+# Pinned below 0.14, which removed the int4_weight_only name the remote code
+# imports at module scope. Raising the cap means checking that name still
+# resolves, not just that the package installs.
+cuda = ["torchao>=0.11,<0.14"]
 
 [dependency-groups]
 dev = [

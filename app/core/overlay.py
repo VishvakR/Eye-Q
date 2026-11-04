@@ -37,6 +37,7 @@ def draw_detection(
     label: str,
     confidence: float,
     triggered: bool = False,
+    track_id: int = -1,
 ) -> None:
     """Draw a bounding box with a label on the frame.
 
@@ -70,7 +71,11 @@ def draw_detection(
         cv2.line(frame, (cx, cy), (cx + dx * corner_len, cy), color, corner_thick)
         cv2.line(frame, (cx, cy), (cx, cy + dy * corner_len), color, corner_thick)
 
-    text = f"{label} {confidence:.0%}"
+    # The subject id makes tracking legible on the live feed: an id that flickers
+    # or swaps as people cross is visible here long before it shows up as a
+    # duplicate alert.
+    subject = f"{label}#{track_id}" if track_id >= 0 else label
+    text = f"{subject} {confidence:.0%}"
     if triggered:
         text = f"[TRIGGER] {text}"
 

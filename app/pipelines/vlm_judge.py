@@ -107,17 +107,7 @@ class BinaryVerdictParser:
         # Count affirmative vs. negative keywords. Handle negation
         # patterns like "is not blocking" by checking for "not" before
         # affirmative words.
-        word_set = set(words)
-
-        # Check for negation of affirmative keywords
-        negated_affirmatives = 0
-        for i, w in enumerate(words):
-            negators = ("not", "no", "isn't", "aren't", "doesn't", "don't", "wasn't")
-            if w in cls.AFFIRMATIVE and i > 0 and words[i - 1] in negators:
-                negated_affirmatives += 1
-
-        affirm_count = len(word_set & cls.AFFIRMATIVE) - negated_affirmatives
-        negate_count = len(word_set & cls.NEGATIVE)
+        affirm_count, negate_count = cls._keyword_counts(words)
 
         if affirm_count > negate_count:
             logger.debug(
@@ -137,6 +127,26 @@ class BinaryVerdictParser:
             f"negate={negate_count}, defaulting to no-alert)"
         )
         return False
+
+    _NEGATORS = frozenset({"not", "no", "isn't", "aren't", "doesn't", "don't", "wasn't"})
+
+    @classmethod
+    def _keyword_counts(cls, words: list[str]) -> tuple[int, int]:
+        """Distinct affirmative and negative keywords, honouring negation.
+
+        An affirmative word counts once if it appears at least once *without* a
+        negator in front of it. This used to subtract every negated occurrence
+        from a count of distinct words, so "not blocked ... not blocked" scored
+        -1 and could tip an otherwise even response to False; and
+        :meth:`parse_with_confidence` ignored negation altogether, calling
+        "is not blocking" a confident yes.
+        """
+        affirmed = {
+            w
+            for i, w in enumerate(words)
+            if w in cls.AFFIRMATIVE and not (i > 0 and words[i - 1] in cls._NEGATORS)
+        }
+        return len(affirmed), len(set(words) & cls.NEGATIVE)
 
     @classmethod
     def parse_with_confidence(cls, raw_response: str) -> tuple[bool, float, str]:
@@ -164,10 +174,9 @@ class BinaryVerdictParser:
         if first_word in cls.FIRST_WORD_NO:
             return False, 0.95, "first_word_no"
 
-        # Strategy 2: Keyword scoring
-        word_set = set(words)
-        affirm_count = len(word_set & cls.AFFIRMATIVE)
-        negate_count = len(word_set & cls.NEGATIVE)
+        # Strategy 2: Keyword scoring — the same counts parse() decides on, so
+        # the two can never disagree about which way a response leans.
+        affirm_count, negate_count = cls._keyword_counts(words)
         total = affirm_count + negate_count
 
         if total > 0:

@@ -112,6 +112,10 @@ def main() -> None:
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
+        # The live-feed stream never ends on its own, so without a bound
+        # uvicorn waits forever for an open dashboard tab to disconnect — and
+        # a second Ctrl+C skips lifespan shutdown, leaking the shared memory.
+        timeout_graceful_shutdown=5,
     )
 
 

@@ -12,9 +12,15 @@ Architecture:
     - Circular write via the shared write head.
     - Writer-side locking only; readers are lock-free (stale-OK semantics).
 
-A torn read (reading a frame while it's being overwritten) is harmless:
-YOLO will produce a low-confidence/garbage detection that gets filtered.
-The VLM worker validates frame integrity after fetch.
+Torn reads are detected, not tolerated. A slot's timestamp is zeroed before
+its pixels are overwritten and restored after, a sequence-lock in miniature:
+a reader that re-reads the timestamp after copying and finds it changed knows
+the pixels it holds may belong to two different frames. ``read_latest`` needs
+no such check — the head only advances once a write is complete, and a slot
+cannot come round again within one copy — but ``read_by_timestamp`` and
+``read_at_index`` reach back into slots the writer is about to reuse. With the
+default 150 frames at 30 FPS and a 5 s staleness threshold, Stage 2 lands on
+the oldest slot routinely.
 
 Example:
     >>> buffer = RollingFrameBuffer(capacity=300, frame_height=720, frame_width=1280)
@@ -117,14 +123,24 @@ class RollingFrameBuffer:
                 existing.unlink()
                 return SharedMemory(name=name, create=True, size=size)
 
-        # Allocate shared memory — frame pixel data
-        self._shm_frames = _safe_create_shm(f"eyeq_frames_{buffer_id}", total_frame_bytes)
-
-        # Allocate shared memory — timestamps
-        self._shm_timestamps = _safe_create_shm(f"eyeq_ts_{buffer_id}", total_ts_bytes)
-
-        # Allocate shared memory — [write_head, frame_count]
-        self._shm_meta = _safe_create_shm(f"eyeq_meta_{buffer_id}", total_meta_bytes)
+        # Allocate the three segments. If a later one fails, release the ones
+        # already created: nothing else holds their names, so they would
+        # outlive the process.
+        created: list[SharedMemory] = []
+        try:
+            self._shm_frames = _safe_create_shm(f"eyeq_frames_{buffer_id}", total_frame_bytes)
+            created.append(self._shm_frames)
+            self._shm_timestamps = _safe_create_shm(f"eyeq_ts_{buffer_id}", total_ts_bytes)
+            created.append(self._shm_timestamps)
+            self._shm_meta = _safe_create_shm(f"eyeq_meta_{buffer_id}", total_meta_bytes)
+        except Exception:
+            for shm in created:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception as exc:
+                    logger.warning(f"Error releasing SHM '{shm.name}': {exc}")
+            raise
 
         # Create numpy views over shared memory (zero-copy)
         self._frames: NDArray[np.uint8] = np.ndarray(
@@ -216,17 +232,23 @@ class RollingFrameBuffer:
                 f"Frame must have {expected_c} channels, got shape {frame.shape}"
             )
 
-        if frame.shape[0] != expected_h or frame.shape[1] != expected_w:
-            # Resize in-place to expected dimensions
-            import cv2
-
-            frame = cv2.resize(frame, (expected_w, expected_h))
+        needs_resize = frame.shape[0] != expected_h or frame.shape[1] != expected_w
 
         with self._write_lock:
             idx = int(self._meta[0])
 
-            # Copy frame data into shared memory
-            np.copyto(self._frames[idx], frame)
+            # Zero the timestamp first so a reader can tell this slot is being
+            # rewritten: ts > 0 excludes it from lookups while the pixels are
+            # in flux, and a reader that already picked it sees the change
+            # when it re-checks. See the module docstring.
+            self._timestamps[idx] = 0.0
+            if needs_resize:
+                # Straight into the slot — no intermediate frame-sized array.
+                import cv2
+
+                cv2.resize(frame, (expected_w, expected_h), dst=self._frames[idx])
+            else:
+                np.copyto(self._frames[idx], frame)
             self._timestamps[idx] = timestamp
 
             # Advance the write head (circular)
@@ -259,6 +281,22 @@ class RollingFrameBuffer:
         ts = float(self._timestamps[idx])
 
         return frame_copy, ts, idx
+
+    def latest_timestamp(self) -> float | None:
+        """Timestamp of the most recent frame, without copying its pixels.
+
+        Lets a consumer that polls faster than capture — the watchdog under a
+        slow source — recognise a frame it already processed before paying
+        for a full-frame copy.
+
+        Returns:
+            The timestamp, or None if nothing has been written yet.
+        """
+        if self._closed:
+            raise RuntimeError("Cannot read from a closed buffer.")
+        if self._frame_count == 0:
+            return None
+        return float(self._timestamps[(self._write_head - 1) % self._capacity])
 
     def read_by_timestamp(
         self,
@@ -313,6 +351,14 @@ class RollingFrameBuffer:
         frame_copy = self._frames[best_idx].copy()
         actual_ts = float(ts_snapshot[best_idx])
 
+        # The slot was chosen from a snapshot, and it is often the oldest one
+        # — the next the writer reuses. If its timestamp moved while the
+        # pixels were being copied, they may be half one frame and half the
+        # next, or a different frame entirely.
+        if float(self._timestamps[best_idx]) != actual_ts:
+            logger.debug(f"Slot {best_idx} was overwritten during read; discarding.")
+            return None
+
         return frame_copy, actual_ts, best_idx
 
     def read_at_index(self, index: int) -> tuple[NDArray[np.uint8], float]:
@@ -335,8 +381,12 @@ class RollingFrameBuffer:
                 f"Slot index {index} out of range [0, {self._capacity})"
             )
 
-        frame_copy = self._frames[index].copy()
         ts = float(self._timestamps[index])
+        frame_copy = self._frames[index].copy()
+        if float(self._timestamps[index]) != ts:
+            # Overwritten mid-copy. Report the slot as unwritten rather than
+            # hand back pixels no timestamp describes.
+            return frame_copy, 0.0
         return frame_copy, ts
 
     @property
